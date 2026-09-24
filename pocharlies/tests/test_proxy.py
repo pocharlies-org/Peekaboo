@@ -70,10 +70,12 @@ class FakeDaemon(object):
 
 
 class Client(object):
-    def __init__(self, port, extra_args=("--flag-x", "val y"), notice_seconds="1"):
+    def __init__(self, port, extra_args=("--flag-x", "val y"), notice_seconds="1",
+                 max_call="900"):
         os.chmod(FAKE, 0o755)
         env = dict(os.environ, DESKTOP_MCP_PORT=str(port), PEEKABOO_BIN=FAKE,
-                   DESKTOP_MCP_OVERLAY_IDLE=notice_seconds)
+                   DESKTOP_MCP_OVERLAY_IDLE=notice_seconds,
+                   DESKTOP_MCP_NOTICE_MAX_CALL=max_call)
         self.p = subprocess.Popen([sys.executable, PROXY, "--"] + list(extra_args),
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL, env=env, text=True, bufsize=1)
@@ -176,6 +178,21 @@ class ProxyWithDaemon(unittest.TestCase):
                                                     "arguments": {"exit": 3}}}) + "\n")
         self.c.p.stdin.flush()
         self.assertEqual(self.c.p.wait(timeout=10), 3)
+
+
+class NoticeGivesUpOnAHungCall(unittest.TestCase):
+    def test_a_call_past_the_limit_stops_renewing_the_notice(self):
+        daemon = FakeDaemon()
+        c = Client(daemon.port, max_call="1.5")
+        try:
+            c.initialize()
+            daemon.reset()
+            c.call("see", {"delay": 4.5}, timeout=15)
+            # the lighting before the call + at most one heartbeat inside the limit
+            self.assertLessEqual(len(daemon.named("overlay")), 2)
+        finally:
+            c.close()
+            daemon.close()
 
 
 class ProxyWithoutDaemon(unittest.TestCase):

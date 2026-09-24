@@ -65,9 +65,9 @@ mac "cd $STAGE && $PY smoke_mac.py --mode staged --peekaboo $STAGE/cli/peekaboo 
 
 # --- 3. install ----------------------------------------------------------------------
 PREV=$(mac 'readlink "$HOME/.local/share/peekaboo-fork/current" 2>/dev/null || true')
-mac bash -s -- "$TAG" "$PY" <<'EOF' || die "install $TAG"
+mac bash -s -- "$TAG" "$PY" "$PREV" <<'EOF' || die "install $TAG"
 set -eu
-TAG="$1"; PY="$2"
+TAG="$1"; PY="$2"; PREV="${3:-}"
 D="$HOME/.local/share/peekaboo-fork"
 up() { /usr/bin/nc -z 127.0.0.1 "$1" >/dev/null 2>&1; }
 # -n: replace the link itself; a plain mv onto a link to a directory would move INTO it.
@@ -81,9 +81,9 @@ if ! grep -qxF "$LINE" "$CH" 2>/dev/null; then
   # back through `open`, which keeps the app bundle's grants).
   pkill -f 'mac-desktop-mcp/server.py' || pkill -f 'desktop-mcp/server.py' || true
   for _ in $(seq 1 60); do up 8811 && break; sleep 2; done
-else
-  # exec_host re-reads `current` per connection; restarting it only matters when
-  # exec_host.py itself changed, and it is cheap: the daemon starts it again in 5 s.
+elif [ -z "$PREV" ] || ! cmp -s "$D/$PREV/exec_host.py" "$D/current/exec_host.py"; then
+  # exec_host re-reads `current` per connection, so it is restarted only when
+  # exec_host.py itself changed: a restart drops every session connected to the MCP.
   pkill -f "$D/current/exec_host.py" || true
   sleep 1
 fi

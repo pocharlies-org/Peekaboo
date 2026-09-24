@@ -39,6 +39,9 @@ import time
 
 PORT = int(os.environ.get("DESKTOP_MCP_PORT", "8811"))
 NOTICE_SECONDS = float(os.environ.get("DESKTOP_MCP_OVERLAY_IDLE", "15"))
+# A call with no answer after this long stops renewing the notice: a lost response must
+# not keep the banner on for as long as the session lives.
+NOTICE_MAX_CALL = float(os.environ.get("DESKTOP_MCP_NOTICE_MAX_CALL", "900"))
 DAEMON_TOOLS = ("applescript", "set_control_context", "overlay")
 # Peekaboo tools that neither look at nor touch the desktop.
 QUIET_TOOLS = ("permissions", "sleep", "analyze")
@@ -130,7 +133,7 @@ class Proxy(object):
         self.state_lock = threading.Lock()
         self.pending_list = set()
         self.pending_init = set()
-        self.inflight = set()
+        self.inflight = {}           # request id -> time it was sent
         self.context = None          # (session, purpose) declared by this client
         self.client_name = None
         self.daemon_tools = None
@@ -169,8 +172,9 @@ class Proxy(object):
     def heartbeat(self):
         while True:
             time.sleep(max(1.0, NOTICE_SECONDS / 2))
+            now = time.time()
             with self.state_lock:
-                busy = bool(self.inflight)
+                busy = any(now - t < NOTICE_MAX_CALL for t in self.inflight.values())
             if busy:
                 self.notice()
 
@@ -228,7 +232,7 @@ class Proxy(object):
                 if params.get("name") not in QUIET_TOOLS:
                     self.notice()
                     with self.state_lock:
-                        self.inflight.add(rid)
+                        self.inflight[rid] = time.time()
             self.to_child(raw)
         try:
             self.child.stdin.close()
@@ -249,7 +253,7 @@ class Proxy(object):
             result = msg.get("result")
             if rid is not None and "method" not in msg:
                 with self.state_lock:
-                    self.inflight.discard(rid)
+                    self.inflight.pop(rid, None)
                 if rid in self.pending_list:
                     self.pending_list.discard(rid)
                     if isinstance(result, dict) and not result.get("nextCursor"):
