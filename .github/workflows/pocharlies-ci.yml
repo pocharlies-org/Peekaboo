@@ -28,4 +28,4 @@ jobs:
       - name: Contract with upstream
         run: python3 pocharlies/check_contract.py
       - name: Syntax of the Mac scripts
-        run: bash -n pocharlies/deploy_mac.sh && python3 -m py_compile pocharlies/smoke_mac.py
+        run: bash -n pocharlies/deploy_mac.sh && python3 -m py_compile pocharlies/smoke_mac.py pocharlies/exec_host.py

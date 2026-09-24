@@ -4,9 +4,10 @@
   --mode staged   BEFORE deploying: a candidate binary run with --no-remote (an SSH session
                   has no TCC grants, so no capture): the handshake, the merged tool list,
                   AppleScript through the daemon and the on-screen notice.
-  --mode bridge   AFTER deploying: the installed binary against the Peekaboo.app Bridge, as
-                  the MCP client runs it. Adds Screen Recording + Accessibility granted to
-                  the app and, if the screen is unlocked, a real `see`.
+  --mode host     AFTER deploying: through exec_host (127.0.0.1:8812), exactly as the MCP
+                  client reaches it, with the desktop-mcp daemon's grants. Adds Screen
+                  Recording + Accessibility granted and, if the screen is unlocked, a real
+                  `see`.
 
 Prints one JSON line per check and exits 1 if any failed. Stdlib only.
 """
@@ -84,20 +85,20 @@ def text_of(result):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["staged", "bridge"], required=True)
-    ap.add_argument("--peekaboo", required=True, help="the peekaboo binary to test")
+    ap.add_argument("--mode", choices=["staged", "host"], required=True)
+    ap.add_argument("--peekaboo", help="staged: the candidate peekaboo binary")
     ap.add_argument("--proxy", default=os.path.join(HERE, "peekaboo_proxy.py"))
-    ap.add_argument("--bridge-socket", default=os.path.expanduser(
-        "~/Library/Application Support/Peekaboo/bridge.sock"))
+    ap.add_argument("--port", default=os.environ.get("PEEKABOO_EXEC_PORT", "8812"))
     ap.add_argument("--label", default="smoke", help="goes into the on-screen notice")
     a = ap.parse_args()
 
     if a.mode == "staged":
-        pk_args = ["--no-remote"]
+        if not a.peekaboo:
+            ap.error("--mode staged needs --peekaboo")
+        env = dict(os.environ, PEEKABOO_BIN=a.peekaboo)
+        s = Session([sys.executable, a.proxy, "--", "--no-remote"], env)
     else:
-        pk_args = ["--allow-foreground", "--bridge-socket", a.bridge_socket]
-    env = dict(os.environ, PEEKABOO_BIN=a.peekaboo)
-    s = Session([sys.executable, a.proxy, "--"] + pk_args, env)
+        s = Session(["/usr/bin/nc", "127.0.0.1", a.port], dict(os.environ))
     try:
         init = s.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                                         "clientInfo": {"name": "peekaboo-fork-smoke",
@@ -115,7 +116,7 @@ def main():
         res = s.call("applescript", {"script": 'return "smoke-ok"'})
         report("applescript", "smoke-ok" in text_of(res), text_of(res))
 
-        if a.mode == "bridge":
+        if a.mode == "host":
             res = s.call("permissions")
             meta = (res or {}).get("_meta") or {}
             ok = meta.get("accessibility") is True and meta.get("screen_recording", True) is True
