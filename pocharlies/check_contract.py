@@ -3,7 +3,7 @@
 
 The proxy relies on a few things of `peekaboo mcp` it cannot check at runtime without a
 Mac: the names of Peekaboo's MCP tools (its quiet list must exist, its own tools must not
-collide), the `--allow-foreground` and `--bridge-socket` flags, and stdio as the default
+collide), the `--allow-foreground` and `--no-remote` flags, and stdio as the default
 transport. This reads them from the Swift sources, so an upstream merge that breaks one
 fails CI before anything reaches the Mac. Run from the repository root.
 
@@ -68,8 +68,8 @@ def main():
         problems.append("`peekaboo mcp` lost --allow-foreground (%s)" % MCP_CMD_DIR)
     if not re.search(r'var transport: String = "stdio"', mcp):
         problems.append("`peekaboo mcp` no longer defaults to stdio (%s)" % MCP_CMD_DIR)
-    if '"bridge-socket"' not in "\n".join(swift_sources(RUNTIME_OPTS_DIR).values()):
-        problems.append("--bridge-socket is no longer a runtime option (%s)" % RUNTIME_OPTS_DIR)
+    if '"no-remote"' not in "\n".join(swift_sources(RUNTIME_OPTS_DIR).values()):
+        problems.append("--no-remote is no longer a runtime option (%s)" % RUNTIME_OPTS_DIR)
 
     if problems:
         for p in problems:

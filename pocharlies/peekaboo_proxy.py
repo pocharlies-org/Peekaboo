@@ -19,11 +19,11 @@ without touching Peekaboo:
   or the client's name from `initialize` until it declares one.
 
 Run it on the Mac, where both Peekaboo and the daemon live. Everything after `--` goes
-to `peekaboo mcp`. Over SSH, point Peekaboo at the Peekaboo.app Bridge: the app holds
-the Screen Recording and Accessibility grants, an SSH session never has them.
+to `peekaboo mcp`. Remote clients reach it through exec_host.py (127.0.0.1:8812), which
+runs it as a child of the desktop-mcp daemon so Peekaboo inherits the daemon's Screen
+Recording and Accessibility grants:
 
-  peekaboo_proxy.py -- --allow-foreground \\
-      --bridge-socket "$HOME/Library/Application Support/Peekaboo/bridge.sock"
+  peekaboo_proxy.py -- --allow-foreground --no-remote
 
 If the daemon is down, Peekaboo keeps working and the proxy logs that the notice could
 not be shown. Stdlib only, Python 3.9+.
