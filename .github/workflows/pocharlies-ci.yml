@@ -1,0 +1,31 @@
+# CI of the pocharlies fork: the proxy's tests and its static contract with the upstream
+# source it is merged with. Upstream's own workflows are disabled in this fork (they need
+# macOS runners); the live test on the Mac is pocharlies/deploy_mac.sh --stage-only, run by
+# the daily updater before it merges.
+name: pocharlies-ci
+
+on:
+  pull_request:
+    branches: [pocharlies]
+  push:
+    branches: [pocharlies]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proxy:
+    runs-on: arc-k8s
+    env:
+      PYTHONPYCACHEPREFIX: /tmp/py-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Proxy tests
+        run: python3 -m unittest discover -s pocharlies/tests -v
+      - name: Contract with upstream
+        run: python3 pocharlies/check_contract.py
+      - name: Syntax of the Mac scripts
+        run: bash -n pocharlies/deploy_mac.sh && python3 -m py_compile pocharlies/smoke_mac.py
