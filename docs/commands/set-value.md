@@ -22,11 +22,19 @@ read_when:
 ## Notes
 
 - The target element must expose a settable accessibility value.
+- Numeric controls retain native numeric verification, including floating-point rounding tolerance; numeric-looking
+  text remains literal. Successful output reports the observed value, not a replacement copy of the requested value.
+- Boolean verification requires an actual Boolean or exact numeric `0`/`1`; fractional values are not truncated.
+- Integer-valued controls accept decimal strings and decimal/scientific forms such as `001.0`, `10e-1`, and `1.e3`
+  only when they represent an exact in-range integer. Nonzero fractional tails, underflow-to-zero, out-of-range values,
+  and hexadecimal forms are rejected before writing. These restrictions do not apply to literal text controls.
 - Every mutation requires a current snapshot. App/PID/window target flags capture one automatically; without target
   flags, run `peekaboo see` first. A missing snapshot is refused instead of falling through to the frontmost app. Exact
   process/window receipts and the final resolved Accessibility element PID are revalidated before the value is written.
 - Remote value mutation requires Bridge protocol 1.37 and `processGenerationBoundElementMutations`; older or
   receiptless hosts are refused before the request is sent.
+- Current clients negotiate typed value-verification evidence with capable hosts. Without that evidence, remote
+  results retain the legacy exact-string verification contract.
 - A result with `requires_fresh_observation: true`, or no canonical outcome, makes that snapshot mutation-ineligible.
   The old evidence stays readable, but another mutation must use a new `peekaboo see` snapshot and otherwise fails
   before dispatch.

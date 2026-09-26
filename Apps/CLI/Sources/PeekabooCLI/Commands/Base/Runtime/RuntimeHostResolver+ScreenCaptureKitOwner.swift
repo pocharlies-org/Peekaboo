@@ -342,11 +342,11 @@ extension RuntimeHostResolver {
     ) async throws -> Resolution? {
         try Task.checkCancellation()
         let options = context.options
+        let supportsAutomaticObservation = options.usesPersistentDynamicCaptureRuntime ||
+            (!options.usesPerToolSnapshotInvalidation && options.requiresScreenCapturePermission &&
+                options.transportsCaptureEnginePreference && options.requiresScreenCaptureKitOwnerCapability)
         guard let explicitSocket = context.candidatePlan.explicitSocket,
-              !options.usesPerToolSnapshotInvalidation,
-              options.requiresScreenCapturePermission,
-              options.transportsCaptureEnginePreference,
-              options.requiresScreenCaptureKitOwnerCapability,
+              supportsAutomaticObservation,
               self.captureEnginePreferenceForOwnership(options: options, environment: context.environment) == .auto,
               !self.screenCaptureKitOwnerIsCurrentProcess(owner),
               let candidate = context.candidatePlan.candidates.first(where: {
@@ -359,14 +359,21 @@ extension RuntimeHostResolver {
               hostIdentity.processStartIdentity != nil,
               BridgeCapabilityPolicy.supportsClassicCaptureWithoutScreenCaptureKit(for: entry.response),
               BridgeCapabilityPolicy.supportsDesktopObservationCaptureEngine(for: entry.response),
-              BridgeCapabilityPolicy.screenCaptureKitReadinessRefusal(for: entry.response) == nil
+              !options.usesPersistentDynamicCaptureRuntime || entry.response.screenCaptureKitReadiness?
+                  .permitsAttempt == true,
+                  BridgeCapabilityPolicy.screenCaptureKitReadinessRefusal(for: entry.response) == nil
         else { return nil }
 
         // Select classic before dispatch so neither permission probing nor a legacy fallback can enter SCK.
         var classicOptions = options
         classicOptions.captureEnginePreference = "classic"
+        classicOptions.requiresDesktopObservation = true
+        classicOptions.requiresScreenCaptureKitOwnerCapability = true
         classicOptions.requiresCaptureEnginePreferenceHost = true
         classicOptions.requiresCaptureEnginePreferenceCapability = true
+        classicOptions.remoteCapturePolicy = .classicOnly(self.ownerRefusal(
+            owner: owner, explicitSocket: explicitSocket
+        ).failure)
         guard var resolution = try await self.resolveRemoteServices(
             candidates: [candidate],
             identity: context.identity,
@@ -565,19 +572,21 @@ extension RuntimeHostResolver {
         return code == .ENOENT || code == .ECONNREFUSED || code == .ENAMETOOLONG
     }
 
+    private static let ownerSocketReceiptNote =
+        "The process ownership receipt does not include a Bridge socket path. No capture was dispatched."
+
     static func ownerRefusal(
         owner: ScreenCaptureKitOwnerLease.OwnerReceipt,
         callerLocal: Bool
     ) -> PreDispatchActionError {
         let ownerText = self.ownerDescription(owner)
         let message = if callerLocal {
-            "Caller-local ScreenCaptureKit is already owned by another Peekaboo process (\(ownerText)). " +
-                "Selected route: caller-local; owner socket: unavailable in the process ownership receipt. " +
-                "No capture was dispatched."
+            "Peekaboo's ScreenCaptureKit lane is already owned by another process (\(ownerText)). " +
+                "Selected route: caller-local. \(self.ownerSocketReceiptNote)"
         } else {
-            "ScreenCaptureKit is owned by another Peekaboo process (\(ownerText)), but no compatible " +
-                "Bridge host for that exact process generation is available. Selected socket: automatic " +
-                "resolution; owner socket: unavailable in the process ownership receipt. No capture was dispatched."
+            "Peekaboo's ScreenCaptureKit lane is owned by another process (\(ownerText)), but automatic resolution " +
+                "found no compatible Bridge host for that exact process generation. " +
+                "Selected socket: automatic resolution. \(self.ownerSocketReceiptNote)"
         }
         let hint = "Use a Bridge socket served by exactly \(ownerText) with the required capture contract."
         return PreDispatchActionError(
@@ -596,8 +605,8 @@ extension RuntimeHostResolver {
         let ownerText = self.ownerDescription(owner)
         let selectedSocket = NSString(string: explicitSocket).standardizingPath
         return PreDispatchActionError(
-            message: "Selected socket: \(selectedSocket). The ScreenCaptureKit owner is \(ownerText), but its " +
-                "owner socket is unavailable in the process ownership receipt. No capture was dispatched.",
+            message: "Selected socket: \(selectedSocket). A compatible Bridge host for the ScreenCaptureKit owner " +
+                "(\(ownerText)) could not be established on this route. \(self.ownerSocketReceiptNote)",
             code: .CAPTURE_FAILED,
             hint: "Explicit --capture-engine classic can avoid ScreenCaptureKit on this socket if the host proves " +
                 "a safe classic path. Modern capture requires a Bridge host served by the exact owner generation.",
@@ -613,8 +622,9 @@ extension RuntimeHostResolver {
         let ownerText = self.ownerDescription(owner)
         let selectedSocket = NSString(string: requiredSocket).standardizingPath
         return PreDispatchActionError(
-            message: "ScreenCaptureKit owner \(ownerText) does not serve selected socket \(selectedSocket); " +
-                "the owner socket is unavailable in the process ownership receipt. No capture was dispatched.",
+            message: "Selected socket: \(selectedSocket). A compatible Bridge host for the ScreenCaptureKit owner " +
+                "(\(ownerText)) and the required build could not be established on this route. " +
+                self.ownerSocketReceiptNote,
             code: .CAPTURE_FAILED,
             hint: "The selected socket must match the owner generation and required build for this stateful request.",
             reason: .runtimeIncompatible,

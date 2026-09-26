@@ -20,9 +20,12 @@ public final class SnapshotMutationRecordingManager: SnapshotManagerProtocol {
     public private(set) var ownsCalls: [String] = []
     public private(set) var createCalls: [Date?] = []
     public private(set) var createExplicitCallCount = 0
+    public private(set) var storeDetectionResultCalls: [String] = []
     public var failFinish = false
     public var ownsSnapshotError: (any Error)?
     public var getDetectionResultError: (any Error)?
+    /// Suspends after real acquisition, before the caller receives the lease.
+    public var afterBeginSnapshotMutation: (@MainActor (SnapshotMutationLease) async -> Void)?
 
     private let wrapped: any SnapshotManagerProtocol
     private let producerBoundSnapshotReferencesOverride: Bool?
@@ -100,6 +103,7 @@ public final class SnapshotMutationRecordingManager: SnapshotManagerProtocol {
     }
 
     public func storeDetectionResult(snapshotId: String, result: ElementDetectionResult) async throws {
+        self.storeDetectionResultCalls.append(snapshotId)
         try await self.wrapped.storeDetectionResult(snapshotId: snapshotId, result: result)
     }
 
@@ -160,6 +164,10 @@ public final class SnapshotMutationRecordingManager: SnapshotManagerProtocol {
         self.wrapped.getSnapshotStoragePath()
     }
 
+    public func getPersistedSnapshotMapPath(snapshotId: String) -> String? {
+        self.wrapped.getPersistedSnapshotMapPath(snapshotId: snapshotId)
+    }
+
     public func storeScreenshot(_ request: SnapshotScreenshotRequest) async throws {
         try await self.wrapped.storeScreenshot(request)
     }
@@ -191,7 +199,9 @@ public final class SnapshotMutationRecordingManager: SnapshotManagerProtocol {
 
     public func beginSnapshotMutation(snapshotId: String) async throws -> SnapshotMutationLease {
         self.beginCalls.append(snapshotId)
-        return try await self.wrapped.beginSnapshotMutation(snapshotId: snapshotId)
+        let lease = try await self.wrapped.beginSnapshotMutation(snapshotId: snapshotId)
+        await self.afterBeginSnapshotMutation?(lease)
+        return lease
     }
 
     public func finishSnapshotMutation(

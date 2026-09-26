@@ -234,8 +234,12 @@ enabled `desktopObservation` operation is absent; an older host cannot silently 
 and run its default backend. `auto` remains compatible, and request-scoped selection does not alter
 the long-lived daemon's fallback policy.
 
-ScreenCaptureKit coordination covers Peekaboo's own CLI/app processes and selected Bridge hosts. Running third-party
-capture apps, including Claude and OpenClaw, does not block capture or require those apps to publish Peekaboo receipts.
+ScreenCaptureKit coordination covers Peekaboo's CLI/app processes and applications that embed or explicitly register
+Peekaboo's capture runtime. Merely running a third-party application that uses ScreenCaptureKit does not make it a
+Peekaboo participant or require it to publish Peekaboo receipts. An application such as OpenClaw can participate when
+it embeds Peekaboo; its registered process may own Peekaboo's ScreenCaptureKit lane even when another Bridge socket is
+selected. Process ownership receipts identify the owner generation and build, not its Bridge socket path. A missing
+socket path in that receipt does not mean the owner has no reachable listener.
 
 Capture support and startup preparation are separate, additive handshake contracts at the existing protocol version.
 `screenCaptureKitOwnershipEnforcement` and `classicCaptureWithoutScreenCaptureKit` are derived from the host's concrete
@@ -250,11 +254,14 @@ on that same socket when it proves no in-process SCK, while auto and modern retu
 AX-only operations remain independent. Typed ownership errors also survive capture, permission, and Bridge error
 conversion; a refused SCK entry does not erase an earlier desktop mutation outcome.
 
-For one-shot CLI capture with an explicit socket, a credible live SCK owner in a different process can make an
+For CLI capture or a persistent Agent/MCP runtime with an explicit socket, a credible live SCK owner in a different process can make an
 otherwise ready host unsuitable for automatic SCK capture. When that authenticated host also proves classic capture
 and request-local engine selection, the CLI selects explicit classic before transport and keeps the same socket and
-process generation. This automatic-engine exception does not change raw Bridge auto/modern admission, unknown-readiness
-refusals, implicit routing, or persistent MCP startup. Explicit modern remains bound to the exact SCK owner.
+process generation. In a persistent runtime, automatic `see` and `image` observations use that same classic path;
+explicit modern and raw SCK-only capture calls refuse before transport for the lifetime of that runtime. This
+automatic-engine exception does not change raw Bridge auto/modern admission, unknown-readiness refusals, or implicit
+routing. Every request still validates the authenticated listener and its signed result; a replacement listener is
+not silently adopted. Explicit modern remains bound to the exact SCK owner.
 
 Typed terminal error fields additionally require the raw client offer `screenCaptureKitOwnershipDiagnostics`, bound to
 an authenticated operation session. Before computing the terminal response digest and signing its receipt, the host
@@ -366,6 +373,13 @@ Mutating operations remain indeterminate and retry-unsafe because the unsigned r
 Window and frontmost capture receipts bind the exact process/window identity returned by capture metadata; a missing
 target or a window ID that contradicts the request is rejected. Screen and area captures remain targetless global reads.
 
+Browser batch results share one progress validator for signed and legacy receiptless responses. Counts describe
+mutation calls, not the total calls in a mixed read/mutation batch. Typed failures must agree with their projected
+outcomes; malformed or contradictory progress cannot become permission to retry. Signed validation additionally
+requires a canonical connection receipt even for a zero-dispatch refusal and `deliveryAccepted` evidence for success.
+Receiptless compatibility still permits successful `operationStillRunning` evidence and skips target attribution only
+for a proven pre-dispatch refusal. Connection and signature checks remain outside the shared progress validator.
+
 Protocol `1.37` adds `processGenerationBoundElementMutations`. Current clients require this capability, attested
 operation receipts, and the existing `setValueResultTargetBinding` contract before sending `setValue` or
 `performAction`. The host binds the snapshot receipt, final resolved AX element PID, canonical outcome, and returned
@@ -374,6 +388,15 @@ written. A current 1.37-capable host advertises these operations only when its a
 generation-bound mutations and canonical outcomes. It removes `setValue` and `performAction` from downgraded or
 receiptless handshakes and rejects direct requests without the negotiated capability before invoking the provider. A
 claimed success without its process-generation target is treated as indeterminate and retry-unsafe.
+
+The optional raw client offer `setValueVerification` carries native-produced value verification in the existing
+`ElementActionResult`: the resolved comparison kind, selected/value attribute route, and tagged actual readback.
+Signed result binding reuses native coercion and numeric tolerance without interpreting literal text as a number.
+The offer is bound to one authenticated operation session at protocol 1.37 or later. Hosts remove the optional
+evidence before hashing or encoding responses for non-offering or receiptless clients, so old decoders reconstruct
+the same signed bytes. The witness also captures the baseline presentation from that same raw observation; after
+validating its exact native rendering and original typed request binding, legacy projection restores that presentation.
+Absent evidence retains exact-string result binding; malformed evidence is rejected before it can be projected away.
 
 Protocol `1.34` introduced three independent capabilities:
 
@@ -488,6 +511,18 @@ response bytes. Protocol 1.5 desktop observation provides the raster metadata, w
 - Use `--bridge-socket <path>` or `PEEKABOO_BRIDGE_SOCKET` to override host discovery.
 - Use `PEEKABOO_DAEMON_SOCKET` only to change the auto-start daemon socket without treating it as an explicit Bridge override.
 - Use `peekaboo bridge status` to verify which host would be selected and why (probe results, handshake errors, etc.).
+
+Bridge status separates `handshake succeeded` from permissions, advertised capture support, desktop-observation
+enablement, and ScreenCaptureKit preparation. The selected remote host shows these diagnostics without `--verbose`;
+verbose candidate lines use the same summary. Granted permissions and a successful handshake do not establish the
+capture-ownership contract. `unproven` support means the advertised operation and capabilities do not establish that
+contract; it is not an instruction to bypass the ownership check.
+
+`SCK preparation: ready to attempt` reports a ready preparation observation with a timestamp and no recorded failure.
+It does not mean capture succeeded or that this host currently owns ScreenCaptureKit. Blocked, unavailable, missing,
+or incomplete preparation remains explicit, including unknown readiness on legacy hosts. Status performs no capture
+to verify these fields and does not change routing or admission. `--json` retains the existing handshake fields,
+including `hostCapabilities` and `screenCaptureKitReadiness`, without adding human presentation text.
 
 ## Screen Recording troubleshooting
 

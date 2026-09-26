@@ -38,6 +38,7 @@ enum MCPToolResponseMetadataProjector {
         "browser_execution",
         "error_code",
         "execution_policy",
+        "snapshot_invalidation",
         "target_identity",
         "target_receipt",
     ])
@@ -91,6 +92,12 @@ enum MCPToolResponseMetadataProjector {
         }
         if toolName == "permissions" {
             allowed.formUnion(Self.permissionKeys)
+        }
+        if toolName == "see" || toolName == "inspect_ui" {
+            allowed.insert("focused_element")
+        }
+        if toolName == "agent" {
+            allowed.insert("recordedOutcomeNotice")
         }
         return fields.filter { allowed.contains($0.key) }
     }

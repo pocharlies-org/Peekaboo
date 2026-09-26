@@ -93,6 +93,14 @@ extension SeeCommand {
     }
 
     private func outputJSONResults(context: SeeCommandRenderContext) throws {
+        let output = self.makeJSONResult(
+            context: context,
+            snapshotPaths: self.snapshotPaths(for: context, snapshots: self.services.snapshots)
+        )
+        try self.outputSeeSuccessJSON(data: output, receipt: context.receipt)
+    }
+
+    func makeJSONResult(context: SeeCommandRenderContext, snapshotPaths: SnapshotPaths) -> SeeResult {
         let mutationTargetingAvailable = context.snapshotReusable
         let uiElements: [UIElementSummary] = context.elements.all.map { element in
             UIElementSummary(
@@ -116,9 +124,7 @@ extension SeeCommand {
             )
         }
 
-        let snapshotPaths = self.snapshotPaths(for: context)
-
-        let output = SeeResult(
+        return SeeResult(
             snapshot_id: context.snapshotReusable ? context.snapshotId : nil,
             snapshot_reusable: context.snapshotReusable,
             semantic_scope: context.semanticScope,
@@ -128,6 +134,7 @@ extension SeeCommand {
             ui_map: snapshotPaths.map,
             application_name: context.metadata.windowContext?.applicationName,
             window_title: context.metadata.windowContext?.windowTitle,
+            focused_element: context.snapshotReusable ? context.metadata.windowContext?.focusedElement : nil,
             is_dialog: context.metadata.isDialog,
             element_count: context.metadata.elementCount,
             interactable_count: mutationTargetingAvailable
@@ -142,8 +149,6 @@ extension SeeCommand {
             observation: context.observation,
             coordinate_context: context.coordinateContext
         )
-
-        try self.outputSeeSuccessJSON(data: output, receipt: context.receipt)
     }
 
     private func getMenuBarItemsSummary() async -> MenuBarSummary {
@@ -266,13 +271,16 @@ extension SeeCommand {
         }
     }
 
-    private func snapshotPaths(for context: SeeCommandRenderContext) -> SnapshotPaths {
+    func snapshotPaths(
+        for context: SeeCommandRenderContext,
+        snapshots: any SnapshotManagerProtocol
+    ) -> SnapshotPaths {
         let publishesScreenshotPaths = !self.usesTemporaryScreenshotOutput
         return SnapshotPaths(
             raw: publishesScreenshotPaths ? context.screenshotPath : "",
             annotated: publishesScreenshotPaths ? context.annotatedPath ?? "" : "",
             map: context.snapshotReusable
-                ? self.services.snapshots.getSnapshotStoragePath() + "/\(context.snapshotId)/snapshot.json"
+                ? snapshots.getPersistedSnapshotMapPath(snapshotId: context.snapshotId) ?? ""
                 : ""
         )
     }
