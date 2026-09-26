@@ -18,6 +18,7 @@ public final class HotkeyService {
     private let logger = Logger(subsystem: "boo.peekaboo.core", category: "HotkeyService")
     private let postEventAccessEvaluator: @MainActor @Sendable () -> Bool
     private let eventPoster: @MainActor @Sendable (CGEvent, pid_t) -> Void
+    private let foregroundEventPoster: @MainActor @Sendable (CGEvent) -> Void
     private let frontmostApplicationResolver: @MainActor @Sendable () -> NSRunningApplication?
     private let runningApplicationResolver: @MainActor @Sendable (pid_t) -> NSRunningApplication?
     private let processStartIdentityProvider: @Sendable (pid_t) -> UInt64?
@@ -25,6 +26,8 @@ public final class HotkeyService {
     private let heldInterEventDelay: @MainActor @Sendable () -> Void
     let inputPolicy: UIInputPolicy
     private let actionInputDriver: any ActionInputDriving
+    private let focusedTextHotkey: @MainActor (
+        String, CGEventFlags, pid_t, UIAutomationTarget.ExactWindow?) throws -> Bool
     private let desktopOperationExecutor: DesktopOperationExecutor
     private let operationFinalizer: @MainActor () -> Void
 
@@ -50,9 +53,19 @@ public final class HotkeyService {
     init(
         inputPolicy: UIInputPolicy = .currentBehavior,
         actionInputDriver: any ActionInputDriving = ActionInputDriver(),
+        focusedTextHotkey: @escaping @MainActor (
+            String, CGEventFlags, pid_t, UIAutomationTarget.ExactWindow?) throws
+            -> Bool = { key, flags, pid, exactWindow in
+                try BackgroundInputDriver.performFocusedTextHotkey(
+                    primaryKey: key,
+                    modifierFlags: flags,
+                    targetProcessIdentifier: pid,
+                    exactWindow: exactWindow)
+            },
         postEventAccessEvaluator: @escaping @MainActor @Sendable ()
             -> Bool = { CGPreflightPostEventAccess() },
         eventPoster: @escaping @MainActor @Sendable (CGEvent, pid_t) -> Void = HotkeyService.defaultTargetedEventPoster,
+        foregroundEventPoster: @escaping @MainActor @Sendable (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
         frontmostApplicationResolver: @escaping @MainActor @Sendable () -> NSRunningApplication? = {
             NSWorkspace.shared.frontmostApplication
         },
@@ -70,8 +83,10 @@ public final class HotkeyService {
     {
         self.inputPolicy = inputPolicy
         self.actionInputDriver = actionInputDriver
+        self.focusedTextHotkey = focusedTextHotkey
         self.postEventAccessEvaluator = postEventAccessEvaluator
         self.eventPoster = eventPoster
+        self.foregroundEventPoster = foregroundEventPoster
         self.frontmostApplicationResolver = frontmostApplicationResolver
         self.runningApplicationResolver = runningApplicationResolver
         self.processStartIdentityProvider = processStartIdentityProvider
@@ -100,7 +115,7 @@ public final class HotkeyService {
         -> UIInputExecutionResult
     {
         self.logger.debug("Hotkey requested: '\(keys)', hold: \(holdDuration)ms")
-        let parsedKeys = try self.parsedKeys(keys)
+        let parsedKeys = try Self.parsedKeys(keys)
         var application: NSRunningApplication?
         var bundleIdentifier: String?
         let plan = try DesktopOperationPlan(
@@ -177,7 +192,7 @@ public final class HotkeyService {
             "Targeted hotkey requested: '\(keys)', hold: \(holdDuration)ms, pid: \(targetProcessIdentifier)")
 
         try BackgroundHotkeyPolicy.validate(keys: keys)
-        let parsedKeys = try self.parsedKeys(keys)
+        let parsedKeys = try Self.parsedKeys(keys)
         let targetValidator: @MainActor @Sendable () async throws -> Void = {
             if let expectedProcessIdentity = automationTarget.processIdentity,
                self.processStartIdentityProvider(targetProcessIdentifier) !=
@@ -224,19 +239,21 @@ public final class HotkeyService {
                     emittedUnitCount: 0)
                 try Self.validateTargetProcess(targetProcessIdentifier)
                 let plan = try self.makeHotkeyPlan(parsedKeys)
-                if try BackgroundInputDriver.performFocusedTextHotkey(
-                    primaryKey: plan.primaryKey,
-                    modifierFlags: plan.modifierFlags,
-                    targetProcessIdentifier: targetProcessIdentifier)
+                if try self.focusedTextHotkey(
+                    plan.primaryKey,
+                    plan.modifierFlags,
+                    targetProcessIdentifier,
+                    automationTarget.exactWindow)
                 {
                     if automationTarget.exactWindow == nil {
                         try await self.validateDelivery(targetValidator, emittedUnitCount: 1)
                     }
                     return .dispatchedUnverified(
                         delivery: DesktopActionOutcome.Delivery(
-                            mechanism: .accessibilityAction,
+                            mechanism: .accessibilityValue,
                             mode: .background),
-                        evidence: .deliveryAccepted)
+                        evidence: .deliveryAccepted,
+                        unitCount: .one)
                 }
 
                 let holdNanoseconds = try Self.holdNanoseconds(for: holdDuration)
@@ -281,32 +298,43 @@ public final class HotkeyService {
         let plan = try self.makeHotkeyPlan(keys)
         let holdNanoseconds = try Self.holdNanoseconds(for: holdDuration)
         let source = CGEventSource(stateID: .hidSystemState)
-        guard
-            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: plan.keyCode, keyDown: true),
-            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: plan.keyCode, keyDown: false)
+        guard let events = ForegroundKeyboardEventPair(
+            source: source,
+            keyCode: plan.keyCode,
+            keyDownFlags: plan.modifierFlags)
         else {
             throw PeekabooError.operationError(message: "Failed to create keyboard events")
         }
 
-        keyDown.flags = plan.modifierFlags
-        keyUp.flags = plan.modifierFlags
-        keyDown.post(tap: .cghidEventTap)
+        try Task.checkCancellation()
+        self.foregroundEventPoster(events.keyDown)
+        var emittedUnitCount = 1
         var keyUpPosted = false
-        defer {
-            if !keyUpPosted {
-                keyUp.post(tap: .cghidEventTap)
+        func releaseKey() {
+            guard !keyUpPosted else { return }
+            self.foregroundEventPoster(events.keyUp)
+            emittedUnitCount += 1
+            keyUpPosted = true
+        }
+        defer { releaseKey() }
+
+        do {
+            if holdNanoseconds > 0 {
+                try await self.holdSleeper(holdNanoseconds)
             }
-        }
 
-        if holdNanoseconds > 0 {
-            try await Task.sleep(nanoseconds: holdNanoseconds)
-        }
+            releaseKey()
 
-        keyUp.post(tap: .cghidEventTap)
-        keyUpPosted = true
-
-        if holdDuration <= 0 {
-            try await Task.sleep(nanoseconds: 10_000_000)
+            if holdDuration <= 0 {
+                try await self.holdSleeper(10_000_000)
+            }
+        } catch {
+            releaseKey()
+            throw InputDeliveryIndeterminateError(
+                operation: .hotkey,
+                emittedUnitCount: emittedUnitCount,
+                causeDescription: error.localizedDescription,
+                delivery: .init(mechanism: .globalEvents, mode: .foreground))
         }
     }
 
@@ -548,7 +576,7 @@ extension HotkeyService {
     }
 
     public func parsedKeysForTesting(_ raw: String) throws -> [String] {
-        try self.parsedKeys(raw)
+        try Self.parsedKeys(raw)
     }
 
     func targetedHotkeyPlanForTesting(_ raw: [String]) throws

@@ -18,6 +18,8 @@ struct CommandRuntimeOptions {
     var jsonOutput = false
     var logLevel: LogLevel?
     var captureEnginePreference: String?
+    /// The selected remote route may safely support classic observations but not ScreenCaptureKit.
+    var remoteCapturePolicy: RemoteCapturePolicy = .unrestricted
     /// This command carries the capture-engine choice in its remote request instead of
     /// requiring the caller process to own capture/TCC.
     var transportsCaptureEnginePreference = false
@@ -218,7 +220,9 @@ struct CommandRuntime {
     @MainActor let logger: Logger
 
     @MainActor
-    var observationTimeoutMutationTracker: InteractionMutationTracker? {
+    func observationTimeoutMutationTracker(mayMutateDesktop: Bool) -> InteractionMutationTracker? {
+        // Read-only work neither owns nor extends a caller's desktop mutation lease.
+        guard mayMutateDesktop else { return nil }
         if self.selectedRemoteSocketPath == nil || self.interactionMutationTracker.hasPendingDurableMutation {
             return self.interactionMutationTracker
         }

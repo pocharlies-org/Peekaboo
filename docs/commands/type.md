@@ -22,7 +22,8 @@ that snapshot. Use `press` for standalone keys or chords.
 | `--delay <duration>` | Time between synthetic keystrokes (default `0`; bare values are milliseconds). Valid long delays remain cancellable; cancelling a wait stops the remaining input. |
 | `--wpm <80-220>` | Enable human-typing cadence at the chosen words per minute. |
 | `--profile <linear|human>` | Switch between linear (default, honors `--delay`) and human (honors `--wpm`). |
-| `--clear` | Clear before typing. Background targets prefer one AXValue replacement; keyboard fallback uses Cmd+A, Delete. |
+| `--clear` | Clear before typing. Native background targets prefer one AXValue replacement; web fields and keyboard fallback use Cmd+A, Delete. |
+| `--input-strategy <strategy>` | Override typing delivery: `actionFirst` (background default), `actionOnly`, `synthFirst`, or `synthOnly`. Per-call overrides execute locally. |
 | `--accept-dispatched` | CLI only: also return exit 0 for accepted but unverified dispatch. Keeps the unverified outcome, zero confirmed counts, and observe-before-retry warning. Default remains confirmed change only. |
 | Target flags | `--app <name>`, `--pid <pid>`, or an exact window selector for background input. |
 | `--foreground` | Focus a supplied target or intentionally send foreground/global keyboard input. |
@@ -39,22 +40,36 @@ that snapshot. Use `press` for standalone keys or chords.
 ## Implementation notes
 - Text may be omitted only when `--clear` is used. Chain a following `press` command for Return, Tab, Escape, or Delete.
 - Escape handling splits literal text and key presses: `"Hello\nWorld"` becomes `text("Hello"), key(.return), text("World")`, so newlines don’t require separate flags.
+- Foreground special-key events explicitly clear inherited modifier flags on both key-down and key-up. Their existing keycodes and unverified delivery semantics are unchanged.
 - Exact window selectors and fresh exact-window snapshots preserve PID generation, window ID/bounds, and focused-element identity through dispatch. Stale or ambiguous receipts fail before typing.
-- A fresh exact-window `see` records focus only when exactly one element in that window explicitly reports
-  `AXFocused=true`. Cached trees, a first editable-field guess, and application-level focus from another window are
-  never accepted. To focus a known field without activating the app, use its fresh element ID with background
-  `click`, run `see` again, then type with the new snapshot.
+- Focused web controls may expose their exact owner through the native `AXWindow` link instead of a direct window ID; both paths retain the same exact-window checks.
+- Ordinary snapshot-backed CLI and MCP typing reserve the snapshot before focus or input. A pending mutation or a prior outcome requiring fresh observation refuses further typing, including `--accept-dispatched`; read-only inspection of that snapshot remains available. Pixel-focus typing retains its single service-owned reservation.
+- A fresh exact-window `see` records focus from a uniquely focused captured element. When ancestor groups also
+  report `AXFocused=true`, a complete observation can disambiguate only if the application's native focused reference
+  stays stable across traversal, uniquely matches a genuinely focused captured node, and proves the same process/window.
+  Cached trees, a first editable-field guess, and application-level focus from another window are never accepted;
+  partial or truncated captures cannot use this additional corroboration. Input still revalidates the live receiver.
+  To focus a known field without activating the app, use its fresh element ID with background `click`, run `see`
+  again, then type with the new snapshot.
 - Exact background delivery strictly validates the initial focused-element frame. Subsequent units and text
   completion allow that same uniquely identified element to reflow: role and identifier (or title when no identifier
   exists) must still match, its center must remain inside the captured window, and `AXFocused` and the application's
   exact internal key window must still agree. This applies to both Accessibility edits and keyboard events. Process
   relaunch, window/bounds drift, sibling or ambiguous focus, a different internal key window, or an unreadable focus
   attribute stops delivery with retry-unsafe prefix evidence after any input was emitted.
+- Receipt-pinned Accessibility text, clear, and editing-key writes retain the native receiver selected by that unit's
+  focus validation. A different or unreadable final receiver refuses before mutation or keyboard fallback, even when
+  it exposes the same role and identifier; the retained receiver can still reflow under continuation validation.
 - A delivered trailing special key may intentionally change focus, so it returns dispatched-unverified without an
   unchanged-focus check afterward. Any remaining input still requires the same receiver's continuation proof.
 - Default profile is `linear`, using no inter-key delay for fast deterministic input. Passing `--wpm` opts into human cadence; `--profile human` uses 140 WPM when `--wpm` is omitted.
-- Background delivery prefers Accessibility value and selection edits for writable focused text controls. Unsupported or rejected AX routes fall back to process-targeted CoreGraphics keyboard events, which require Event Synthesizing access. Apps that accept neither background route may still need `--foreground`.
-- Printable event fallback carries Unicode instead of physical US key positions, so the requested characters remain stable across active keyboard layouts.
+- The built-in background typing policy is `actionFirst`: background delivery tries Accessibility value and selection edits for writable focused text controls, then process-targeted keyboard events only when the edit is unsupported. `actionOnly` never emits keyboard events, including for clear and event-only keys such as Return or Tab. Explicit `synthFirst` and `synthOnly` bypass AX value and selection edits. Per-app typing policy is resolved once from the target process, never from the foreground app.
+- Under `actionFirst`, controls beneath a proven `AXWebArea` use process-targeted keyboard events before any AX value or selection write, including clear and editable special keys; web controls can accept AX writes without applying them. `actionOnly` refuses these edits instead of emitting keys. The focused-text Cmd+A optimization uses the same gate and never writes a selection into a proven web control; its existing hotkey strategy and hold-duration behavior are unchanged. Before an AX edit is selected, a bounded parent walk must establish the route and recheck the same focused AX receiver; an unproven route refuses that unit before input. Route classification follows retained/exact receiver validation and does not replace process-generation or per-unit focus checks.
+- Local native Accessibility edits do not require Event Synthesizing access; local keyboard delivery checks that permission only when needed. Bridge-hosted targeted typing still requires Post Event permission at admission, even when a native edit would suffice. Accepted or uncertain AX writes never fall back to keyboard input, and accepted events never retry through AX. A failed later unit retains any accepted prefix as retry-unsafe. Apps that accept neither background route may still need `--foreground`.
+- Pixel-focus typing retains its explicitly requested AX focus prelude under every typing strategy; `synthOnly` controls text/value/selection delivery, not that separate focus operation. The focus write is composed with any later typing failure.
+- The legacy SDK `type(text:target:clearExisting:typingDelay:snapshotId:)` retains its shipped `synthFirst` default and synthetic focus/clear/type behavior; default calls do not probe AX replacement eligibility. Explicit global, type, or per-app strategies still apply. When an action strategy is explicitly selected, one AX replacement is eligible only with `clearExisting: true`, zero `typingDelay`, and a fresh check proving the named target is the current keyboard receiver; cached focus or a frontmost app/window alone is insufficient. Positive delay or a successfully read focus mismatch lets `actionFirst` use the existing synthetic path; `actionOnly` refuses before dispatch. Unreadable or uncertain focus stops without input or fallback under either action strategy. The SDK's nil-target keyboard fallback and CLI foreground action-array delivery are unchanged.
+- Legacy SDK AX replacement also requires bounded, same-process ancestry proving a non-web receiver. A proven `AXWebArea` descendant uses the existing keyboard route under `actionFirst` and refuses under `actionOnly`, before any value write. Unreadable, ambiguous, or incomplete ancestry stops without input or fallback. AX value readback alone does not establish page input-event behavior; this typing-only eligibility rule does not change explicit `set-value` semantics.
+- Printable event fallback carries Unicode instead of physical US key positions and clears inherited modifier flags, so the requested literal text remains independent of active keyboard layouts and held user modifiers. This does not change foreground keyboard hold/release behavior.
 - Background app/PID delivery is pinned to the process generation resolved before dispatch. Peekaboo revalidates the receipt before every character or special action, stops on target exit/relaunch, and reports partial delivery as retry-unsafe. Requests containing non-empty text, clear, or an editable focused-text key require Bridge protocol 1.36 plus `compositeTypeDelivery`, because those actions may use AXValue delivery; event-only special keys retain their earlier compatibility floor.
 - Event injection is not evidence that the receiver changed. By default, a native `dispatched_unverified` result is
   non-success and requires a fresh observation. Standalone CLI callers can opt into `--accept-dispatched` to return
@@ -97,7 +112,7 @@ peekaboo type "hello" --at 320,180 --coordinate-space image_pixels --snapshot "$
 ```
 
 ## Troubleshooting
-- Verify Screen Recording + Accessibility permissions (`peekaboo permissions status`). Background typing also requires Event Synthesizing access for the sending process; request it with `peekaboo permissions request event-synthesizing`.
+- Verify Screen Recording + Accessibility permissions (`peekaboo permissions status`). Keyboard-event delivery and Bridge-hosted targeted typing also require Event Synthesizing access for the sending process; local native Accessibility edits do not. Request it when needed with `peekaboo permissions request event-synthesizing`.
 - Confirm your process with `peekaboo app list`, its exact window with `peekaboo window list`, and current UI with `peekaboo see` before rerunning.
 - If you see `SNAPSHOT_NOT_FOUND`, regenerate the snapshot with `peekaboo see`.
 - Re-run with `--json` or `--verbose` to surface detailed errors.

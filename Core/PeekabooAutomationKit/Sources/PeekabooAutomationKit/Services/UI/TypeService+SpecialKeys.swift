@@ -12,30 +12,6 @@ extension TypeService {
         try TypeServiceSpecialKeyMapping.postKey(keyCode)
         return .dispatched(delivery: keyboardDelivery, keyPressCount: 1)
     }
-
-    static func typeTargetedSpecialKey(
-        _ key: PeekabooFoundation.SpecialKey,
-        targetProcessIdentifier: pid_t,
-        keyboardDelivery: DesktopActionOutcome.Delivery) throws -> TypeActionDispatchSummary
-    {
-        switch try BackgroundInputDriver.performFocusedTextKey(
-            key,
-            targetProcessIdentifier: targetProcessIdentifier)
-        {
-        case .accessibilityValue:
-            return .dispatched(
-                delivery: .init(mechanism: .accessibilityValue, mode: .background),
-                keyPressCount: 0)
-        case .noChange:
-            return .noChange
-        case .unsupported:
-            let keyCode = TypeServiceSpecialKeyMapping.keyCode(for: key)
-            try BackgroundInputDriver.tapKey(
-                keyCode: keyCode,
-                targetProcessIdentifier: targetProcessIdentifier)
-            return .dispatched(delivery: keyboardDelivery, keyPressCount: 1)
-        }
-    }
 }
 
 enum TypeServiceSpecialKeyMapping {
@@ -105,15 +81,24 @@ enum TypeServiceSpecialKeyMapping {
         return self.aliases[key] ?? key
     }
 
-    static func postKey(_ keyCode: CGKeyCode) throws {
-        guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false)
+    @MainActor
+    static func postKey(
+        _ keyCode: CGKeyCode,
+        makeEvent: ForegroundKeyboardEventPair.EventFactory = ForegroundKeyboardEventPair.makeCGEvent,
+        eventPoster: (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
+        interEventDelay: () -> Void = { Thread.sleep(forTimeInterval: 0.001) }) throws
+    {
+        guard let events = ForegroundKeyboardEventPair(
+            source: nil,
+            keyCode: keyCode,
+            keyDownFlags: [],
+            makeEvent: makeEvent)
         else {
             throw PeekabooError.operationError(message: "Failed to create keyboard event")
         }
 
-        keyDown.post(tap: .cghidEventTap)
-        Thread.sleep(forTimeInterval: 0.001)
-        keyUp.post(tap: .cghidEventTap)
+        eventPoster(events.keyDown)
+        interEventDelay()
+        eventPoster(events.keyUp)
     }
 }

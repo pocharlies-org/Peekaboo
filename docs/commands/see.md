@@ -10,6 +10,12 @@ read_when:
 `peekaboo see` captures the current macOS UI, extracts accessibility metadata, and (optionally) saves annotated screenshots. CLI and agent flows rely on these UI maps to find fresh element IDs, bounds, labels, and snapshot IDs.
 
 Observation is read-only with respect to focus: targeting a background app does not activate it or move its windows.
+
+Timeout handling for plain observations, including AX-tree-only reads, does not advance the desktop mutation
+watermark or borrow an enclosing mutation's barrier. Completing a successful read does not by itself invalidate its
+fresh implicit snapshot. Other desktop mutations can still invalidate it. Explicit `--web-focus` and menu-opening
+observations retain their mutation barriers, including until timed-out or cancelled native work finishes.
+
 With implicit host discovery and the standard daemon path, `see` prefers the current CLI build's deterministic
 build-scoped daemon and may auto-start it before considering a healthy Peekaboo.app host. This applies to pixel and
 AX-tree-only forms because their snapshots and capability decisions are host-memory state. An explicit
@@ -151,11 +157,12 @@ When `--json` is supplied, the CLI prints:
 
 - `snapshot_id` – producer-bound `ps1_` reference for subsequent `click --snapshot …` and `type --snapshot …`.
 - `semantic_scope`, `snapshot_reusable`, and `mutation_targeting_available` – authority for the returned semantics. `application_partial` always carries `snapshot_id: null`, an empty `ui_map`, both authority booleans `false`, `interactable_count: 0`, and no actionable/value-settable element claims; its elements are read-only context from the exact window's attested process, not evidence for the requested exact window.
-- `ui_map` – path to the persisted snapshot file (`~/.peekaboo/snapshots/<id>/snapshot.json`).
+- `ui_map` – path to an existing, producer-owned snapshot file when the selected snapshot manager exposes one locally; otherwise an empty string. In-memory and Bridge-hosted snapshots normally have no caller-local file. An empty map path does not invalidate `snapshot_id`, inline `ui_elements`, or the reported mutation authority; use the snapshot reference for follow-up commands.
 - `ui_elements` – flattened AX nodes with honest `is_actionable` and optional `is_value_settable` capability metadata.
+- `focused_element` – optional existing observed focus identity (`processIdentifier`, `windowID`, `role`, optional `title`/`identifier`, and `frame`). Its frame uses global logical coordinates even for ROI captures; `identifier` is an AX identifier, not a snapshot-local element ID. Missing focus means unknown, including absent, ambiguous, cached, or application-partial observations—not that no element is focused. This readback does not grant input authority or guarantee that focus remains unchanged; typing still requires its normal snapshot and live receiver checks.
 - `coordinate_context` – capture-owned raster mapping. ROI results include the full-window and cropped viewport rectangles described above.
 - `interactable_count`, `element_count`, `capture_mode`, and performance metadata for debugging.
-- Each `ui_elements[n]` entry mirrors the raw AX metadata we capture—semantic `role`, raw `ax_role`, `title`, `label`, scalar `value`, **`description`**, `role_description`, `help`, `identifier`, known enabled/selected state, value-settable capability, and the keyboard shortcut if one exists. The persisted `ui_map` keeps the same fields for follow-up tools. That makes controls whose name lives only in `AXDescription`, including Chrome toolbar icons and unlabeled sliders, searchable without relying on coordinates.
+- Each `ui_elements[n]` entry mirrors the raw AX metadata we capture—semantic `role`, raw `ax_role`, `title`, `label`, scalar `value`, **`description`**, `role_description`, `help`, `identifier`, known enabled/selected state, value-settable capability, and the keyboard shortcut if one exists. When available, the persisted `ui_map` keeps the same fields for follow-up tools. That makes controls whose name lives only in `AXDescription`, including Chrome toolbar icons and unlabeled sliders, searchable without relying on coordinates.
 - GLM vision model analysis responses are converted from the model's 0-1000 bounding box space into delivered screenshot pixels before they are printed. Screenshot pixels are not CLI `click --at` coordinates: map them through `coordinate_context` to global logical points before using `--global`, or use the MCP `image_pixels`/`normalized` coordinate mapping.
 
 Use `jq` or any JSON parser to find elements:
@@ -167,9 +174,16 @@ peekaboo see --app "Safari" --json --path /tmp/safari-see.png \
 # Toolbar buttons that only expose AXDescription:
 peekaboo see --app "Google Chrome" --json --path /tmp/chrome-see.png \
   | jq '.data.ui_elements[] | select((.description // "") | test("Wingman"; "i"))'
+
+# Inspect already-proven focus without opening the snapshot file:
+peekaboo see --window-id 12345 --tree --no-screenshot --json \
+  | jq '.data.focused_element // null'
 ```
 
 ## Troubleshooting tips
+
+- `--verbose` adds a content-free observed-focus summary to the existing capture log (`debug_logs` in JSON mode): raw true/false/unknown `AXFocused` counts, focused element types, `rawResolver`, and cache/partial/truncation/attached-receipt flags. Raw counts include menu-bar nodes; the resolver retains its existing menu-bar exclusion. `rawResolver` describes the boolean-only candidates, while `attached` reflects the final observation, which may additionally corroborate the native application receiver. ROI-filtered captures skip raw re-resolution because their cropped subset cannot explain the original observation's focus. Logging itself adds no Accessibility reads or input authority.
+- Some apps mark focused ancestor groups as well as their text field. A fresh, complete exact-window observation can resolve that ambiguity only when the application's native focused reference stays unchanged across traversal, uniquely matches a genuinely focused captured node, and proves the same process/window ownership. The optional initial focus read reserves most of the remaining deadline for ordinary traversal; it never restarts the observation timeout. Missing or unstable evidence stays unknown; cached, application-partial and truncated captures cannot use this additional corroboration. Input still performs its normal live receiver and key-window validation.
 
 - An inconsistent-response-evidence refusal means the returned capture could not be verified against the request. Check the specific evidence named in the error. Use `--verbose` to identify the selected runtime and Bridge socket before inspecting that host; a current client and host can still hit a runtime bug, so an update is not assumed to resolve every verification refusal.
 

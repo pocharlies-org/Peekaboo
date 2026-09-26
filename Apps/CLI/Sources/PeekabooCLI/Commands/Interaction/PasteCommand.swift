@@ -29,7 +29,10 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
     @Flag(name: .long, help: "Allow payloads larger than 10 MB")
     var allowLarge = false
 
-    @Option(help: "Delay before restoring the previous clipboard (bare values are milliseconds; default: 150ms)")
+    @Option(
+        help: "Delay before restoring the previous clipboard (bare values are milliseconds; " +
+            "default: 150ms, maximum 10000ms)"
+    )
     var restoreDelay: CLIDuration?
 
     @OptionGroup var target: InteractionTargetOptions
@@ -37,6 +40,7 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
 
     @RuntimeStorage var runtime: CommandRuntime?
     var runtimeOptions = CommandRuntimeOptions()
+    var transactionGate: any ClipboardPasteTransactionGating = NativeClipboardPasteTransactionGate()
 
     private var resolvedText: String? {
         if let primary = self.text, !primary.isEmpty {
@@ -67,11 +71,7 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
         self.logger.setJsonOutputMode(self.jsonOutput)
 
         do {
-            try self.target.validate()
-            try KeyboardDeliverySupport.validateForegroundFlags(
-                foreground: self.focusOptions.foreground,
-                focusOptions: self.focusOptions
-            )
+            try self.validate()
 
             guard self.hasExplicitPayload else {
                 try await self.pasteCurrentClipboard(
@@ -96,10 +96,14 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
 
             let expectedPIDIdentity = try self.explicitPIDIdentity()
             let actionSequence = CommandActionSequenceAccumulator()
+            let clipboardMutation = PasteClipboardMutation()
             let actionRoute = commandActionRoute(for: self.services)
             let outcome = try await self.preservingPasteSequence(actionSequence, route: actionRoute) {
-                try await self.withInteractionMutationInvalidation {
-                    try await ClipboardPasteTransactionGate.withExclusiveTransaction {
+                try await self.transactionGate.withExclusiveTransaction {
+                    try await self.withInteractionMutationInvalidation(
+                        actionSequence: actionSequence,
+                        clipboardMutation: clipboardMutation
+                    ) {
                         let deliveryTarget = try await self.preDispatchBackgroundTarget(
                             expectedPIDIdentity: expectedPIDIdentity
                         )
@@ -113,7 +117,8 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
                             request: request,
                             target: deliveryTarget ?? .foreground,
                             actionSequence: deliveryTarget == nil ? actionSequence : nil,
-                            actionRoute: actionRoute
+                            actionRoute: actionRoute,
+                            clipboardMutation: clipboardMutation
                         )
                     }
                 }
@@ -194,7 +199,8 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
         request: ClipboardWriteRequest,
         target: UIAutomationTarget,
         actionSequence: CommandActionSequenceAccumulator?,
-        actionRoute: DesktopActionOutcome.Route
+        actionRoute: DesktopActionOutcome.Route,
+        clipboardMutation: PasteClipboardMutation
     ) async throws -> ClipboardPasteTransactionOutcome {
         if target.exactWindow != nil {
             _ = try ExactWindowKeyboardRuntime.requireOutcomeProvider(
@@ -255,6 +261,8 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
         restorePending = true
         let setResult: ClipboardReadResult
         do {
+            // A throwing clipboard write can still have changed the pasteboard.
+            clipboardMutation.wasAttempted = true
             setResult = try self.services.clipboard.set(request)
             try Task.checkCancellation()
         } catch {
@@ -454,8 +462,8 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
         let actionSequence = CommandActionSequenceAccumulator()
         let actionRoute = commandActionRoute(for: self.services)
         let outcome = try await self.preservingPasteSequence(actionSequence, route: actionRoute) {
-            let outcome = try await self.withInteractionMutationInvalidation {
-                try await ClipboardPasteTransactionGate.withExclusiveTransaction {
+            let outcome = try await self.transactionGate.withExclusiveTransaction {
+                try await self.withInteractionMutationInvalidation(actionSequence: actionSequence) {
                     let deliveryTarget = try await self.preDispatchBackgroundTarget(
                         expectedPIDIdentity: expectedPIDIdentity
                     )
@@ -715,28 +723,6 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
         }
     }
 
-    private func withInteractionMutationInvalidation<T: Sendable>(
-        _ operation: @MainActor () async throws -> T
-    ) async throws -> T {
-        self.resolvedRuntime.beginInteractionMutation()
-        do {
-            let result = try await operation()
-            await InteractionObservationInvalidator.invalidateAfterMutation(
-                targets: self.resolvedRuntime.interactionMutationTargets,
-                logger: self.logger,
-                reason: "paste"
-            )
-            return result
-        } catch {
-            await InteractionObservationInvalidator.invalidateAfterMutation(
-                targets: self.resolvedRuntime.interactionMutationTargets,
-                logger: self.logger,
-                reason: "paste"
-            )
-            throw error
-        }
-    }
-
     private static func readResult(for request: ClipboardWriteRequest) throws -> ClipboardReadResult {
         guard let primary = request.representations.first else {
             throw ClipboardServiceError.writeFailed("No representations provided.")
@@ -867,6 +853,61 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
     }
 }
 
+extension PasteCommand {
+    private func withInteractionMutationInvalidation<T: Sendable>(
+        actionSequence: CommandActionSequenceAccumulator? = nil,
+        clipboardMutation: PasteClipboardMutation? = nil,
+        _ operation: @MainActor () async throws -> T
+    ) async throws -> T {
+        let tracker = self.resolvedRuntime.interactionMutationTracker
+        let hadPriorMark = tracker.mutationStartedAt != nil
+        let boundary = self.resolvedRuntime.beginInteractionMutation()
+        let sequence = tracker.mutationSequence
+        do {
+            let result = try await operation()
+            await InteractionObservationInvalidator.invalidateAfterMutation(
+                targets: self.resolvedRuntime.interactionMutationTargets,
+                logger: self.logger,
+                reason: "paste"
+            )
+            return result
+        } catch {
+            let metadata = actionErrorEnvelopeMetadata(for: error, isActionCommand: true)
+            if clipboardMutation?.wasAttempted != true,
+               actionSequence?.mutationDisposition.mutationDispatched != true,
+               let outcome = metadata.outcome,
+               outcome.state == .refused,
+               outcome.dispatchState == .none,
+               outcome.retrySafety == .safe,
+               metadata.retrySafe == true,
+               metadata.mutationDispatched == false {
+                // Refusal proves no new effects, not ownership of another operation's pending mark.
+                if !hadPriorMark,
+                   sequence < UInt64.max,
+                   tracker.mutationSequence == sequence,
+                   tracker.mutationStartedAt == boundary,
+                   !tracker.hasFailedInvalidationAttempt,
+                   tracker.preservedSnapshotID == nil,
+                   tracker.preservedAt == nil {
+                    tracker.cancelUncommittedMutation(sequence: sequence)
+                }
+                throw error
+            }
+            await InteractionObservationInvalidator.invalidateAfterMutation(
+                targets: self.resolvedRuntime.interactionMutationTargets,
+                logger: self.logger,
+                reason: "paste"
+            )
+            throw error
+        }
+    }
+}
+
+@MainActor
+private final class PasteClipboardMutation {
+    var wasAttempted = false
+}
+
 private struct ClipboardPasteTransactionOutcome: Sendable {
     let setResult: ClipboardReadResult
     let previousClipboardPresent: Bool
@@ -899,6 +940,19 @@ struct PasteResult: Codable {
 
 @MainActor
 extension PasteCommand: ParsableCommand {
+    mutating func validate() throws {
+        try self.target.validate()
+        try KeyboardDeliverySupport.validateForegroundFlags(
+            foreground: self.focusOptions.foreground,
+            focusOptions: self.focusOptions
+        )
+        guard (0...ClipboardPasteTransactionGate.maximumRestoreDelayMilliseconds)
+            .contains(self.resolvedRestoreDelayMs)
+        else {
+            throw ValidationError("--restore-delay must be between 0 and 10000ms")
+        }
+    }
+
     nonisolated(unsafe) static var commandDescription: CommandDescription {
         MainActorCommandDescription.describe {
             CommandDescription(

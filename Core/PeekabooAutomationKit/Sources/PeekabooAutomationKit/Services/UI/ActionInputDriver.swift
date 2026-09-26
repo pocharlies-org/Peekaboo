@@ -407,18 +407,20 @@ struct ActionInputDriver: ActionInputDriving {
 
         do {
             if !element.isValueSettable, element.isSelectedSettable {
-                let requested = try Self.booleanValue(value, role: element.role)
+                let requested = try ElementValueMutationSemantics.booleanValue(value, role: element.role)
                 let selectedBefore = element.selectedValue
-                let alreadyMatched = selectedBefore == requested
-                if alreadyMatched {
+                if let selectedBefore, selectedBefore == requested {
                     return UIInputExecutionResult.Action(
                         outcome: .confirmedNoChange(),
                         actionName: kAXSelectedAttribute as String,
                         anchorPoint: element.anchorPoint,
-                        elementRole: element.role)
+                        elementRole: element.role,
+                        valueVerification: .init(
+                            attribute: .selected, resolvedKind: .bool, readback: .bool(selectedBefore)))
                 }
                 try element.setAutomationSelected(requested)
-                guard element.selectedValue == requested else {
+                let selectedAfter = element.selectedValue
+                guard selectedAfter == requested, let selectedAfter else {
                     throw Self.unverifiedValueMutationFailure(attribute: kAXSelectedAttribute as String)
                 }
                 let outcome = Self.dispatchedValueMutationOutcome(preStateKnown: selectedBefore != nil)
@@ -426,21 +428,39 @@ struct ActionInputDriver: ActionInputDriving {
                     outcome: outcome,
                     actionName: kAXSelectedAttribute as String,
                     anchorPoint: element.anchorPoint,
-                    elementRole: element.role)
+                    elementRole: element.role,
+                    valueVerification: .init(
+                        attribute: .selected, resolvedKind: .bool, readback: .bool(selectedAfter)))
             }
 
             let valueBefore = element.value
+            let readbackBefore = ElementValueReadback(nativeValue: valueBefore)
+            guard !(valueBefore is NSNumber) || readbackBefore != nil else {
+                throw ActionInputError.failed("Native accessibility integer is outside the supported Int range")
+            }
             let requested = try Self.coerceValue(value, currentValue: valueBefore, role: element.role)
-            let alreadyMatched = Self.value(valueBefore, matches: requested)
+            let alreadyMatched = ElementValueMutationSemantics.matches(readbackBefore, expected: requested)
             if alreadyMatched {
+                guard let readbackBefore, readbackBefore.isFinite else {
+                    throw ActionInputError.failed("Expected a finite native readback")
+                }
                 return UIInputExecutionResult.Action(
                     outcome: .confirmedNoChange(),
                     actionName: AXActionNames.kAXSetValueAction,
                     anchorPoint: element.anchorPoint,
-                    elementRole: element.role)
+                    elementRole: element.role,
+                    valueVerification: .init(
+                        attribute: .value,
+                        resolvedKind: requested.comparisonKind,
+                        readback: readbackBefore,
+                        legacyPresentation: NativeElementValuePresentation.describe(valueBefore)))
             }
             try element.setAutomationValue(requested)
-            guard Self.value(element.value, matches: requested) else {
+            let valueAfter = element.value
+            let readbackAfter = ElementValueReadback(nativeValue: valueAfter)
+            guard let readbackAfter, readbackAfter.isFinite,
+                  ElementValueMutationSemantics.matches(readbackAfter, expected: requested)
+            else {
                 throw Self.unverifiedValueMutationFailure(attribute: AXActionNames.kAXSetValueAction)
             }
             let outcome = Self.dispatchedValueMutationOutcome(preStateKnown: valueBefore != nil)
@@ -448,7 +468,12 @@ struct ActionInputDriver: ActionInputDriving {
                 outcome: outcome,
                 actionName: AXActionNames.kAXSetValueAction,
                 anchorPoint: element.anchorPoint,
-                elementRole: element.role)
+                elementRole: element.role,
+                valueVerification: .init(
+                    attribute: .value,
+                    resolvedKind: requested.comparisonKind,
+                    readback: readbackAfter,
+                    legacyPresentation: NativeElementValuePresentation.describe(valueAfter)))
         } catch let failure as DesktopActionFailure {
             throw failure
         } catch {
@@ -480,144 +505,27 @@ struct ActionInputDriver: ActionInputDriving {
         currentValue: Any?,
         role: String?) throws -> UIElementValue
     {
+        let currentKind = ElementValueReadback(nativeValue: currentValue)?.kind
         if self.isTextRole(role) || currentValue is String {
-            return .string(requested.displayString)
+            return try ElementValueMutationSemantics.coerce(requested, to: .string)
         }
-        if self.isBooleanRole(role) || self.valueKind(currentValue) == .bool {
-            return try .bool(self.booleanValue(requested, role: role))
+        if self.isBooleanRole(role) || currentKind == .bool {
+            return try ElementValueMutationSemantics.coerce(requested, to: .bool, role: role)
         }
         if self.isNumericRole(role) {
-            return try .double(self.doubleValue(requested))
+            return try ElementValueMutationSemantics.coerce(requested, to: .double)
         }
 
-        switch self.valueKind(currentValue) {
+        switch currentKind {
         case .int:
-            return try .int(self.integerValue(requested))
+            return try ElementValueMutationSemantics.coerce(requested, to: .int)
         case .double:
-            return try .double(self.doubleValue(requested))
+            return try ElementValueMutationSemantics.coerce(requested, to: .double)
         case .bool, .string:
             // Handled above.
             return requested
-        case .unknown:
+        case nil:
             return requested
-        }
-    }
-
-    private nonisolated static func booleanValue(_ value: UIElementValue, role: String?) throws -> Bool {
-        switch value {
-        case let .bool(value):
-            return value
-        case let .int(value) where value == 0 || value == 1:
-            return value == 1
-        case let .double(value) where value == 0 || value == 1:
-            return value == 1
-        case let .string(value):
-            switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "true", "1", "yes", "on":
-                return true
-            case "false", "0", "no", "off":
-                return false
-            default:
-                break
-            }
-        default:
-            break
-        }
-        let target = role.map { " for \($0)" } ?? ""
-        throw ActionInputError.failed("Expected a boolean value\(target)")
-    }
-
-    private nonisolated static func integerValue(_ value: UIElementValue) throws -> Int {
-        switch value {
-        case let .int(value):
-            return value
-        case let .double(value) where value.isFinite:
-            if let integer = Int(exactly: value) {
-                return integer
-            }
-        case let .string(value):
-            let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let integer = Int(value) {
-                return integer
-            }
-            if let double = Double(value), double.isFinite, let integer = Int(exactly: double) {
-                return integer
-            }
-        case let .bool(value):
-            return value ? 1 : 0
-        default:
-            break
-        }
-        throw ActionInputError.failed("Expected an integer value")
-    }
-
-    private nonisolated static func doubleValue(_ value: UIElementValue) throws -> Double {
-        let result: Double? = switch value {
-        case let .double(value):
-            value
-        case let .int(value):
-            Double(value)
-        case let .string(value):
-            Double(value.trimmingCharacters(in: .whitespacesAndNewlines))
-        case let .bool(value):
-            value ? 1 : 0
-        }
-        guard let result, result.isFinite else {
-            throw ActionInputError.failed("Expected a finite numeric value")
-        }
-        return result
-    }
-
-    private nonisolated static func value(_ actual: Any?, matches expected: UIElementValue) -> Bool {
-        guard let actual else { return false }
-        switch expected {
-        case let .bool(expected):
-            if self.valueKind(actual) == .bool, let actual = actual as? Bool {
-                return actual == expected
-            }
-            if let number = actual as? NSNumber {
-                return number.intValue == (expected ? 1 : 0)
-            }
-            return false
-        case let .int(expected):
-            guard let number = actual as? NSNumber else { return false }
-            return !self.numberIsFloatingPoint(number) && number.intValue == expected
-        case let .double(expected):
-            guard let number = actual as? NSNumber else { return false }
-            let actual = number.doubleValue
-            let tolerance = max(1e-9, abs(expected) * 1e-9)
-            return actual.isFinite && abs(actual - expected) <= tolerance
-        case let .string(expected):
-            return (actual as? String) == expected
-        }
-    }
-
-    private enum ValueKind: Equatable {
-        case bool
-        case int
-        case double
-        case string
-        case unknown
-    }
-
-    private nonisolated static func valueKind(_ value: Any?) -> ValueKind {
-        guard let value else { return .unknown }
-        if value is String {
-            return .string
-        }
-        guard let number = value as? NSNumber else { return .unknown }
-        if CFGetTypeID(number) == CFBooleanGetTypeID() {
-            return .bool
-        }
-        return self.numberIsFloatingPoint(number) ? .double : .int
-    }
-
-    private nonisolated static func numberIsFloatingPoint(_ number: NSNumber) -> Bool {
-        switch String(cString: number.objCType) {
-        case "f", "d", "D":
-            true
-        default:
-            false
         }
     }
 
@@ -663,14 +571,28 @@ extension ActionInputDriver {
         direction: PeekabooFoundation.ScrollDirection,
         pages: Int) throws -> UIInputExecutionResult.Action
     {
+        let scrollBar = self.findScrollBar(in: element, direction: direction)
+        if let scrollBar,
+           let change = Self.scrollBarValueChange(scrollBar, direction: direction, pages: pages)
+        {
+            // Some native scroll areas advertise page actions that fail even though their bar is writable.
+            // Choose the verifiable value route before dispatch; never retry an ambiguous action through it.
+            do {
+                return try self.performScrollbarValueScroll(scrollBar, change: change)
+            } catch let error as ActionInputError where Self.shouldContinueTryingScrollAction(after: error) {
+                // A definitively rejected value write leaves the page and increment routes available.
+            }
+        }
+
         do {
             return try self.performPageScrollActions(
                 element: element,
                 direction: direction,
                 pages: pages)
         } catch let error as ActionInputError where Self.shouldContinueTryingScrollAction(after: error) {
-            return try self.performScrollbarScroll(
-                element: element,
+            guard let scrollBar else { throw error }
+            return try self.performScrollbarActions(
+                scrollBar,
                 direction: direction,
                 pages: pages,
                 pageActionError: error)
@@ -745,19 +667,12 @@ extension ActionInputDriver {
             elementRole: element.role)
     }
 
-    /// Standard AppKit scroll areas commonly expose no page-scroll action on the container. Their
-    /// descendant AXScrollBar is nevertheless a settable native Accessibility control, so mutate
-    /// that value before declaring background scrolling unsupported.
-    private func performScrollbarScroll(
-        element: any AutomationElementRepresenting,
+    private func performScrollbarActions(
+        _ scrollBar: any AutomationElementRepresenting,
         direction: PeekabooFoundation.ScrollDirection,
         pages: Int,
         pageActionError: ActionInputError) throws -> UIInputExecutionResult.Action
     {
-        guard let scrollBar = self.findScrollBar(in: element, direction: direction) else {
-            throw Self.scrollFallbackError(from: pageActionError)
-        }
-
         let actionName: String = switch direction {
         case .down, .right:
             AXActionNames.kAXIncrementAction
@@ -804,21 +719,32 @@ extension ActionInputDriver {
             }
         }
 
+        throw Self.scrollFallbackError(from: pageActionError)
+    }
+
+    private struct ScrollBarValueChange {
+        let currentValue: Double
+        let requestedValue: Double
+    }
+
+    private static func scrollBarValueChange(
+        _ scrollBar: any AutomationElementRepresenting,
+        direction: PeekabooFoundation.ScrollDirection,
+        pages: Int) -> ScrollBarValueChange?
+    {
         guard scrollBar.isValueSettable,
-              let currentValue = Self.numericValue(scrollBar.value)
-        else {
-            throw Self.scrollFallbackError(from: pageActionError)
-        }
+              let currentValue = self.numericValue(scrollBar.value)
+        else { return nil }
 
         let minimumValue = scrollBar.doubleAttribute(AXAttributeNames.kAXMinValueAttribute) ?? 0
         let maximumValue = scrollBar.doubleAttribute(AXAttributeNames.kAXMaxValueAttribute) ?? 1
-        guard maximumValue > minimumValue else {
-            throw Self.scrollFallbackError(from: pageActionError)
-        }
-
         let range = maximumValue - minimumValue
+        guard minimumValue.isFinite, maximumValue.isFinite, range.isFinite, range > 0,
+              (minimumValue...maximumValue).contains(currentValue)
+        else { return nil }
+
         let advertisedIncrement = scrollBar.doubleAttribute(AXAttributeNames.kAXValueIncrementAttribute)
-        let singleStep = advertisedIncrement.flatMap { $0 > 0 ? min($0, range) : nil } ?? (range / 10)
+        let singleStep = advertisedIncrement.flatMap { $0.isFinite && $0 > 0 ? min($0, range) : nil } ?? (range / 10)
         let signedStep: Double = switch direction {
         case .down, .right:
             singleStep
@@ -828,8 +754,16 @@ extension ActionInputDriver {
         let requestedValue = min(
             maximumValue,
             max(minimumValue, currentValue + signedStep * Double(max(1, pages))))
+        return ScrollBarValueChange(currentValue: currentValue, requestedValue: requestedValue)
+    }
 
-        let alreadyMatched = abs(requestedValue - currentValue) < 1e-9
+    private func performScrollbarValueScroll(
+        _ scrollBar: any AutomationElementRepresenting,
+        change: ScrollBarValueChange) throws -> UIInputExecutionResult.Action
+    {
+        let currentValue = change.currentValue
+        let requestedValue = change.requestedValue
+        let alreadyMatched = requestedValue == currentValue
         if !alreadyMatched {
             do {
                 try scrollBar.setAutomationValue(.double(requestedValue))
@@ -848,7 +782,7 @@ extension ActionInputDriver {
         }
 
         let observedValue = Self.numericValue(scrollBar.value)
-        if requestedValue != currentValue, let observedValue, abs(observedValue - currentValue) < 1e-9 {
+        if !alreadyMatched, observedValue == currentValue {
             throw DesktopActionFailure.indeterminate(
                 delivery: Self.accessibilityValueDelivery,
                 evidence: .completionUnknown,
@@ -911,18 +845,34 @@ extension ActionInputDriver {
         _ element: any AutomationElementRepresenting,
         matches direction: PeekabooFoundation.ScrollDirection) -> Bool
     {
-        guard let frame = element.frame else { return true }
-        switch direction {
+        let wantsVertical = switch direction {
         case .up, .down:
-            return frame.height >= frame.width
+            true
         case .left, .right:
-            return frame.width >= frame.height
+            false
         }
+        switch element.stringAttribute(AXAttributeNames.kAXOrientationAttribute) {
+        case kAXVerticalOrientationValue:
+            return wantsVertical
+        case kAXHorizontalOrientationValue:
+            return !wantsVertical
+        default:
+            break
+        }
+
+        guard let frame = element.frame,
+              frame.origin.x.isFinite, frame.origin.y.isFinite,
+              frame.size.width.isFinite, frame.size.height.isFinite,
+              frame.size.width > 0, frame.size.height > 0,
+              frame.size.width != frame.size.height
+        else { return false }
+        return (frame.size.height > frame.size.width) == wantsVertical
     }
 
     private static func numericValue(_ value: Any?) -> Double? {
         guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID()
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite
         else {
             return nil
         }

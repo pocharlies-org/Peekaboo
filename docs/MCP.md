@@ -201,9 +201,15 @@ App and frontmost inspections may still return a successful empty list, even whe
 
 `see` also accepts the closed `capture_engine` values `auto` (default), `modern`, and `classic`. The choice is carried
 in that observation request to the selected host; incapable hosts refuse it before capture. `classic` never enters
-ScreenCaptureKit, so it is the safe request-local recovery path when the selected legacy host blocks auto/modern
+ScreenCaptureKit, so it is the safe request-local recovery path when the selected host proves classic but blocks auto/modern
 capture. A selected-host owner refusal remains fixed for the MCP process lifetime; update or relaunch that exact host
 and start a fresh MCP process before retrying auto/modern capture.
+
+When a different live process holds ScreenCaptureKit, an explicitly selected ready host that proves classic capture
+and request-local engine selection can instead serve automatic `see` and `image` observations as classic on that
+same authenticated connection. Explicit `modern` and SCK-only capture operations remain refused before transport
+for the process lifetime. Missing capabilities, unknown readiness, implicit routing, and caller-local behavior do
+not gain this fallback, and a replaced listener requires a fresh runtime.
 
 Every successful MCP `see` response includes the selected raw or annotated screenshot as inline image content. When
 multiple calls intentionally share the same `path`, each response still returns pixels owned by its own capture; the
@@ -219,6 +225,15 @@ global logical bounds, are marked non-actionable, and are refused by element int
 action is necessary, use explicit coordinates bound to the exact `snapshot`/`coordinate_reference` returned by `see`.
 
 Observation and capture do not activate a target by default. `see` and `inspect_ui` only perform the focus-changing `AXWebArea` retry when `web_focus: true` is supplied. `image` and live `capture` use `capture_focus: "background"` by default; pass `capture_focus: "foreground"` when activating the target is intentional. The legacy `auto` value remains accepted for focus-if-needed compatibility.
+
+Successful `see` and `inspect_ui` responses include optional `_meta.focused_element` when the observation already
+proved one focused element. It preserves the existing identity fields (`processIdentifier`, `windowID`, `role`,
+optional `title`/`identifier`, and global-logical `frame`, also for ROI captures); it does not invent a snapshot-local
+element ID or expose a field value. Missing focus means unknown, including cached or ambiguous observations, not
+that the window has no focused element. This metadata adds no AX read, grants no input authority, and does not bypass
+normal snapshot or live receiver validation. Native Agent tools retain the same field under `meta.focused_element`.
+External MCP clients may not show `_meta` to their model; this addition alone does not guarantee model-visible focus
+in those clients, and the observation's text summary is unchanged.
 
 Successful `capture` results bind every retained frame and `contact.png` to capture-session-authored SHA-256 values.
 MCP exposes them in `artifact_sha256`; finalization revalidates those bytes, complete PNG decoding and dimensions, and
@@ -270,6 +285,12 @@ The `click` and `paste` tools publish flat object schemas without root-level `on
 can forward them to providers such as Anthropic without schema rewriting. Peekaboo enforces cross-field constraints
 at runtime before dispatch; the flat catalog does not relax target, receipt, or foreground-consent requirements.
 
+Snapshot-backed `click`, `action`, `set_value`, `scroll`, `type`, and `press` reserve mutation authority in the snapshot's
+producer store before focus or input. Pending or consumed snapshots are refused before dispatch. Outcomes requiring
+fresh observation, missing canonical outcomes, and unknown completion prevent replay; explicit historical reads remain
+available. Confirmed outcomes that do not require fresh observation release the reservation. Modifier-click and
+pixel-focus typing retain their existing single host-owned lease. Selector-driven `paste` remains snapshot-independent.
+
 The `click` tool accepts exactly one target shape: `on`, `query`, or `coords`. Runtime validation requires every
 background `coords` call to include either `snapshot` or `coordinate_reference`; a PID alone is only a consistency
 check and never replaces the receipt. Both fields must be nonempty and identify a fresh exact-window `see` capture.
@@ -282,6 +303,17 @@ alias); either reference opts into capture-context and live-target validation ev
 
 The `double`, `triple`, `right`, and `middle` click booleans are mutually exclusive; conflicts are rejected before snapshot lookup or dispatch. Background right-, double-, middle-, and triple-clicks use exact PID/window-routed native events without activating the app or moving the physical cursor. Middle/triple require a fresh exact-window snapshot, Event Synthesizing permission, Bridge protocol 1.30, and the `statelessClickVariants` capability; older hosts are refused before the request is encoded. Every event revalidates the normal-layer window owner, process generation, bounds, and point. Since macOS provides no application-level acknowledgment for routed pointer events, successful dispatch responses include `verified: false` and `effect: "unverifiable"`; canonical metadata retains `click_type`, exact target identity/receipt, and three dispatched units for middle or seven for triple. An unprovable or changed route is refused rather than redirected through the desktop-global event tap.
 
+For `click.query`, `wait_for` is a maximum wait in milliseconds (default 5000, maximum 60000). If the current snapshot
+has no match, Peekaboo reads a fresh Accessibility tree for that exact window without taking screenshots or focusing
+it, and uses the matching observation's fresh element ID. The original window ID, owner process generation, and
+bounds stay pinned throughout; a changed target is refused, not adopted. Modifier-click keeps its original screenshot
+lease for coordinate authority and uses only the matched point from the fresh tree.
+Unmatched and timed-out samples are never stored as snapshots, so polling does not evict existing UI snapshots.
+The remaining monotonic budget bounds observation, and a late match never starts a click. An admitted click keeps
+its normal completion and retry-safety semantics; `wait_for` does not cancel already-dispatched input. Zero checks
+only the current snapshot. A missing `on` ID is snapshot-local and is reported immediately, never remapped to a
+later observation.
+
 `click.modifiers` accepts a nonempty unique array of `cmd`, `shift`, and `option`. It is deliberately foreground-only and requires `foreground: true` plus an explicit non-`latest` exact-window screenshot snapshot. Control and right contextual modifier-clicks are refused because restoring the prior foreground would dismiss their result. Bridge protocol 1.33 hosts must advertise `foregroundModifierClickSnapshotLease`; the host leaf then leases the snapshot and owns exact target preflight, one prebuilt modifier-bearing HID mouse sequence that never changes shared keyboard state, and compare-and-swap restoration as one global operation. Response metadata includes `modifiers`, `cursor_restoration`, and `focus_restoration`; restoration reports `preserved_newer_state` when concurrent user or application activity superseded Peekaboo's write.
 
 Default background-only MCP/Agent `type` requires an explicit fresh exact non-dialog snapshot receipt; an optional
@@ -290,6 +322,11 @@ implicit-latest, selector-only, and targetless forms are refused before dispatch
 foreground-capable runtimes retain their documented process-targeted typing routes.
 
 `type.coords` adds atomic pixel-focus typing for exact screenshot snapshots. Supply `snapshot`, optional matching `coordinate_reference`, and `coordinate_space` (`global_display_points`, `image_pixels`, or `normalized`). It cannot be combined with `on`, app/PID/window selectors, or foreground delivery. Bridge protocol 1.33 retains the focus-only Accessibility write and every keyboard unit under one process lane and exact target receipt; successful dispatch units equal keyboard units plus the focus write, and any completed prefix is reported retry-unsafe. The focus prelude never presses a button or selects a row, and its confirmation cannot confirm the separate typing leaf. Only deterministic clear-plus-literal typing can promote through an exact private value readback.
+
+Successful `type` responses preserve the typing result's `target_identity` and `target_receipt` in public `_meta`,
+including ordinary and pixel-focus typing. Process identities retain the generation as a lossless decimal string;
+exact-window identities also retain the window ID. Missing result identity, including untargeted foreground typing,
+adds neither field: request selectors are not substituted for a returned target receipt.
 
 Process, exact-window, and pixel-focus type requests containing non-empty text, clear, or editable focused-text keys require Bridge protocol 1.36 and `compositeTypeDelivery`. Direct AX text, selection/deletion keys, and clear each count as one dispatch and zero key presses; event fallback counts only its posted keys, and requests using both mechanisms report composite delivery. Event-only special keys keep their earlier protocol compatibility, while older or capability-missing sessions refuse AX-capable input before focus or text dispatch.
 

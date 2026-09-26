@@ -53,6 +53,7 @@ extension AgentCommand {
             "Instruction: \(instruction)",
             "Requested foreground UI: \(self.allowForeground ? "yes" : "no")",
             "Effective UI authority: \(policy.rawValue)",
+            "Automatic desktop context: \(self.enhancementOptions.contextAware ? "yes" : "no")",
             "Model execution: skipped",
             "Tool calls: 0",
             "Session saved: no",
@@ -79,6 +80,7 @@ extension AgentCommand {
         payload["dryRun"] = true
         payload["instruction"] = instruction
         payload["modelExecution"] = "skipped"
+        payload["automaticDesktopContext"] = self.enhancementOptions.contextAware
         let policy = self.newSessionToolExecutionPolicy
         payload["uiAuthority"] = [
             "requestedForeground": self.allowForeground,
@@ -126,6 +128,10 @@ extension AgentCommand {
         }
 
         delegate?.showFinalSummaryIfNeeded(result)
+        if !self.jsonOutput, self.outputMode != .quiet,
+           let notice = result.executionTrace().recordedOutcomeNotice {
+            print("\n\(notice)")
+        }
     }
 
     func makeAgentJSONResponse(_ result: AgentExecutionResult) -> [String: Any] {
@@ -159,7 +165,7 @@ extension AgentCommand {
                 "totalTokens": usage.totalTokens,
             ]
         } ?? NSNull()
-        let resultPayload: [String: Any] = [
+        var resultPayload: [String: Any] = [
             "content": result.content,
             "sessionId": result.sessionId.map { $0 as Any } ?? NSNull(),
             "toolCalls": legacyToolCalls,
@@ -171,6 +177,9 @@ extension AgentCommand {
             ],
             "usage": usage,
         ]
+        if let notice = trace.recordedOutcomeNotice {
+            resultPayload["recordedOutcomeNotice"] = notice
+        }
         return ["success": true, "result": resultPayload]
     }
 
@@ -223,7 +232,39 @@ extension AgentCommand {
         func agentDidEmitEvent(_ event: AgentEvent) {}
     }
 
-    func printAgentExecutionError(_ message: String) {
+    struct StepLimitFailureData: Encodable {
+        let maxSteps: Int
+        let sessionId: String?
+        let executionTrace: AgentExecutionTrace?
+    }
+
+    func makeStepLimitErrorResponse(
+        _ error: PeekabooAgentService.AgentStepLimitExceededError,
+        message: String,
+        debugLogs: [String] = []
+    ) -> ResultEnvelope<StepLimitFailureData> {
+        ResultEnvelope(
+            success: false,
+            data: StepLimitFailureData(
+                maxSteps: error.maxSteps,
+                sessionId: error.sessionWasPersisted ? error.sessionId : nil,
+                executionTrace: error.executionTrace
+            ),
+            debug_logs: debugLogs,
+            error: ErrorInfo(message: message, code: .AGENT_ERROR)
+        )
+    }
+
+    func printAgentExecutionError(_ message: String, error: (any Error)? = nil) {
+        if self.jsonOutput, let error = error as? PeekabooAgentService.AgentStepLimitExceededError {
+            let logger = Logger.shared
+            logger.setJsonOutputMode(true)
+            outputJSONCodable(
+                self.makeStepLimitErrorResponse(error, message: message, debugLogs: logger.getDebugLogs()),
+                logger: logger
+            )
+            return
+        }
         self.emitAgentError(message: message, code: .AGENT_ERROR)
     }
 
@@ -275,6 +316,7 @@ extension AgentCommand {
                 queueMode: queueMode,
                 eventDelegate: streamingDelegate,
                 verbose: self.verbose,
+                enhancementOptions: self.enhancementOptions,
                 persistSession: !self.noCache,
                 toolExecutionPolicy: self.newSessionToolExecutionPolicy
             )
@@ -283,7 +325,7 @@ extension AgentCommand {
             return result
         } catch let error as PeekabooAgentService.AgentStepLimitExceededError where preserveStepLimitError {
             if outputDelegate?.hasReceivedError != true {
-                self.printAgentExecutionError("Agent execution failed: \(error.localizedDescription)")
+                self.printAgentExecutionError("Agent execution failed: \(error.localizedDescription)", error: error)
             }
             throw error
         } catch let error as CancellationError {
@@ -294,7 +336,7 @@ extension AgentCommand {
                     throw ReportedChatTurnError(underlyingError: error)
                 }
             } else {
-                self.printAgentExecutionError("Agent execution failed: \(error.localizedDescription)")
+                self.printAgentExecutionError("Agent execution failed: \(error.localizedDescription)", error: error)
             }
             throw ExitCode.failure
         }
