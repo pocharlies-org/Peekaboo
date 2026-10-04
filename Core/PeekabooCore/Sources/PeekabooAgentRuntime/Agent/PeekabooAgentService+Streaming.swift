@@ -1,8 +1,3 @@
-//
-//  PeekabooAgentService+Streaming.swift
-//  PeekabooCore
-//
-
 import Foundation
 import PeekabooAutomation
 import Tachikoma
@@ -22,25 +17,30 @@ extension PeekabooAgentService {
         public let maxSteps: Int
         public let sessionId: String
         public let sessionWasPersisted: Bool
+        public let executionTrace: AgentExecutionTrace?
 
-        public init(maxSteps: Int, sessionId: String, sessionWasPersisted: Bool = true) {
+        public init(
+            maxSteps: Int,
+            sessionId: String,
+            sessionWasPersisted: Bool = true,
+            executionTrace: AgentExecutionTrace? = nil)
+        {
             self.maxSteps = maxSteps
             self.sessionId = sessionId
             self.sessionWasPersisted = sessionWasPersisted
+            self.executionTrace = executionTrace
         }
 
         public var errorDescription: String? {
-            let resumeGuidance = if self.sessionWasPersisted {
-                "Session \(self.sessionId) was saved and can be resumed to continue."
-            } else {
-                "Session caching was disabled, so this run cannot be resumed."
-            }
-            guard self.maxSteps < AgentStepBudget.supportedRange.upperBound else {
-                return "Agent reached the \(self.maxSteps)-step limit after executing tools whose results still " +
-                    "require model review. \(resumeGuidance)"
-            }
-            return "Agent reached the \(self.maxSteps)-step limit after executing tools whose results still " +
-                "require model review. \(resumeGuidance) You can also retry with a larger --max-steps value " +
+            let resumeGuidance = self.sessionWasPersisted
+                ? "Session \(self.sessionId) was saved and can be resumed to continue."
+                : "Session caching was disabled, so this run cannot be resumed."
+            let message = "Agent reached the \(self.maxSteps)-step limit after executing tools whose results still " +
+                "require model review. Inspect current app state before continuing; do not blindly repeat actions. " +
+                resumeGuidance
+            guard self.maxSteps < AgentStepBudget.supportedRange.upperBound else { return message }
+            let nextRun = self.sessionWasPersisted ? "future runs or a saved-session resume" : "future runs"
+            return message + " For \(nextRun), --max-steps can be increased " +
                 "(maximum \(AgentStepBudget.supportedRange.upperBound))."
         }
     }
@@ -51,6 +51,7 @@ extension PeekabooAgentService {
         let tools: [AgentTool]
         let sessionId: String
         let eventHandler: EventHandler?
+        let textHandler: TextStreamHandler?
         let enhancementOptions: AgentEnhancementOptions?
         let executionPolicy: MCPToolExecutionPolicy
 
@@ -60,6 +61,7 @@ extension PeekabooAgentService {
             tools: [AgentTool],
             sessionId: String,
             eventHandler: EventHandler?,
+            textHandler: TextStreamHandler? = nil,
             enhancementOptions: AgentEnhancementOptions?,
             executionPolicy: MCPToolExecutionPolicy = .backgroundOnly)
         {
@@ -68,6 +70,7 @@ extension PeekabooAgentService {
             self.tools = tools
             self.sessionId = sessionId
             self.eventHandler = eventHandler
+            self.textHandler = textHandler
             self.enhancementOptions = enhancementOptions
             self.executionPolicy = executionPolicy
         }
@@ -234,22 +237,24 @@ extension PeekabooAgentService {
             }
             try Task.checkCancellation()
 
-            let streamResult = try await streamText(
-                model: configuration.model,
-                provider: configuration.provider,
-                messages: state.messages,
-                tools: configuration.tools.isEmpty ? nil : configuration.tools,
-                settings: self.generationSettings(for: configuration.model))
-
             var terminalUsage: Usage?
             let output: StreamProcessingOutput
             do {
-                output = try await self.collectStreamOutput(
-                    from: streamResult,
-                    model: configuration.model,
-                    eventHandler: configuration.eventHandler,
-                    stepIndex: stepIndex,
-                    onTerminalUsage: { terminalUsage = $0 })
+                output = try await self.withAgentPhaseTiming(.providerStream, stepIndex: stepIndex) {
+                    let streamResult = try await streamText(
+                        model: configuration.model,
+                        provider: configuration.provider,
+                        messages: state.messages,
+                        tools: configuration.tools.isEmpty ? nil : configuration.tools,
+                        settings: self.generationSettings(for: configuration.model))
+                    return try await self.collectStreamOutput(
+                        from: streamResult,
+                        model: configuration.model,
+                        eventHandler: configuration.eventHandler,
+                        textHandler: configuration.textHandler,
+                        stepIndex: stepIndex,
+                        onTerminalUsage: { terminalUsage = $0 })
+                }
             } catch {
                 if let terminalUsage {
                     state.usage = usageAccumulator.record(terminalUsage)
@@ -1048,21 +1053,6 @@ extension PeekabooAgentService {
             isError: true)
     }
 
-    func contentByAppendingTurnBoundaryReason(
-        _ stopReason: String,
-        to content: String) -> String
-    {
-        let normalizedContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedReason = stopReason.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedReason.isEmpty else { return normalizedContent }
-        guard !normalizedContent.isEmpty else { return normalizedReason }
-
-        if normalizedContent == normalizedReason || normalizedContent.hasSuffix("\n\(normalizedReason)") {
-            return normalizedContent
-        }
-        return "\(normalizedContent)\n\n\(normalizedReason)"
-    }
-
     private func executeToolCall(
         _ toolCall: AgentToolCall,
         tool: AgentTool,
@@ -1094,11 +1084,21 @@ extension PeekabooAgentService {
                     "supportsVision": context.supportsVision ? "true" : "false",
                 ])
             let toolArguments = AgentToolArguments(toolCall.arguments)
-            let execution = try await self.executeTool(
-                tool,
-                arguments: toolArguments,
-                executionContext: executionContext,
-                options: context.enhancementOptions)
+            var resultFailed = false
+            let execution = try await self.withAgentPhaseTiming(
+                .tool,
+                stepIndex: options.stepIndex,
+                resultIsFailure: {
+                    resultFailed = Self.resultEncodesToolFailure($0.result)
+                    return resultFailed
+                },
+                operation: {
+                    try await self.executeTool(
+                        tool,
+                        arguments: toolArguments,
+                        executionContext: executionContext,
+                        options: context.enhancementOptions)
+                })
             let result = execution.result
             let resultBoundaryDecision = context.turnBoundary.recordResult(
                 toolName: toolCall.name,
@@ -1106,7 +1106,7 @@ extension PeekabooAgentService {
             let effectiveBoundaryDecision = Self.effectiveBoundaryDecision(
                 initial: boundaryDecision,
                 afterResult: resultBoundaryDecision)
-            if !Self.resultEncodesToolFailure(result) {
+            if !resultFailed {
                 context.turnBoundary.recordSuccessfulCompletion(
                     toolName: toolCall.name,
                     arguments: toolCall.arguments,
@@ -1121,7 +1121,7 @@ extension PeekabooAgentService {
             case let .continueNextStep(reason):
                 toolValue = self.addTurnBoundarySignal(.continueNextStep(reason: reason), to: toolValue)
             case let .stopAgentAfterSuccessfulTool(reason)
-                where options.allowSuccessfulToolBoundary && !Self.resultEncodesToolFailure(result):
+                where options.allowSuccessfulToolBoundary && !resultFailed:
                 toolValue = self.addTurnBoundarySignal(.stopAgent(reason: reason), to: toolValue)
             case .stopAgentAfterSuccessfulTool:
                 break
@@ -1311,23 +1311,13 @@ extension PeekabooAgentService {
         }
     }
 
-    private func logStepCompletion(
-        stepIndex: Int,
-        stepText: String,
-        toolCalls: [AgentToolCall])
-    {
-        guard self.isVerbose else { return }
-        self.logger.debug(
-            "Step \(stepIndex) completed: collected \(toolCalls.count) tool calls, text length: \(stepText.count)")
-    }
-
-    private func sendToolCompletionEvent(
+    func sendToolCompletionEvent(
         name: String,
-        payload: String,
+        payload: @autoclosure () -> String,
         eventHandler: EventHandler?) async
     {
         guard let eventHandler else { return }
-        await eventHandler.send(.toolCallCompleted(name: name, result: payload))
+        await eventHandler.send(.toolCallCompleted(name: name, result: payload()))
     }
 
     private func sendToolStartEvent(_ toolCall: AgentToolCall, eventHandler: EventHandler?) async throws {
@@ -1337,7 +1327,7 @@ extension PeekabooAgentService {
         await eventHandler.send(.toolCallStarted(name: toolCall.name, arguments: argumentsJSON))
     }
 
-    private func toolResultPayload(from result: AnyAgentToolValue, toolName: String) -> String {
+    func toolResultPayload(from result: AnyAgentToolValue, toolName: String) -> String {
         do {
             let jsonObject = try result.toJSON()
             var wrapped: [String: Any] = if let dict = jsonObject as? [String: Any] {

@@ -18,13 +18,21 @@ struct CommandRuntimeOptions {
     var jsonOutput = false
     var logLevel: LogLevel?
     var captureEnginePreference: String?
+    /// The selected remote route may safely support classic observations but not ScreenCaptureKit.
+    var remoteCapturePolicy: RemoteCapturePolicy = .unrestricted
     /// This command carries the capture-engine choice in its remote request instead of
     /// requiring the caller process to own capture/TCC.
     var transportsCaptureEnginePreference = false
+    /// Fixed capture requests support inline engine selection on an explicitly selected remote host.
+    var usesInlineCaptureEngineTransport = false
+    var requiresDesktopObservationInlinePixels: Bool {
+        self.usesInlineCaptureEngineTransport && self.requiresCaptureEnginePreferenceHost
+    }
+
     /// AX-only command forms do not run a capture backend; ambient engine configuration must
     /// not alter their runtime host.
     var ignoresCaptureEnginePreference = false
-    /// An explicit engine must run on a compatible host or fail; local fallback would silently
+    /// A transported engine must run on a compatible host or fail; local fallback would silently
     /// change capture/TCC ownership. Explicit `--no-remote` remains the local opt-in.
     var requiresCaptureEnginePreferenceHost = false
     /// Non-auto engine values need an additive host capability so an older host cannot silently
@@ -77,8 +85,8 @@ struct CommandRuntimeOptions {
     var requiresExplicitSnapshotPublication = false
     var requiresCallerDesktopMutationBarrier = false
     var usesPerToolSnapshotInvalidation = false
-    /// Defaults conservative. Only an explicit immutable MCP env allow-list can prove that the
-    /// persistent tool runtime exposes no path to ScreenCaptureKit.
+    /// Defaults conservative. A fixed command request or explicit immutable MCP env allow-list
+    /// can prove that the coordinated tool path cannot reach ScreenCaptureKit.
     var dynamicToolScreenCaptureReachable = true
     /// MCP and Agent keep one dynamic tool runtime alive across multiple calls. An explicit
     /// Bridge route therefore owns capture preflight for that runtime's authenticated generation.
@@ -150,20 +158,9 @@ struct CommandRuntimeOptions {
     func applyingEnvironmentOverrides(environment: [String: String]) -> CommandRuntimeOptions {
         var options = self
         if !options.ignoresCaptureEnginePreference,
-           options.captureEnginePreference == nil,
-           let captureEngine = Self.captureEnginePreference(environment: environment) {
-            options.captureEnginePreference = captureEngine
-            if options.transportsCaptureEnginePreference {
-                options.requiresCaptureEnginePreferenceHost = true
-                let preference = ObservationCommandSupport.captureEnginePreference(
-                    cliValue: captureEngine,
-                    configuredValue: nil
-                )
-                options.requiresCaptureEnginePreferenceCapability = preference != .auto
-                options.requiresScreenCaptureKitOwnerCapability = true
-            } else if !options.requiresApplicationLaunchOptions, !options.requiresHostApplicationInventory {
-                options.preferRemote = false
-            }
+           let captureEngine = options.captureEnginePreference ?? Self
+               .captureEnginePreference(environment: environment) {
+            options.selectCaptureEnginePreference(captureEngine, environment: environment)
         }
         if options.requiresBrowserHandoffBridge {
             options.preferRemote = true
@@ -171,6 +168,29 @@ struct CommandRuntimeOptions {
             options.autoStartDaemon = false
         }
         return options
+    }
+
+    mutating func selectCaptureEnginePreference(_ value: String, environment: [String: String]) {
+        self.captureEnginePreference = value
+        let transportsPreference = self.shouldTransportCaptureEnginePreference(environment: environment)
+        if self.usesInlineCaptureEngineTransport {
+            self.transportsCaptureEnginePreference = transportsPreference
+            self.requiresDesktopObservation = transportsPreference
+            self.preferRemote = transportsPreference
+        }
+        self.requiresCaptureEnginePreferenceHost = transportsPreference
+        let preference = ObservationCommandSupport.captureEnginePreference(cliValue: value, configuredValue: nil)
+        self.requiresCaptureEnginePreferenceCapability = transportsPreference && preference != .auto
+        self.requiresScreenCaptureKitOwnerCapability = transportsPreference
+        if !transportsPreference, !self.requiresApplicationLaunchOptions, !self.requiresHostApplicationInventory {
+            self.preferRemote = false
+        }
+    }
+
+    private func shouldTransportCaptureEnginePreference(environment: [String: String]) -> Bool {
+        guard self.usesInlineCaptureEngineTransport else { return self.transportsCaptureEnginePreference }
+        return !self.remoteIsolationRequested && environment["PEEKABOO_NO_REMOTE"] == nil &&
+            BridgeSocketResolver.hasNonblankExplicitBridgeSocket(options: self, environment: environment)
     }
 
     static func captureEnginePreference(environment: [String: String]) -> String? {
@@ -217,8 +237,19 @@ struct CommandRuntime {
     @MainActor let services: any PeekabooServiceProviding
     @MainActor let logger: Logger
 
+    func requireCompatibleHost() throws {
+        if let requiredHostFailure {
+            throw PeekabooBridgeErrorEnvelope(
+                code: .operationNotSupported,
+                message: requiredHostFailure
+            )
+        }
+    }
+
     @MainActor
-    var observationTimeoutMutationTracker: InteractionMutationTracker? {
+    func observationTimeoutMutationTracker(mayMutateDesktop: Bool) -> InteractionMutationTracker? {
+        // Read-only work neither owns nor extends a caller's desktop mutation lease.
+        guard mayMutateDesktop else { return nil }
         if self.selectedRemoteSocketPath == nil || self.interactionMutationTracker.hasPendingDurableMutation {
             return self.interactionMutationTracker
         }

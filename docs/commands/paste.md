@@ -7,7 +7,7 @@ read_when:
 
 # `peekaboo paste`
 
-`paste` sends Cmd+V. With no payload, it pastes the current clipboard contents. With text, a file, an image, or base64 data, it becomes an atomic “clipboard + Cmd+V + restore” helper: temporarily replace the system clipboard with your payload, paste into the target, then restore the previous clipboard contents (or clear it if it was empty).
+`paste` sends Cmd+V. With no payload, it pastes the current clipboard contents. With text, a file, an image, or base64 data, it temporarily replaces the system clipboard, pastes into the target, then restores the previous clipboard items (or clears it if it was empty) only while it still owns that clipboard generation. A newer copy from the user or another app is preserved instead.
 
 This reduces drift by collapsing multiple CLI steps into one command. Plain text uses direct process-targeted typing in background mode. Rich/current-clipboard payloads use Cmd+V; pass `--foreground` when the caller needs a confirmed command result because macOS does not acknowledge whether a process-targeted Cmd+V was consumed.
 
@@ -18,7 +18,7 @@ This reduces drift by collapsing multiple CLI steps into one command. Plain text
 | `--file-path` | Copy a file or image into the clipboard, then paste. |
 | `--data-base64` + `--uti` | Paste raw base64 payload with explicit UTI (e.g. `public.rtf`). |
 | `--also-text` | Optional plain-text companion when pasting binary. |
-| `--restore-delay <duration>` | Delay before restoring the previous clipboard (default `150ms`; bare values are milliseconds). |
+| `--restore-delay <duration>` | Delay before restoring the previous clipboard (default `150ms`; bare values are milliseconds; maximum `10000ms`). |
 | Target flags | `--app <name>`, `--pid <pid>`, or an exact window selector for background paste. |
 | `--foreground` | Focus a supplied target or intentionally send foreground/global Cmd+V. |
 | Focus flags | Foreground focus controls (`--space-switch`, `--no-auto-focus`, etc.). |
@@ -30,8 +30,12 @@ This reduces drift by collapsing multiple CLI steps into one command. Plain text
 - Exact window selectors stay exact through text or Cmd+V dispatch; focus, owner, generation, or bounds drift fails before clipboard access whenever no event has begun. Exact-window remote delivery requires Bridge protocol 1.24.
 - Process-targeted text and Cmd+V delivery retain the resolved app's process-generation receipt. Plain text revalidates before every emitted character, while clipboard-backed paste uses generation-pinned hotkey delivery. A target exit or relaunch never silently retargets the reusable PID. Remote background paste requires Bridge protocol 1.22 or newer.
 - Clipboard-backed transactions are serialized across CLI, daemon, and GUI processes with a private per-user lock under `~/Library/Application Support/Peekaboo`, independent of each process's temporary directory.
-- Target capability checks, cancellation checks, and the prior-clipboard snapshot must all succeed before Peekaboo writes a temporary payload. A read failure is never treated as an empty clipboard; if a write fails after partially changing the pasteboard, Peekaboo restores the exact saved state before returning the error.
-- Background binary/rich paste still mutates the system clipboard briefly; `paste` completes the noncancellable `--restore-delay` settle and restores the previous contents before releasing the transaction lock, even when delivery throws or the caller cancels.
+- Admission shares one 15-second monotonic deadline across the in-process queue and file-lock acquisition. If either wait ends at or after that deadline, even with successful acquisition, Peekaboo refuses before running the transaction body. The canonical `TIMEOUT` is a retry-safe pre-dispatch refusal: this transaction has not changed the clipboard or dispatched paste input, and the timeout alone does not require a fresh observation.
+- Target and temporary-clipboard ownership capabilities, cancellation checks, and a complete prior-clipboard snapshot must succeed before Peekaboo writes a temporary payload. Providers without ownership-aware temporary writes refuse rather than falling back to unconditional restoration. Every advertised representation must be readable: an unresolved promised type refuses temporary replacement without dropping it or treating unavailable data as empty. Lazy providers that supply data and zero-length data representations are supported.
+- On macOS 15.4+, automatic General-clipboard replacement and current-clipboard reads require the reader's native access policy to be `alwaysAllow` before any contents are inspected. `default`, `ask`, and `alwaysDeny` refuse with `permission_denied`, including an empty clipboard and explicit foreground paste. This avoids deliberately triggering a permission alert; it is not an atomic guarantee against a concurrent permission-setting change. Use `clipboard status` for a content-free caller-local diagnostic; paste never opts into a permission alert. Named pasteboards remain exempt, and macOS 14–15.3 has no equivalent native access-policy preflight.
+- Partial-write failures retain the actual native clipboard claim. Cleanup restores only that owned generation; a failure before any claim does not restore or clear anything. If another app has replaced the payload, cleanup leaves the newer contents untouched and reports `preserved_newer_contents`, even when the replacement has identical bytes.
+- Background binary/rich paste still mutates the system clipboard briefly; `paste` completes the noncancellable `--restore-delay` settle and ownership-aware cleanup before releasing the transaction lock, even when delivery throws or the caller cancels. The admission deadline does not time out this already-admitted settle/cleanup phase or bound the whole command.
+- Clipboard generation checks detect intervening ownership changes, but macOS exposes no atomic compare-and-swap for restoring a pasteboard. The adjacent check/write calls cannot exclude every concurrent cross-process race; the transaction lock only serializes cooperating Peekaboo paste clients. Explicit manual `clipboard restore` remains an intentional overwrite operation.
 
 ## Examples
 ```bash
@@ -52,11 +56,33 @@ peekaboo paste "Hello" --app TextEdit --foreground
 ```
 
 ## Notes
+- Restore delays must be between `0` and `10000ms`, inclusive. Existing CLI scripts or MCP callers using longer delays must reduce them; invalid values fail before clipboard access or input delivery. Direct calls to the shared consumption-wait helper are capped at 10 seconds as a backstop.
 - File paths for `--file-path` accept `~/...`.
 - Successful background text JSON reports delivery mode and target PID. Clipboard-backed background delivery returns `INTERACTION_FAILED` with the explicit retry-unsafe message instead of a success payload.
+- JSON preserves a typed `TIMEOUT` even if a later input-lane wait expires after foreground focus has already changed the desktop. Check the canonical outcome and retry metadata: an earlier dispatched phase still makes the overall request indeterminate and unsafe to retry.
+- A canonical no-dispatch refusal with no prior focus effect or attempted clipboard write preserves implicit observations, including wrapped target-resolution refusals and background text. Stronger aggregate or retry-unsafe metadata, partial clipboard writes, and unclassified input failures still invalidate conservatively, and another operation's pending mutation barrier is never canceled by this refusal.
 - After Cmd+V dispatch begins, cancellation or a delivery error is indeterminate. A clipboard restoration failure is always reported with a canonical partial or indeterminate retry-unsafe outcome, including for receiptless providers. Inspect fresh UI state rather than replaying the paste.
+- Cleanup status is separate from input success. CLI successful payloads include `clipboardCleanupStatus`, CLI error JSON includes `error.clipboard_cleanup_status`, and MCP metadata uses `clipboard_cleanup_status`: `restored`, `preserved_newer_contents`, or `not_needed`. A newer clipboard update never reports restoration success. A partial temporary write remains retry-unsafe even if no Cmd+V was sent; an error retains no prior clipboard payload.
+- A canonical hotkey refusal after a temporary clipboard write cannot erase that earlier clipboard effect. The failure retains its error code but reports the caller-local clipboard mutation as retry-unsafe, without inventing a Cmd+V dispatch or exact receiver count. When an earlier window-focus action is combined with this untargeted clipboard effect, the aggregate does not inherit that focus window as its target or report an exact combined count. Refusals before any clipboard claim remain zero-dispatch and retry-safe.
+
+## Custom clipboard providers
+
+Temporary-payload paste now requires `ClipboardTemporaryWriteProviding` in addition to the existing `ClipboardServiceProtocol`. This is an intentional safety boundary: the old `get`/`set`/`save`/`restore` interface cannot establish whether another application has claimed the clipboard. There is no unconditional-restore fallback. Plain background text and current-clipboard paste do not require the new capability.
+
+The built-in `ClipboardService` already implements the capability. Native wrappers should use that implementation for the same pasteboard as their existing methods and forward preparation:
+
+```swift
+// In an existing @MainActor wrapper conforming to ClipboardTemporaryWriteProviding:
+func prepareTemporaryWrite() throws -> any ClipboardTemporaryWriteTransaction {
+    try self.nativeClipboard.prepareTemporaryWrite()
+}
+```
+
+A custom backend must return a transaction that records the actual write claim even on partial failure, fences complete prior contents, preserves newer ownership, and performs one-shot cleanup independently of task cancellation. Do not implement this by wrapping the old unconditional restore sequence. Unsupported-provider refusals occur before clipboard reads, focus setup, or paste input; they are not a reason to retry with foreground authority.
 
 ## Troubleshooting
+- If silent clipboard access is unavailable, arrange the reader's permission deliberately outside automation. An application still at `default` may not yet appear in System Settings because it has never shown a clipboard access alert. Peekaboo does not open settings, manufacture an alert, or change that policy automatically. Allowing the GUI host does not necessarily allow a separate caller-local clipboard reader.
+- If a complete prior snapshot is unavailable, keep the original clipboard intact and resolve the supplying application's unreadable/promised data before trying temporary replacement. Changing foreground mode does not make an incomplete snapshot safe to discard.
 - Verify Screen Recording + Accessibility permissions (`peekaboo permissions status`). Background paste also requires Event Synthesizing access for the sending process; request it with `peekaboo permissions request event-synthesizing`.
 - Confirm your target with `peekaboo app list`, `peekaboo window list`, or `peekaboo see` before rerunning.
 - Re-run with `--json` or `--verbose` to surface detailed errors.

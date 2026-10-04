@@ -12,10 +12,14 @@ final class VerifyStateApplicationService: ApplicationServiceProtocol {
     let applicationWarnings: [String]
     let applicationLists: [[ServiceApplicationInfo]]?
     let onListApplications: (@MainActor (Int) -> Void)?
+    let applicationLookups: [ServiceApplicationInfo?]?
+    let onFindApplication: (@MainActor (Int) async throws -> Void)?
     let windowStatus: UnifiedToolOutput<ServiceWindowListData>.Summary.Status
     let warnings: [String]
     let delay: Duration?
+    let onListWindows: (@MainActor () async -> Void)?
     private(set) var listApplicationsCallCount = 0
+    private(set) var findApplicationIdentifiers: [String] = []
     private(set) var listWindowsCallCount = 0
 
     init(
@@ -25,9 +29,12 @@ final class VerifyStateApplicationService: ApplicationServiceProtocol {
         applicationWarnings: [String] = [],
         applicationLists: [[ServiceApplicationInfo]]? = nil,
         onListApplications: (@MainActor (Int) -> Void)? = nil,
+        applicationLookups: [ServiceApplicationInfo?]? = nil,
+        onFindApplication: (@MainActor (Int) async throws -> Void)? = nil,
         windowStatus: UnifiedToolOutput<ServiceWindowListData>.Summary.Status = .success,
         warnings: [String] = [],
-        delay: Duration? = nil)
+        delay: Duration? = nil,
+        onListWindows: (@MainActor () async -> Void)? = nil)
     {
         self.applications = applications
         self.windows = windows
@@ -35,9 +42,12 @@ final class VerifyStateApplicationService: ApplicationServiceProtocol {
         self.applicationWarnings = applicationWarnings
         self.applicationLists = applicationLists
         self.onListApplications = onListApplications
+        self.applicationLookups = applicationLookups
+        self.onFindApplication = onFindApplication
         self.windowStatus = windowStatus
         self.warnings = warnings
         self.delay = delay
+        self.onListWindows = onListWindows
     }
 
     func listApplications() async throws -> UnifiedToolOutput<ServiceApplicationListData> {
@@ -55,6 +65,14 @@ final class VerifyStateApplicationService: ApplicationServiceProtocol {
     }
 
     func findApplication(identifier: String) async throws -> ServiceApplicationInfo {
+        self.findApplicationIdentifiers.append(identifier)
+        try await self.onFindApplication?(self.findApplicationIdentifiers.count)
+        if let applicationLookups, !applicationLookups.isEmpty {
+            let index = min(self.findApplicationIdentifiers.count - 1, applicationLookups.count - 1)
+            guard let application = applicationLookups[index]
+            else { throw PeekabooError.appNotFound(identifier) }
+            return application
+        }
         guard let application = self.applications.first(where: {
             $0.name == identifier || $0.bundleIdentifier == identifier || identifier == "PID:\($0.processIdentifier)"
         }) else {
@@ -67,6 +85,7 @@ final class VerifyStateApplicationService: ApplicationServiceProtocol {
         -> UnifiedToolOutput<ServiceWindowListData>
     {
         self.listWindowsCallCount += 1
+        await self.onListWindows?()
         if let delay {
             await verifyStateNonCooperativeDelay(delay)
         }
@@ -121,15 +140,19 @@ final class VerifyStateScreenCaptureService: ScreenCaptureServiceProtocol {
     let applicationInfo: ServiceApplicationInfo?
     let windowInfo: ServiceWindowInfo?
     let delay: Duration?
+    private let onCapture: (@MainActor () async throws -> Void)?
+    private(set) var permissionCheckCount = 0
 
     init(
         applicationInfo: ServiceApplicationInfo? = nil,
         windowInfo: ServiceWindowInfo? = nil,
-        delay: Duration? = nil)
+        delay: Duration? = nil,
+        onCapture: (@MainActor () async throws -> Void)? = nil)
     {
         self.applicationInfo = applicationInfo
         self.windowInfo = windowInfo
         self.delay = delay
+        self.onCapture = onCapture
     }
 
     func captureWindow(
@@ -139,6 +162,7 @@ final class VerifyStateScreenCaptureService: ScreenCaptureServiceProtocol {
     {
         self.windowIDs.append(windowID)
         self.visualizerModes.append(visualizerMode)
+        try await self.onCapture?()
         if let delay {
             await verifyStateNonCooperativeDelay(delay)
         }
@@ -152,7 +176,8 @@ final class VerifyStateScreenCaptureService: ScreenCaptureServiceProtocol {
     }
 
     func hasScreenRecordingPermission() async -> Bool {
-        true
+        self.permissionCheckCount += 1
+        return true
     }
 
     func captureScreen(

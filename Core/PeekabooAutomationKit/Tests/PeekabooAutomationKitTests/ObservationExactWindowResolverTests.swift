@@ -1,9 +1,64 @@
 import CoreGraphics
+import PeekabooFoundation
 import XCTest
 @testable import PeekabooAutomationKit
 
 @MainActor
 final class ObservationExactWindowResolverTests: XCTestCase {
+    func testFrontmostSkipsRunningApplicationEnumerationWithoutChangingResolvedReceipt() async throws {
+        let app = Self.app(pid: 123)
+        let window = Self.serviceWindow(id: 42)
+        let service = ExactWindowApplicationService(app: app, windows: [window])
+        let snapshotProvider = DesktopStateSnapshotProvider(applications: service)
+        let resolver = ObservationTargetResolver(
+            applications: service,
+            exactWindowMetadataProvider: TestExactWindowMetadataProvider { _ in nil })
+
+        let snapshot = try await snapshotProvider.snapshot(for: .frontmost)
+        let resolved = try await resolver.resolve(.frontmost, snapshot: snapshot)
+        let inventorySnapshot = DesktopStateSnapshot(
+            runningApplications: [ApplicationIdentity(app)],
+            frontmostApplication: ApplicationIdentity(app))
+        let resolvedWithInventory = try await resolver.resolve(.frontmost, snapshot: inventorySnapshot)
+        let summary = DesktopStateSnapshotSummary(snapshot)
+
+        XCTAssertTrue(snapshot.runningApplications.isEmpty)
+        XCTAssertEqual(summary.runningApplicationCount, 0)
+        XCTAssertEqual(summary.frontmostApplication, ApplicationIdentity(app))
+        XCTAssertEqual(service.getFrontmostApplicationCalls, 1)
+        XCTAssertEqual(service.listApplicationsCalls, 0)
+        XCTAssertEqual(service.findApplicationCalls, 0)
+        XCTAssertEqual(service.listWindowsCalls, 2)
+        XCTAssertEqual(resolved, resolvedWithInventory)
+        XCTAssertEqual(resolved.kind, .windowID(42))
+        XCTAssertEqual(resolved.app?.processIdentifier, 123)
+        XCTAssertEqual(resolved.app?.processStartIdentity, 700)
+        XCTAssertEqual(resolved.window?.bounds, window.bounds)
+        XCTAssertEqual(resolved.detectionContext?.windowMutationIdentity, window.mutationIdentity)
+        XCTAssertEqual(
+            resolved.detectionContext?.windowMutationIdentity,
+            resolvedWithInventory.detectionContext?.windowMutationIdentity)
+    }
+
+    func testNonExactAppAndPIDStillCollectRunningApplicationInventory() async throws {
+        let app = Self.app(pid: 123)
+        let service = ExactWindowApplicationService(app: app, windows: [])
+        let snapshotProvider = DesktopStateSnapshotProvider(applications: service)
+        let targets: [DesktopObservationTargetRequest] = [
+            .app(identifier: "com.example.fixture", window: .automatic),
+            .pid(123, window: .title("Editor")),
+        ]
+
+        for target in targets {
+            let snapshot = try await snapshotProvider.snapshot(for: target)
+            XCTAssertEqual(snapshot.runningApplications, [ApplicationIdentity(app)])
+            XCTAssertEqual(DesktopStateSnapshotSummary(snapshot).runningApplicationCount, 1)
+            XCTAssertNil(snapshot.frontmostApplication)
+        }
+        XCTAssertEqual(service.listApplicationsCalls, targets.count)
+        XCTAssertEqual(service.getFrontmostApplicationCalls, 0)
+    }
+
     func testExactPIDSkipsRunningApplicationEnumeration() async throws {
         let app = Self.app(pid: 123)
         let service = ExactWindowApplicationService(app: app, windows: [])
@@ -96,6 +151,51 @@ final class ObservationExactWindowResolverTests: XCTestCase {
         XCTAssertEqual(proof.scope, .application)
         XCTAssertEqual(proof.normalizedSelector, "com.example.fixture")
         XCTAssertTrue(proof.selectedWindowIdentity?.hasSameStableReceipt(as: exactIdentity) == true)
+        XCTAssertEqual(service.listWindowsCalls, 0)
+    }
+
+    func testAmbiguousApplicationListsOnlyMatchingNamesAndPIDsBeforeAnyLookup() async throws {
+        let identities: [(Int32, String)] = [
+            (101, "Playground"),
+            (999, "Unrelated App"),
+            (202, "Playground"),
+            (303, "Playground"),
+            (404, "Playground Extra"),
+        ]
+        let applications = identities.map { pid, name in
+            ServiceApplicationInfo(
+                processIdentifier: pid,
+                processStartIdentity: 700,
+                bundleIdentifier: "org.example.fixture.\(pid)",
+                name: name,
+                windowCount: 1)
+        }
+        let service = ExactWindowApplicationService(app: applications[0], windows: [])
+        let resolver = ObservationTargetResolver(
+            applications: service,
+            exactWindowMetadataProvider: TestExactWindowMetadataProvider { _ in nil })
+        let expected = ["Playground (PID:101)", "Playground (PID:202)", "Playground (PID:303)"]
+
+        do {
+            _ = try await resolver.resolve(
+                .app(identifier: "Playground", window: .id(42)),
+                snapshot: DesktopStateSnapshot(runningApplications: applications.map(ApplicationIdentity.init)))
+            XCTFail("Expected duplicate exact app names to remain ambiguous")
+        } catch let error as PeekabooError {
+            guard case let .ambiguousAppIdentifier(identifier, suggestions) = error else {
+                return XCTFail("Expected app ambiguity, got \(error)")
+            }
+            XCTAssertEqual(identifier, "Playground")
+            XCTAssertEqual(suggestions, expected)
+            XCTAssertEqual(error.code.rawValue, "AMBIGUOUS_APP_IDENTIFIER")
+            XCTAssertEqual(
+                error.errorDescription,
+                "Multiple apps match 'Playground'. Did you mean: \(expected.joined(separator: ", "))")
+            XCTAssertEqual(error.context["suggestions"], expected.joined(separator: ", "))
+            XCTAssertEqual(error.suggestedAction, "Try one of: \(expected.joined(separator: ", "))")
+        }
+        XCTAssertEqual(service.listApplicationsCalls, 0)
+        XCTAssertEqual(service.findApplicationCalls, 0)
         XCTAssertEqual(service.listWindowsCalls, 0)
     }
 
@@ -347,6 +447,7 @@ private final class ExactWindowApplicationService: ApplicationServiceProtocol {
     var listApplicationsCalls = 0
     var findApplicationCalls = 0
     var listWindowsCalls = 0
+    var getFrontmostApplicationCalls = 0
 
     init(app: ServiceApplicationInfo, windows: [ServiceWindowInfo]) {
         self.app = app
@@ -375,7 +476,8 @@ private final class ExactWindowApplicationService: ApplicationServiceProtocol {
     }
 
     func getFrontmostApplication() async throws -> ServiceApplicationInfo {
-        self.app
+        self.getFrontmostApplicationCalls += 1
+        return self.app
     }
 
     func isApplicationRunning(identifier _: String) async -> Bool {

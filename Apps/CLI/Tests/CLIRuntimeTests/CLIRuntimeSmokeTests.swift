@@ -535,8 +535,8 @@ struct CLIRuntimeSmokeTests {
         #expect(metadata["modelName"] as? String == "not_invoked")
     }
 
-    @Test
-    func `peekaboo agent dry run is explicit for shorthand and run JSON`() async throws {
+    @Test(arguments: [false, true])
+    func `peekaboo agent dry run is explicit for shorthand and run JSON`(noDesktopContext: Bool) async throws {
         guard Self.ensureLocalRuntimeAvailable() else { return }
 
         let authorityCases: [(arguments: [String], requestedForeground: Bool, policy: String)] = [
@@ -550,7 +550,7 @@ struct CLIRuntimeSmokeTests {
         for prefix in [["agent"], ["agent", "run"]] {
             for authorityCase in authorityCases {
                 let arguments = prefix + ["  Inspect TextEdit  ", "--dry-run", "--json", "--no-remote"] +
-                    authorityCase.arguments
+                    authorityCase.arguments + (noDesktopContext ? ["--no-desktop-context"] : [])
                 let result = try await TestChildProcess.runPeekaboo(arguments)
                 let repeated = try await TestChildProcess.runPeekaboo(arguments)
                 #expect(result.status == .exited(0))
@@ -569,6 +569,7 @@ struct CLIRuntimeSmokeTests {
                 #expect(payload["dryRun"] as? Bool == true)
                 #expect(payload["instruction"] as? String == "Inspect TextEdit")
                 #expect(payload["modelExecution"] as? String == "skipped")
+                #expect(payload["automaticDesktopContext"] as? Bool == !noDesktopContext)
                 #expect((payload["toolCalls"] as? [Any])?.isEmpty == true)
                 #expect((trace["entries"] as? [Any])?.isEmpty == true)
                 #expect(trace["totalCallCount"] as? Int == 0)
@@ -580,8 +581,8 @@ struct CLIRuntimeSmokeTests {
         }
     }
 
-    @Test
-    func `peekaboo agent dry run is explicit for shorthand and run human output`() async throws {
+    @Test(arguments: [false, true])
+    func `peekaboo agent dry run is explicit for shorthand and run human output`(noDesktopContext: Bool) async throws {
         guard Self.ensureLocalRuntimeAvailable() else { return }
 
         let authorityCases: [(arguments: [String], requested: String, policy: String)] = [
@@ -592,7 +593,7 @@ struct CLIRuntimeSmokeTests {
             for authorityCase in authorityCases {
                 let result = try await TestChildProcess.runPeekaboo(
                     prefix + ["  Inspect TextEdit  ", "--dry-run", "--simple", "--no-remote"] +
-                        authorityCase.arguments
+                        authorityCase.arguments + (noDesktopContext ? ["--no-desktop-context"] : [])
                 )
                 #expect(result.status == .exited(0))
                 #expect(result.standardError.isEmpty)
@@ -601,6 +602,7 @@ struct CLIRuntimeSmokeTests {
                 Instruction: Inspect TextEdit
                 Requested foreground UI: \(authorityCase.requested)
                 Effective UI authority: \(authorityCase.policy)
+                Automatic desktop context: \(noDesktopContext ? "no" : "yes")
                 Model execution: skipped
                 Tool calls: 0
                 Session saved: no
@@ -660,8 +662,8 @@ struct CLIRuntimeSmokeTests {
         let nextTool = clipboardTail.dropFirst().range(of: "\n#### `")?.lowerBound ?? clipboardTail.endIndex
         let clipboardSection = clipboardTail[..<nextTool]
         let compactClipboard = clipboardSection.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        #expect(compactClipboard.contains("Available actions are `get` and `save`"))
-        #expect(compactClipboard.contains("Options: `get`, `save`"))
+        #expect(compactClipboard.contains("Available actions are `status`, `get` and `save`"))
+        #expect(compactClipboard.contains("Options: `status`, `get`, `save`"))
         #expect(!clipboardSection.contains("**Examples:**"))
         #expect(!clipboardSection.contains(#""action": "set""#))
         #expect(!clipboardSection.contains("peekaboo clipboard set"))
@@ -714,7 +716,7 @@ struct CLIRuntimeSmokeTests {
                 #expect(properties["foreground"] == nil)
                 #expect(description.contains("focus: Unavailable under background-only authority"))
             case "clipboard":
-                #expect(actions == Set(["get", "save"]))
+                #expect(actions == Set(["status", "get", "save"]))
                 #expect(properties["text"] == nil)
                 #expect(description.contains("persistently"))
                 #expect(description.contains("shared clipboard state"))
@@ -724,7 +726,7 @@ struct CLIRuntimeSmokeTests {
         }
     }
 
-    @Test
+    @Test(.enabled(if: CLIRuntimeEnvironment.runAmbientStateTests))
     func `peekaboo visualizer emits JSON (success or error)`() async throws {
         guard Self.ensureLocalRuntimeAvailable() else { return }
         let result = try await TestChildProcess.runPeekaboo(["visualizer", "--json", "--no-remote"])

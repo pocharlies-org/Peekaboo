@@ -32,7 +32,11 @@ extension ErrorHandlingCommand {
     }
 
     /// Handle errors with appropriate output format
-    func handleError(_ error: any Error, customCode: ErrorCode? = nil) {
+    func handleError(
+        _ error: any Error,
+        customCode: ErrorCode? = nil,
+        clipboardCleanupStatus: String? = nil
+    ) {
         if jsonOutput {
             let envelopeError = error as? any ResultEnvelopeError
             let isActionCommand = (self as? any ActionOutputFormattable)?.defaultEffect != nil
@@ -73,6 +77,7 @@ extension ErrorHandlingCommand {
                     targetReceipt: actionMetadata.targetReceipt,
                     targetIdentity: actionMetadata.targetIdentity,
                     screenCaptureKitOwnershipDiagnostic: screenCaptureKitOwnershipDiagnostic(for: error),
+                    clipboardCleanupStatus: clipboardCleanupStatus,
                     logger: logger
                 )
             }
@@ -130,16 +135,7 @@ extension ErrorHandlingCommand {
         case is ApplicationLifecycleRefusalError:
             .INTERACTION_FAILED
         case let failure as DesktopActionFailure:
-            switch failure.standardErrorCode {
-            case .snapshotStale:
-                .SNAPSHOT_STALE
-            case .snapshotNotFound:
-                .SNAPSHOT_NOT_FOUND
-            case .elementNotFound:
-                .ELEMENT_NOT_FOUND
-            default:
-                .INTERACTION_FAILED
-            }
+            desktopActionFailureErrorCode(failure)
         case let failure as ApplicationLifecycleReadOnlyFailureError:
             self.mapPeekabooErrorToCode(failure.underlyingError)
         case let posixError as POSIXError:

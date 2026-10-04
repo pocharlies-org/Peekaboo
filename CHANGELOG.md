@@ -1,5 +1,122 @@
 # Changelog
 
+## 4.7.0 - 2026-09-29
+
+**Highlights:** Fix the 4.6.0 CLI startup failure on Macs without the macOS 27 runtime, add GPT-6 Astra, Sol, and Luna plus GPT-6.1 Sol models, keep unattended clipboard reads from triggering macOS privacy prompts, give MCP and JSON clients structured element tables, focused text selection, and visible display bounds, and make compatible-provider Agent streaming reliable.
+
+- Keep CLI builds on Swift Collections 1.6.0 and reject unsupported strong borrowing-runtime imports in release artifacts, preventing the 4.6.0 startup failure on supported Macs without the macOS 27 runtime. Thanks @changexbc and @jandubois! #831.
+- Add GPT-6 Astra, Sol, and Luna selection through Tachikoma, preserving the chosen tier and 128K output allowance for native and compatible agent routes, and omitting unsupported temperature controls on reasoning routes.
+- Add GPT-6.1 Sol selection through Tachikoma, retaining its 128K output allowance on native and compatible Agent routes and validating its supported reasoning settings.
+- Refuse unattended clipboard reads before macOS privacy prompts, including Agent context and current-clipboard paste; share read admission with temporary writes, preserve retry-unsafe writes when readback is unavailable, and add content-free `clipboard status` plus explicit manual CLI `--allow-prompt` opt-in.
+- Preserve newer user or application clipboard updates during CLI and MCP paste cleanup, including cancellation and partial-write failures; require silent clipboard-read access and complete prior contents before replacement, restore only while the temporary generation is owned, and retain earlier clipboard effects when input is refused.
+- Add opt-in `include_elements` to the `see` and `inspect_ui` MCP tools, returning the element table as structured `_meta.ui_elements` (same fields as `see --json`) with its `snapshot_id`, so clients can act on element IDs without parsing the text summary; default responses are unchanged. Thanks @gxcsoccer.
+- Expose bounded, privacy-checked focused text selection as UTF-16 ranges in CLI JSON and MCP/Agent observations; consolidate native range decoding and preserve the existing signed receipt shape.
+- Include full visible work-area bounds in `screen list` JSON and its origin in human output, reusing global logical coordinates while preserving the existing display and visible-size fields.
+- Apply the saved Dock preference before promoting the Mac app at startup, keeping **Menu bar only** launches in accessory mode on macOS 27 while preserving unattended Bridge-host behavior. Thanks @tobihagemann! #861.
+- Update Chrome DevTools MCP to 1.10.1 with its per-server browser owner, preserving one-socket verification, telemetry isolation, redirect/reconnect refusal, and exact-page element routing; keep unprojected CSS response references unavailable.
+- Update Tachikoma to 0.5.1 for cancellable provider streams, correct LM Studio tool-call history, and preserved numeric tool values, retaining Peekaboo's existing tool schemas and compatible dependency pins.
+- Update Tachikoma to remove compatible streaming request dumps that could expose prompts/tool schemas and contaminate Agent JSON or quiet output, without changing provider requests or stream delivery.
+- Preserve fragmented tool arguments in compatible-provider Agent streams, validate complete call batches before execution, and retain explicit empty no-argument calls along with existing terminal, schema, and background-authority safeguards.
+- Restore the SDK Agent text-stream callback with exact text chunks and whitespace, separate from reasoning and tool events, while retaining model-specific terminal buffering and awaited cancellation-aware delivery.
+- Preserve native scalar tool arguments in Agent provider schemas and preflight validation so `set_value` accepts Boolean and numeric values without string coercion; retain existing structured-schema compatibility and native safety checks.
+- Skip discarded Agent progress-event rendering in JSON and quiet runs, share event completion/cancellation draining across task, resume, and audio execution, and remove the unused streaming-delegate adapter without changing provider selection, typed results, or safety metadata.
+- Add content-free monotonic Agent provider and tool phase timings for performance diagnosis, preserving streaming selection, results, cancellation, and public output formats.
+- Keep help, version, shell completions, and Agent dry-run output independent of configuration parsing, avoiding unnecessary startup reads and malformed-config warnings that corrupt JSON previews.
+- Honor `see --timeout` for pixel-only, raw-output, area, and multi-window captures, sharing the remaining budget with the selected host and preventing late successful output after timeout or cancellation.
+- Keep screenshot-free `verify` independent of capture-owner readiness and ambient capture-engine settings while preserving screenshot safety; clarify that `--on` matches an app's AXIdentifier or exact role and label, not snapshot-local element IDs.
+- Avoid a redundant all-app inventory before `verify` final screenshots so unrelated app warnings cannot omit an exact-target image; preserve process-generation checks across permission waits and exact-window checks around capture.
+- Honor classic capture for `verify --screenshot` on an explicitly selected compatible Bridge host, preserving optional-image failures, exact-target checks, and screenshot-free verification without extra permission probes.
+- Resolve live exact-PID verification through targeted application lookup instead of repeatedly collecting every app's metadata; unrelated inventory warnings no longer block the target, while generation, incomplete-target and absence checks remain fail-closed.
+- Verify positive element existence from the same exact-identifier evidence used for value matches when unrelated Accessibility reads fail; share witness validation while preserving unknown absence, ambiguity, truncated observations and target-drift checks.
+- Explain authenticated producer-bound snapshot requirements when an explicit Bridge host cannot serve `see`, instead of suggesting the older protocol 1.26 publication capability is sufficient; preserve host trust and refusal behavior.
+- Wait for native Accessibility text, value, and selection writes before dependent input; revalidate the exact receiver and edit state at dispatch, preserve accepted prefixes, and report cancelled pre-service Bridge operations without inventing input.
+- Share background window-geometry sequencing across move, resize, set-bounds, and maximize: verify dependent position changes before resizing, skip unchanged components, and retain retry-unsafe accounting for accepted or uncertain native writes.
+- Preserve Accessibility-value opt-out through background positional click fallback, and retain signed one-unit focus/selection results without upgrading unverified delivery to confirmed change.
+- Preserve signed background coordinate-click results when native hit-testing uses AXPress, retaining exact-window receipts, one-action accounting, and unverified retry-unsafe outcomes.
+- Preserve generation-pinned native hotkey targets through CLI and MCP results using the shared executor and sequence metadata; keep unverified chords retry-unsafe and never borrow a setup-focus receipt for an unattributed input leaf.
+- Honor synthetic hotkey strategies for Cmd+A without AX selection or permission bypass, preserving the built-in focused-selection default and direct event fallback; keep explicit process-menu scope, exact-window guards, and truthful post-action failure delivery.
+- Refuse exact-window `actionOnly` hotkeys before invoking an app-wide menu, preserving receipt-pinned `actionFirst` fallback, process-scoped menus, and truthful paste retry safety.
+- Stop guessing unreadable menu-shortcut modifiers or enabled state in action-first keyboard input; preserve native read failures and shortcut order while reducing menu traversal to direct Accessibility child reads.
+- Preserve signed background Cmd+A selection results and uncertain-write failures across process and exact-window Bridge routes using shared chord classification; retain concrete receipt-validation diagnostics without mistaking differing CLI/app build labels for a stale host.
+- Withhold post-mutation native value evidence when security metadata is unreadable, preserving retry-unsafe uncertainty without replaying accepted writes; later readable samples can still confirm within the existing deadline.
+- Reduce native AX round trips during exact-field observation by batching non-value identity metadata, preserving bounded individual-read compatibility, before/after validation, secure-field admission, deadlines, and retry-unsafe write outcomes.
+- Add content-free debug measurements for slow, incomplete and fallback native AX reads without extra queries or changes to observation completeness, timeouts or stability requirements.
+- Avoid executable-file probes when selecting background pointer delivery; inspect WebKit imports only for eligible native wheel targets, preserving exact-window safety checks.
+- Reuse the server's immutable semantic plan for projected Bridge requests instead of rebuilding it before dispatch, preserving wrapper validation and signed receipt binding.
+- Preserve Bridge request deadlines while socket work waits in its execution queue, refusing expired work before connecting without changing cancellation or dispatched-result semantics.
+- Refuse conflicting explicit Bridge sockets and caller-local input-policy overrides before constructing local services or sending input; preserve explicit local opt-in, implicit policy-local routing, and concrete snapshot producer affinity.
+- Honor live/action capture-engine overrides on explicitly selected capable Bridge hosts using verified inline pixels, preserving implicit caller-local overrides, default routing, and background focus; avoid redundant frontmost app inventories during observation.
+- Validate contiguous typing dispatch counts with bounded ranges instead of repeatedly allocating and scanning arrays, preserving receipt acceptance and partial-failure semantics.
+- Confirm daemon shutdown when its socket is gone and the process has exited but awaits parent reaping, avoiding false refusal/timeouts in synchronous automation; distinguish accepted shutdown timeouts from explicit refusals while preserving uncertain-state and probe-error safeguards.
+- Include received modifiers, event/key-window identity, activation state, and text-selection metadata in Playground keyboard diagnostics so background shortcut tests can distinguish delivery from verified effects without changing input handling.
+- Keep application-launch option tests from activating Finder by isolating their activation callbacks from the desktop.
+
+### Compatibility
+
+- CLI `clipboard get` and `clipboard save`, plus `clipboard set --verify` readback, now refuse instead of showing the macOS clipboard privacy alert unless the reader already has silent access. Check `peekaboo clipboard status`, and use `--allow-prompt` only for an attended permission bootstrap; MCP and automatic Agent or paste reads cannot opt in.
+
+## 4.6.0 - 2026-09-25
+
+**Highlights:** Safer typing and bounded clipboard/desktop waits, restored Codex MCP and GUI Bridge connections, explicit background typing strategies, and optional Agent desktop context.
+
+- Clear inherited modifier flags from targeted Unicode typing so held Command, Shift, or other modifiers cannot turn literal text into shortcuts.
+- Clear foreground chord modifier flags on key-up, including cancellation cleanup, and preserve retry-unsafe dispatch receipts for interrupted holds. Thanks @jandubois! #797.
+- Clear inherited modifier flags from unmodified foreground typing special keys without changing their keycodes or unverified delivery outcomes.
+- Bound paste clipboard-restoration waits to 10 seconds so excessive delays cannot monopolize the shared paste lock; CLI and MCP callers using longer delays must reduce them. Thanks @SebTardif! #759.
+- Bound clipboard-backed paste admission to one 15-second monotonic deadline across in-process and file-lock waits; refuse late acquisition with retry-safe `TIMEOUT` before clipboard or input changes, while preserving admitted settle and restoration. Thanks @SebTardif! #793.
+- Bound desktop operation lane admission to a shared 15-second deadline across turnstiles and scoped locks; refuse late acquisition before dispatch while preserving earlier effects and admitted operation lifetimes. Thanks @SebTardif! #794.
+- Bound targeted dialog hierarchy discovery off the main actor using the caller's timeout, preserving large/deep trees and exact receipts; reject late candidates and report timeout or incomplete Accessibility evidence with specific error codes.
+- Bound selected-dialog metadata extraction to the targeted list's remaining timeout without blocking the main actor or accepting late results; read native text values directly while preserving optional metadata defaults and exact dialog discovery.
+- Accept structured MCP experimental capabilities during initialization, restoring Codex connections; pin the upstream decoder repair and document its Swift dictionary-type migration. Thanks @Wudib! #745.
+- Restore default MCP startup on explicitly selected GUI Bridge hosts that support isolated browser sessions, preserving capability checks and caller-owned session cleanup. Thanks @smhanov! #744.
+- Refuse ordinary CLI typing and MCP clicks, actions, value changes, snapshot-backed scrolling, typing, and key presses from consumed or pending snapshots before focus or input; centralize mutation-lease handling while preserving historical reads and existing modifier-click/pixel-focus ownership.
+- Route background typing in web fields directly through targeted keyboard events, including clear and editing keys, instead of accepting ignored Accessibility writes; refuse unproven routes before input.
+- Bind receipt-pinned Accessibility typing, clear, and editing-key writes to the native receiver selected by focus validation; refuse last-moment receiver changes before mutation or keyboard fallback while preserving continuation reflow.
+- Bind background Cmd+A selection to its retained exact-window receiver, refusing changed or unreadable receiver identities before writing or replaying input.
+- Preserve known typing prefixes and zero-input refusal receipts when shared Accessibility setters fail, without replaying input or changing typing strategy.
+- Honor background typing strategies for text, editing keys, and clear; make the native-AX-first default explicit as `actionFirst`, keep synthetic-only choices free of AX value/selection edits, and refuse ambiguous AX failures without duplicating input through keyboard fallback. Preserve legacy SDK keyboard delivery by default; explicitly selected AX replacement requires zero delay and a freshly verified already-focused named target, while foreground CLI keyboard behavior is unchanged.
+- Distinguish Agent narrative from recorded action outcomes with bounded runtime notices in CLI JSON, non-quiet completion output, and MCP; preserve quiet text, original outcomes, and successful workflow semantics when later observations verify effects.
+- Add `agent --no-desktop-context` to skip new automatic desktop-context collection for run, chat, and resume invocations while preserving saved history, tool access, and background authority.
+- Honor MCP query-click waits with fresh, receipt-pinned Accessibility reads without screenshots; refuse changed targets and late matches while preserving the original modifier-click authority. Thanks @SebTardif! #785.
+- Expose already-observed focus identity in `see --json` and `see`/`inspect_ui` MCP metadata without extra Accessibility reads, preserving unknown focus and existing input guards.
+- Distinguish Bridge handshake success, permissions, advertised capture support, and ScreenCaptureKit preparation in normal and verbose status output without changing capture admission or JSON reports. Thanks @ProActive2023! #748.
+- Stop reporting hidden windows as on screen when native visibility metadata is omitted or as minimized in text listings; align native and classic capture metadata while preserving exact-window targeting and partial-inventory diagnostics. #779.
+- Refuse unsupported live/action capture-engine overrides combined with an explicit Bridge socket before capture or child execution, instead of silently moving capture into the caller process; preserve explicit local opt-in and normal host-policy capture.
+- Stop inventing local `see --json` UI-map paths for in-memory and Bridge-hosted snapshots; report an empty map path when no persisted artifact is available while preserving snapshot reuse and inline elements.
+- Preserve sanitized partial Agent execution traces when the step limit is exhausted, keep no-cache runs non-resumable, and replace blind-retry guidance with current-state inspection; retain Peekaboo-owned snapshot-cleanup metadata while isolating legacy browser-provider claims.
+- Centralize browser batch-progress validation for signed and legacy receiptless Bridge results while preserving their separate connection and completion-evidence requirements.
+- Keep fresh local `see` snapshots eligible for subsequent background input by excluding read-only observation timeouts from mutation barriers; preserve barriers for web-focus/menu-opening observations and caller-owned mutations.
+- Skip capture-owner startup probes for Agent invocations with an explicit tool allow-list that cannot reach native capture and no visual enhancements, reusing MCP catalog policy while preserving host routing and snapshot safety.
+- Preserve returned process and exact-window target identities and receipts in successful MCP typing metadata, including pixel-focus typing.
+- Bind signed `set-value` results to the same typed native observation, preserving numeric tolerance, literal text, and old-client presentation while rejecting fractional Boolean readbacks and lossy decimal-to-integer requests before claiming success.
+- Preserve exact-window snapshot receipts for background CLI element/query clicks on capable hosts without requiring redundant window flags; retain the process-pinned contract on limited hosts, share target planning across click variants, and reject contradictory or incomplete exact-window receipts.
+- Resolve ambiguous background focus observations using a stable native application receiver matched to one captured element, while preserving exact-window ownership, live input validation, and ordinary traversal time when the optional initial focus read stalls; later menu-bar reads retain their normal remaining-deadline budget.
+- Explain missing or ambiguous observed focus in `see --verbose` using content-free capture diagnostics without extra Accessibility reads or changed input guards.
+- Clarify that ScreenCaptureKit process-owner receipts omit Bridge socket paths rather than proving a listener absent or unreachable; document capture-runtime participation by embedding apps without changing routing or ownership guards.
+- Preserve the legacy SDK's `synthFirst` typing default while background typing remains AX-first; explicit strategies retain their precedence, and explicit SDK AX replacement rejects web or unprovable receivers before value mutation.
+- Prefer the best renderable window for daemon-backed app-only foreground focus while preserving exact selectors, receipt validation, and the fallback when every window is non-renderable. Thanks @jandubois! #802.
+- Resolve background keyboard focus through the native owning-window link when web text fields do not expose a direct window ID, preserving exact process, window, and focus validation.
+- Keep Agent text-task dry-run previews independent of UI hosts, capture ownership, and permissions while preserving input validation and foreground-authority reporting. #776.
+- Preserve typed desktop-action timeout, snapshot, and element error codes consistently across CLI JSON renderers without changing prior-effect or retry-safety metadata. #793.
+- Preserve implicit observations after canonical no-dispatch paste refusals, including wrapped target-resolution failures, when no focus or clipboard effect occurred; retain conservative invalidation for stronger outcome evidence, partial clipboard writes, and uncertain input and preserve other operations' pending barriers.
+- Exclude twice-confirmed absent processes from read-only application inventory while keeping denied, unavailable, and changing identities partial. Thanks @SkidCentrel! #784.
+- Limit ambiguous application suggestions to tied matching names and PIDs instead of exposing the entire running-app inventory, while keeping selector ambiguity fail-closed.
+- Let Agent and MCP automatic observations use proven classic capture on an explicitly selected ready Bridge while another process owns ScreenCaptureKit; keep explicit modern and raw SCK-only requests refused before transport. #778.
+- Restore reliable background scrolling by preferring owned numeric scrollbars, while keeping page fallback after definite value rejection and stopping after ambiguous input; eligible targets now use scrollbar increments instead of page distances.
+- Preserve existing background Cmd+A selection receipts as one unverified Accessibility value mutation through exact-window CLI/MCP checks; stop on ambiguous AX errors without replay. Input-strategy and hold behavior are unchanged.
+- Allow verified foreground focus after native AXRaise reports an unsupported action or attribute, without inventing a raise dispatch; preserve earlier accepted mutations and stop on ambiguous AX errors. Thanks @jandubois! #801.
+- Avoid downloading CLI CI build caches that are immediately discarded; key reusable dependency state by toolchain, manifests, locks, and submodules instead of every commit.
+- Align internal and public SwiftPM consumers on AXorcist 0.1.11 to preserve native numeric values, improve geometry/range parsing, and reject invalid scroll amounts before input dispatch.
+- Avoid duplicating native tool observations in Agent context while preserving action safety metadata, verification receipts, and image attachments.
+- Avoid reading geometry for unrelated Accessibility roles during exact-window keyboard focus checks, preserving per-character receiver validation.
+- Remove retired internal MCP process-only target resolution and obsolete window-target rejection; keep process-generation coverage on the active shared keyboard planner.
+
+- Update subprocess integration guidance for background-first host routing, producer-bound snapshots, shell-free Node.js calls, and structured failures without automatic input replay.
+
+### Compatibility
+
+- Propagate ambiguous application running-state checks instead of reporting matching apps as stopped; direct Swift `ApplicationService` callers must now use `try await`. Thanks @SebTardif! #795.
+
 ## 4.5.0 - 2026-09-22
 
 **Highlights:** Prevent snapshot data loss, crashes, and stuck desktop mutations; restore reliable Chrome connections; and ship smaller architecture-specific CLI downloads with automatic Homebrew selection.

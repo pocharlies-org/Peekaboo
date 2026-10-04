@@ -74,10 +74,7 @@ enum CommanderCLIBinder {
             options.requiresProcessGenerationPinnedHotkeys = true
         }
         options.requiresHostApplicationInventory = Self.requiresHostApplicationInventory(commandType)
-        let seeSkipsPixels = Self.applySeeRuntimeOptions(&options, commandType, values: commandValues)
-        options.transportsCaptureEnginePreference = options.requiresDesktopObservation
-        options.requiresScreenCaptureKitOwnerCapability = options.transportsCaptureEnginePreference
-        options.ignoresCaptureEnginePreference = seeSkipsPixels
+        let seeSkipsPixels = Self.applyObservationRuntimeOptions(&options, commandType, values: commandValues)
         options.requiresImplicitSnapshotInvalidation = Self.requiresImplicitSnapshotInvalidation(
             commandType,
             parsedValues: parsedValues
@@ -152,10 +149,10 @@ enum CommanderCLIBinder {
             parsedValues: parsedValues
         )
         options.requestsHostPermissionGrant = Self.isInteractivePermissionRequest(commandType)
-        options.usesPerToolSnapshotInvalidation = Self.isAgentExecutionCommand(commandType) ||
-            commandType == MCPCommand.Serve.self ||
-            commandType == VerifyCommand.self
-        if commandType == MCPCommand.Serve.self,
+        options.usesPerToolSnapshotInvalidation = servesDynamicTools || commandType == VerifyCommand.self
+        let enhancements = AgentCommand.resolveEnhancements(noDesktopContext: commandValues.flag("noDesktopContext"))
+        let enhancementCaptureReachable = Self.isAgentExecutionCommand(commandType) && enhancements.mayCaptureScreen
+        if servesDynamicTools, !enhancementCaptureReachable,
            MCPToolCatalog.explicitEnvironmentAllowListProvesNoScreenCaptureKitUse(environment: environment) {
             options.dynamicToolScreenCaptureReachable = false
             options.requiresSilentCapture = false
@@ -197,6 +194,18 @@ enum CommanderCLIBinder {
         return options
     }
 
+    private static func validateLiveCaptureEnginePreference(
+        _ options: CommandRuntimeOptions,
+        environment: [String: String]
+    ) throws {
+        guard options.usesInlineCaptureEngineTransport,
+              let captureEngine = options.captureEnginePreference ??
+              CommandRuntimeOptions.captureEnginePreference(environment: environment)
+        else { return }
+
+        try ObservationCommandSupport.validateCaptureEngineValue(captureEngine)
+    }
+
     private static func applyRuntimeTransportOptions(
         _ options: inout CommandRuntimeOptions,
         commandType: (any ParsableCommand.Type)?,
@@ -221,10 +230,13 @@ enum CommanderCLIBinder {
             options.remoteIsolationRequested = true
         }
         let explicitBridgeSocket = values.singleOption("bridge-socket")?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let environmentBridgeSocket = environment["PEEKABOO_BRIDGE_SOCKET"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let hasExplicitBridgeSocket = explicitBridgeSocket?.isEmpty == false ||
-            environmentBridgeSocket?.isEmpty == false
+        if let socketPath = explicitBridgeSocket, !socketPath.isEmpty {
+            options.bridgeSocketPath = socketPath
+        }
+        let hasExplicitBridgeSocket = BridgeSocketResolver.hasNonblankExplicitBridgeSocket(
+            options: options,
+            environment: environment
+        )
         if commandType == AppCommand.QuitSubcommand.self, hasExplicitBridgeSocket {
             // Implicit quit routing needs a reusable daemon so the selected host cannot be one
             // of the applications being quit. An explicit socket is the caller's selected host;
@@ -251,12 +263,13 @@ enum CommanderCLIBinder {
                   explicitBridgeSocket?.isEmpty ?? true {
             options.preferRemote = false
         }
-        if let socketPath = explicitBridgeSocket, !socketPath.isEmpty {
-            options.bridgeSocketPath = socketPath
+        try Self.validateLiveCaptureEnginePreference(options, environment: environment)
+        if let captureEngine = options.captureEnginePreference {
+            options.selectCaptureEnginePreference(captureEngine, environment: environment)
         }
     }
 
-    private static func applySeeRuntimeOptions(
+    private static func applyObservationRuntimeOptions(
         _ options: inout CommandRuntimeOptions,
         _ commandType: (any ParsableCommand.Type)?,
         values: CommanderBindableValues
@@ -268,6 +281,18 @@ enum CommanderCLIBinder {
             values.flag("noElements") &&
             values.singleOption("windowId") != nil &&
             values.singleOption("path")?.trimmingCharacters(in: .whitespacesAndNewlines) != "-"
+        options.usesInlineCaptureEngineTransport = commandType == CaptureLiveCommand.self ||
+            commandType == CaptureActionCommand.self
+        options.transportsCaptureEnginePreference = options.requiresDesktopObservation
+        options.requiresScreenCaptureKitOwnerCapability = options.transportsCaptureEnginePreference
+        options.ignoresCaptureEnginePreference = seeSkipsPixels
+        if commandType == VerifyCommand.self {
+            // Snapshot coordination does not imply that this fixed request captures pixels.
+            let requestsScreenshot = values.singleOption("screenshot") != nil
+            options.usesInlineCaptureEngineTransport = requestsScreenshot
+            options.dynamicToolScreenCaptureReachable = requestsScreenshot
+            options.ignoresCaptureEnginePreference = !requestsScreenshot
+        }
         return seeSkipsPixels
     }
 
@@ -296,17 +321,6 @@ enum CommanderCLIBinder {
             )
         }
         options.captureEnginePreference = captureEngine
-        if options.transportsCaptureEnginePreference {
-            let preference = ObservationCommandSupport.captureEnginePreference(
-                cliValue: captureEngine,
-                configuredValue: nil
-            )
-            options.requiresCaptureEnginePreferenceHost = true
-            options.requiresCaptureEnginePreferenceCapability = preference != .auto
-            options.requiresScreenCaptureKitOwnerCapability = true
-        } else if !options.requiresApplicationLaunchOptions, !options.requiresHostApplicationInventory {
-            options.preferRemote = false
-        }
     }
 
     private static func requiresApplicationLaunchOptions(_ commandType: (any ParsableCommand.Type)?) -> Bool {

@@ -146,7 +146,7 @@ for mutation in extra malformed multiple array writable symlink missing; do
     writable) chmod 644 "$candidate_receipt" ;;
     symlink) mv "$candidate_receipt" "$candidate/Contents/Resources/receipt-target.json"
       ln -s receipt-target.json "$candidate_receipt" ;;
-    missing) rm "$candidate_receipt" ;;
+    missing) rm -f "$candidate_receipt" ;;
     *) chmod u+w "$candidate_receipt"; cp "$TEST_DIR/receipt.json" "$candidate_receipt"; chmod 444 "$candidate_receipt" ;;
   esac
   assert_receipt_refused "$mutation"
@@ -163,7 +163,7 @@ mv "$TEST_DIR/absent-lock" "$lock"
 mv "$lock" "$TEST_DIR/symlink-lock"
 ln -s "$TEST_DIR/symlink-lock" "$lock"
 assert_native "$OUTPUT_APP" refuse 'lock missing or symlinked'
-rm "$lock"
+rm -f "$lock"
 mv "$TEST_DIR/symlink-lock" "$lock"
 git -C "$FIXTURE_ROOT" rm --cached -q "$CANONICAL_LOCK_RELATIVE"
 assert_native "$OUTPUT_APP" refuse 'lock is not tracked'
@@ -179,10 +179,10 @@ for relative in Apps/Playground/Package.resolved \
   mkdir -p "$(dirname "$FIXTURE_ROOT/$relative")"
   printf '{}\n' > "$FIXTURE_ROOT/$relative"
   assert_native "$OUTPUT_APP" refuse 'Noncanonical Playground dependency lock'
-  rm "$FIXTURE_ROOT/$relative"
+  rm -f "$FIXTURE_ROOT/$relative"
   ln -s missing "$FIXTURE_ROOT/$relative"
   assert_native "$OUTPUT_APP" refuse 'Noncanonical Playground dependency lock'
-  rm "$FIXTURE_ROOT/$relative"
+  rm -f "$FIXTURE_ROOT/$relative"
 done
 printf 'source lock refusals: absent, symlinked, untracked, dirty, assume-unchanged, competing\n'
 
@@ -200,7 +200,7 @@ done
 for mutation in missing nonexecutable symlink; do
   new_candidate "executable-$mutation"
   case "$mutation" in
-    missing) rm "$candidate/Contents/MacOS/Playground" ;;
+    missing) rm -f "$candidate/Contents/MacOS/Playground" ;;
     nonexecutable) chmod 644 "$candidate/Contents/MacOS/Playground" ;;
     symlink) mv "$candidate/Contents/MacOS/Playground" "$candidate/Contents/MacOS/target"
       ln -s target "$candidate/Contents/MacOS/Playground" ;;

@@ -111,7 +111,7 @@ private struct ActionResultEnvelopeFailure: LocalizedError, ResultEnvelopeError 
     }
 
     nonisolated var envelopeCode: ErrorCode? {
-        .INTERACTION_FAILED
+        desktopActionFailureErrorCode(self.failure)
     }
 
     nonisolated var envelopeEffect: ActionEffect? {
@@ -153,7 +153,7 @@ private struct PostDispatchActionResultEnvelopeFailure: LocalizedError, ResultEn
     }
 
     nonisolated var envelopeCode: ErrorCode? {
-        .INTERACTION_FAILED
+        self.failure.map(desktopActionFailureErrorCode) ?? .INTERACTION_FAILED
     }
 
     nonisolated var envelopeEffect: ActionEffect? {
@@ -271,6 +271,7 @@ struct ErrorInfo: Codable {
     let retry_safe: Bool?
     let mutation_dispatched: Bool?
     let screen_capture_kit_ownership_diagnostic: ScreenCaptureKitOwnershipDiagnostic?
+    let clipboard_cleanup_status: String?
 
     init(
         message: String,
@@ -279,7 +280,8 @@ struct ErrorInfo: Codable {
         details: String? = nil,
         retrySafe: Bool? = nil,
         mutationDispatched: Bool? = nil,
-        screenCaptureKitOwnershipDiagnostic: ScreenCaptureKitOwnershipDiagnostic? = nil
+        screenCaptureKitOwnershipDiagnostic: ScreenCaptureKitOwnershipDiagnostic? = nil,
+        clipboardCleanupStatus: String? = nil
     ) {
         self.init(
             message: message,
@@ -288,7 +290,8 @@ struct ErrorInfo: Codable {
             details: details,
             retrySafe: retrySafe,
             mutationDispatched: mutationDispatched,
-            screenCaptureKitOwnershipDiagnostic: screenCaptureKitOwnershipDiagnostic
+            screenCaptureKitOwnershipDiagnostic: screenCaptureKitOwnershipDiagnostic,
+            clipboardCleanupStatus: clipboardCleanupStatus
         )
     }
 
@@ -299,7 +302,8 @@ struct ErrorInfo: Codable {
         details: String? = nil,
         retrySafe: Bool? = nil,
         mutationDispatched: Bool? = nil,
-        screenCaptureKitOwnershipDiagnostic: ScreenCaptureKitOwnershipDiagnostic? = nil
+        screenCaptureKitOwnershipDiagnostic: ScreenCaptureKitOwnershipDiagnostic? = nil,
+        clipboardCleanupStatus: String? = nil
     ) {
         let presentation = splitErrorHint(from: message)
         self.code = code
@@ -309,6 +313,7 @@ struct ErrorInfo: Codable {
         self.retry_safe = retrySafe
         self.mutation_dispatched = mutationDispatched
         self.screen_capture_kit_ownership_diagnostic = screenCaptureKitOwnershipDiagnostic
+        self.clipboard_cleanup_status = clipboardCleanupStatus
     }
 }
 
@@ -342,7 +347,7 @@ nonisolated enum ErrorCode: String, Codable, Sendable {
 }
 
 func outputSuccessCodable(
-    data: some Codable,
+    data: some Encodable,
     messages: [String]? = nil,
     effect: ActionEffect? = nil,
     outcome: DesktopActionOutcome? = nil,
@@ -569,6 +574,7 @@ func outputError(
     targetReceipt: DesktopActionTargetReceipt? = nil,
     targetIdentity: DesktopTargetIdentity? = nil,
     screenCaptureKitOwnershipDiagnostic: ScreenCaptureKitOwnershipDiagnostic? = nil,
+    clipboardCleanupStatus: String? = nil,
     logger: Logger
 ) {
     let response = makeErrorEnvelope(
@@ -584,6 +590,7 @@ func outputError(
         targetReceipt: targetReceipt,
         targetIdentity: targetIdentity,
         screenCaptureKitOwnershipDiagnostic: screenCaptureKitOwnershipDiagnostic,
+        clipboardCleanupStatus: clipboardCleanupStatus,
         debugLogs: logger.getDebugLogs()
     )
     outputJSONCodable(response, logger: logger)
@@ -602,6 +609,7 @@ func makeErrorEnvelope(
     targetReceipt: DesktopActionTargetReceipt? = nil,
     targetIdentity: DesktopTargetIdentity? = nil,
     screenCaptureKitOwnershipDiagnostic: ScreenCaptureKitOwnershipDiagnostic? = nil,
+    clipboardCleanupStatus: String? = nil,
     debugLogs: [String] = []
 ) -> ResultEnvelope<Empty?> {
     let suppliedOutcome = actionOutcome?.projection ?? actionFailure?.outcome.projection
@@ -636,7 +644,8 @@ func makeErrorEnvelope(
             retrySafe: resolvedRetrySafe,
             mutationDispatched: resolvedMutationDispatched,
             screenCaptureKitOwnershipDiagnostic: screenCaptureKitOwnershipDiagnostic ??
-                actionFailure?.screenCaptureKitOwnershipDiagnostic
+                actionFailure?.screenCaptureKitOwnershipDiagnostic,
+            clipboardCleanupStatus: clipboardCleanupStatus
         )
     )
 }

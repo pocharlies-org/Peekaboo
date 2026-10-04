@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 import PeekabooAutomationKit
 import PeekabooCore
+import PeekabooFoundation
 
 /// Shared entry point used by the executable target.
 @MainActor
@@ -25,10 +26,6 @@ func executePeekabooCLI(arguments: [String]) async -> Int32 {
 
     // Initialize CoreGraphics silently to prevent CGS_REQUIRE_INIT error
     _ = CGMainDisplayID()
-
-    // Load configuration at startup. The singleton initializer already performs
-    // the initial load, so avoid a second credentials/config read on every CLI invocation.
-    _ = ConfigurationManager.shared.getConfiguration()
 
     let shouldEmitJSONErrors = containsJSONOutputFlag(arguments)
     let isActionCommand = shouldEmitJSONErrors && CommanderRuntimeRouter.isActionInvocation(argv: arguments)
@@ -97,7 +94,9 @@ func printGenericError(_ error: any Error, jsonOutput: Bool) {
     } else {
         .UNKNOWN_ERROR
     }
-    let code = captureOwnershipErrorCode(for: error) ?? envelopeError?.envelopeCode ?? fallbackCode
+    let failureCode = ((error as? DesktopActionFailure) ?? envelopeError?.envelopeActionFailure)
+        .map(desktopActionFailureErrorCode)
+    let code = captureOwnershipErrorCode(for: error) ?? envelopeError?.envelopeCode ?? failureCode ?? fallbackCode
     let actionMetadata = actionErrorEnvelopeMetadata(
         for: error,
         isActionCommand: ResultEnvelopeContext.isActionCommand

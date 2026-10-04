@@ -11,6 +11,28 @@ import Testing
 @MainActor
 @Suite(.serialized, .tags(.safe))
 struct DialogDiscoveryCommandTests {
+    @Test(arguments: [1.0, 5, 20, 60])
+    func `dialog command timeout preserves the explicit local service budget`(_ seconds: Double) async throws {
+        let observed = try await DialogCommand.withTimeout(seconds: seconds, operationName: "dialog fixture") {
+            try #require(DialogOperationDeadline.current)
+        }
+        #expect(observed.timeoutSeconds == seconds)
+        #expect(observed.operationName == "dialog fixture")
+        #expect(DialogOperationDeadline.current == nil)
+    }
+
+    @Test
+    func `dialog command cannot extend a tighter inherited deadline`() async throws {
+        let parent = try DialogOperationDeadline.bounded(timeoutSeconds: 5, operationName: "parent dialog")
+        let observed = try await DialogOperationDeadline.$current.withValue(parent) {
+            try await DialogCommand.withTimeout(seconds: 60, operationName: "nested dialog") {
+                try #require(DialogOperationDeadline.current)
+            }
+        }
+        #expect(observed.deadline == parent.deadline)
+        #expect(observed.operationName == parent.operationName)
+    }
+
     @Test func `targetless foreground click and dismiss still refuse`() {
         #expect(throws: (any Error).self) {
             _ = try DialogCommand.ClickSubcommand.parse(["--button", "Don't Allow", "--foreground"])
@@ -24,7 +46,7 @@ struct DialogDiscoveryCommandTests {
         let dialogs = try StubDiscoveredDialogService()
         let services = DiscoveryCommandServices(dialogs: dialogs)
         var command = try DialogCommand.ListSubcommand.parse([])
-        let output = try await self.capture {
+        let output = try await captureStandardOutputBytes {
             try await command.run(using: self.runtime(services))
         }
         let envelope = try #require(JSONSerialization.jsonObject(with: output) as? [String: Any])
@@ -38,11 +60,59 @@ struct DialogDiscoveryCommandTests {
         #expect(dialogs.preparedRequests.isEmpty)
     }
 
+    @Test(arguments: [false, true])
+    func `dialog list CLI timeout is standardized and creates no mutation debt`(targeted: Bool) async throws {
+        let dialogs = try StubDiscoveredDialogService()
+        let elements = dialogs.elements
+        dialogs.listHandler = {
+            try await Task.sleep(for: .seconds(60))
+            return elements
+        }
+
+        try await self.expectListFailure(
+            dialogs: dialogs,
+            targeted: targeted,
+            arguments: ["--timeout", "1s"],
+            code: "TIMEOUT",
+            messageFragment: "dialog list"
+        )
+    }
+
+    @Test(arguments: [false, true])
+    func `dialog list service timeout is standardized and creates no mutation debt`(targeted: Bool) async throws {
+        let dialogs = try StubDiscoveredDialogService()
+        dialogs.listHandler = {
+            throw PeekabooError.timeout("Fixture dialog read deadline exceeded")
+        }
+
+        try await self.expectListFailure(
+            dialogs: dialogs,
+            targeted: targeted,
+            code: "TIMEOUT",
+            messageFragment: "Fixture dialog read deadline exceeded"
+        )
+    }
+
+    @Test(arguments: [false, true])
+    func `dialog list unreadable hierarchy is standardized without claiming absence`(targeted: Bool) async throws {
+        let dialogs = try StubDiscoveredDialogService()
+        dialogs.listHandler = {
+            throw PeekabooError.accessibilityIncomplete("Fixture dialog hierarchy could not be read completely")
+        }
+
+        try await self.expectListFailure(
+            dialogs: dialogs,
+            targeted: targeted,
+            code: "ACCESSIBILITY_INCOMPLETE",
+            messageFragment: "Fixture dialog hierarchy could not be read completely"
+        )
+    }
+
     @Test func `targetless click dont allow prepares discovered receipt`() async throws {
         let dialogs = try StubDiscoveredDialogService()
         let services = DiscoveryCommandServices(dialogs: dialogs)
         var command = try DialogCommand.ClickSubcommand.parse(["--button", "Don't Allow"])
-        _ = try await self.capture { try await command.run(using: self.runtime(services)) }
+        _ = try await captureStandardOutputBytes { try await command.run(using: self.runtime(services)) }
         #expect(dialogs.preparedRequests.count == 1)
         #expect(dialogs.preparedRequests.first?.target.hasTarget == false)
         #expect(dialogs.preparedRequests.first?.buttonText == "Don't Allow")
@@ -72,6 +142,43 @@ struct DialogDiscoveryCommandTests {
         }
     }
 
+    private func expectListFailure(
+        dialogs: StubDiscoveredDialogService,
+        targeted: Bool,
+        arguments: [String] = [],
+        code: String,
+        messageFragment: String
+    ) async throws {
+        let services = DiscoveryCommandServices(dialogs: dialogs)
+        let runtime = self.runtime(services)
+        let targetArguments = targeted ? ["--pid", "42", "--window-id", "700"] : []
+        var command = try DialogCommand.ListSubcommand.parse(targetArguments + arguments)
+        let output = try await captureStandardOutputBytes {
+            let exitCode = await #expect(throws: ExitCode.self) {
+                try await command.run(using: runtime)
+            }
+            #expect(exitCode == ExitCode(1))
+        }
+        let envelope = try #require(JSONSerialization.jsonObject(with: output) as? [String: Any])
+        let error = try #require(envelope["error"] as? [String: Any])
+        #expect(envelope["success"] as? Bool == false)
+        #expect(error["code"] as? String == code)
+        #expect((error["message"] as? String)?.contains(messageFragment) == true)
+        #expect(envelope["data"] == nil || envelope["data"] is NSNull)
+        #expect(envelope["outcome"] == nil)
+        #expect(dialogs.listCalls == 1)
+        #expect(dialogs.listedTargets.count == (targeted ? 1 : 0))
+        if targeted {
+            #expect(dialogs.listedTargets.first?.processIdentifier == 42)
+            #expect(dialogs.listedTargets.first?.windowID == 700)
+        }
+        #expect(dialogs.preparedRequests.isEmpty)
+        #expect(dialogs.executedReceipts.isEmpty)
+        #expect(runtime.interactionMutationTracker.mutationSequence == 0)
+        #expect(runtime.interactionMutationTracker.mutationStartedAt == nil)
+        #expect(!runtime.interactionMutationTracker.hasPendingDurableMutation)
+    }
+
     private func runtime(_ services: DiscoveryCommandServices) -> CommandRuntime {
         CommandRuntime(
             configuration: .init(
@@ -85,27 +192,6 @@ struct DialogDiscoveryCommandTests {
             )
         )
     }
-
-    private func capture(_ operation: () async throws -> Void) async throws -> Data {
-        let pipe = Pipe()
-        fflush(stdout)
-        let original = dup(STDOUT_FILENO)
-        guard original >= 0, dup2(pipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO) >= 0 else {
-            throw POSIXError(.EIO)
-        }
-        defer { close(original) }
-        do {
-            try await operation()
-        } catch {
-            fflush(stdout)
-            _ = dup2(original, STDOUT_FILENO)
-            throw error
-        }
-        fflush(stdout)
-        _ = dup2(original, STDOUT_FILENO)
-        try pipe.fileHandleForWriting.close()
-        return try pipe.fileHandleForReading.readToEnd() ?? Data()
-    }
 }
 
 @MainActor
@@ -114,6 +200,8 @@ private final class StubDiscoveredDialogService: DialogServiceProtocol {
     let receipt: PreparedDialogActionReceipt
     let elements: DialogElements
     var listCalls = 0
+    var listHandler: (@MainActor () async throws -> DialogElements)?
+    var listedTargets: [DialogTargetSelector] = []
     var preparedRequests: [DialogActionPreparationRequest] = []
     var executedReceipts: [PreparedDialogActionReceipt] = []
 
@@ -200,7 +288,19 @@ private final class StubDiscoveredDialogService: DialogServiceProtocol {
         appName: String?
     ) async throws -> DialogElements {
         #expect(windowTitle == nil && appName == nil)
+        return try await self.listElements()
+    }
+
+    func listDialogElements(target: DialogTargetSelector) async throws -> DialogElements {
+        self.listedTargets.append(target)
+        return try await self.listElements()
+    }
+
+    private func listElements() async throws -> DialogElements {
         self.listCalls += 1
+        if let listHandler {
+            return try await listHandler()
+        }
         return self.elements
     }
 

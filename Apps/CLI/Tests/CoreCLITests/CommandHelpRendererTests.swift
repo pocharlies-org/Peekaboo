@@ -174,6 +174,16 @@ struct CommandHelpRendererTests {
     }
 
     @Test
+    func `scroll help distinguishes native units from wheel ticks`() {
+        let help = ScrollCommand.helpMessage()
+
+        #expect(help.contains("Number of native scroll units or wheel ticks"))
+        #expect(help.contains("Numeric scrollbars use AXValueIncrement or one tenth of their range per unit"))
+        #expect(help.contains("Distance depends on the selected route"))
+        #expect(!help.contains("Each tick is equivalent to one notch on a physical mouse wheel"))
+    }
+
+    @Test
     func `interaction help distinguishes current and legacy targeting`() {
         let typeHelp = TypeCommand.helpMessage()
         let clickHelp = ClickCommand.helpMessage()
@@ -207,6 +217,17 @@ struct CommandHelpRendererTests {
         #expect(help.contains("Expected element value"))
         #expect(!help.contains("Required x,y,width,height"))
         #expect(!help.contains("Required element value"))
+    }
+
+    @Test
+    func `verify help distinguishes accessibility identifiers from snapshot element IDs`() {
+        let help = VerifyCommand.helpMessage()
+
+        #expect(help.contains("Exact AXIdentifier or role:label selector"))
+        #expect(help.contains("not a snapshot-local element ID"))
+        #expect(help.contains("data.ui_elements[].identifier rather than data.ui_elements[].id"))
+        #expect(help.contains("--on basic-text-field --value-equals Ready"))
+        #expect(!help.contains("Element ID or role:label query"))
     }
 
     private func helpEntryCount(_ option: String, in help: String) -> Int {

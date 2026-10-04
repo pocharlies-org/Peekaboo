@@ -102,6 +102,7 @@ enum PeekabooBridgeOperationResultSemantics {
     enum UnitPolicy: Equatable, Sendable {
         case exact(Int)
         case oneOf([Int])
+        case range(ClosedRange<Int>)
         case positive
         /// The concrete service owns the count and may omit it when multiple native mechanisms ran.
         case variable
@@ -111,6 +112,8 @@ enum PeekabooBridgeOperationResultSemantics {
             case let .exact(expected):
                 count?.rawValue == expected
             case let .oneOf(expected):
+                count.map { expected.contains($0.rawValue) } ?? false
+            case let .range(expected):
                 count.map { expected.contains($0.rawValue) } ?? false
             case .positive:
                 count != nil
@@ -126,6 +129,8 @@ enum PeekabooBridgeOperationResultSemantics {
                 count.rawValue <= maximum
             case let .oneOf(expected):
                 expected.max().map { count.rawValue <= $0 } ?? false
+            case let .range(expected):
+                count.rawValue <= expected.upperBound
             case .positive:
                 true
             case .variable:
@@ -140,6 +145,10 @@ enum PeekabooBridgeOperationResultSemantics {
             case let .oneOf(values):
                 values.count == 1
                     ? values.first.flatMap { DesktopActionOutcome.DispatchUnitCount($0) }
+                    : nil
+            case let .range(values):
+                values.lowerBound == values.upperBound
+                    ? DesktopActionOutcome.DispatchUnitCount(values.lowerBound)
                     : nil
             case .positive, .variable:
                 nil
@@ -253,7 +262,7 @@ enum PeekabooBridgeOperationResultSemantics {
         var dispatchUnits: UnitPolicy {
             let minimum = self.minimumDispatchUnits
             let maximum = self.maximumDispatchUnits
-            return minimum == maximum ? .exact(minimum) : .oneOf(Array(minimum...maximum))
+            return minimum == maximum ? .exact(minimum) : .range(minimum...maximum)
         }
 
         var hasPositiveDispatch: Bool {
@@ -420,7 +429,7 @@ enum PeekabooBridgeOperationResultSemantics {
         case processGenerationObservation(PeekabooBridgeProcessGenerationObservationRequest)
         case certificationProducerAttestation(PeekabooBridgeCertificationProducerAttestationRequest)
         case typeActions(TypeActionResultRule)
-        case setValue(target: String, value: String)
+        case setValue(target: String, value: UIElementValue)
         case performAction(target: String, actionName: String)
 
         var typeActionDispatchUnits: UnitPolicy? {
@@ -758,10 +767,12 @@ enum PeekabooBridgeOperationResultSemantics {
                         "type response key and dispatch units")
                 }
             case let (.setValue(expectedTarget, expectedValue), .elementActionResult(result)):
+                let valueMatches = result.valueVerification.map {
+                    $0.matches(requested: expectedValue, newValue: result.newValue, actionName: result.actionName)
+                } ?? (result.actionName == "AXSetValue" && result.newValue == expectedValue.displayString)
                 guard result.target == expectedTarget,
-                      result.actionName == "AXSetValue",
                       result.anchorPoint == nil,
-                      result.newValue == expectedValue
+                      valueMatches
                 else {
                     throw PeekabooBridgeOperationReceiptError.receiptMismatch(
                         "set-value response request semantics")
@@ -770,7 +781,8 @@ enum PeekabooBridgeOperationResultSemantics {
                 guard result.target == expectedTarget,
                       result.actionName == expectedAction,
                       result.oldValue == nil,
-                      result.newValue == nil
+                      result.newValue == nil,
+                      result.valueVerification == nil
                 else {
                     throw PeekabooBridgeOperationReceiptError.receiptMismatch(
                         "perform-action response request semantics")

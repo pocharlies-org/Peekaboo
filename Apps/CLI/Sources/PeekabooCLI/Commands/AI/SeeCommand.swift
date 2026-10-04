@@ -126,6 +126,8 @@ RuntimeBackedCommand {
     @RuntimeStorage var runtime: CommandRuntime?
     var runtimeOptions = CommandRuntimeOptions()
 
+    var pixelCaptureAttempt: SeePixelCaptureAttempt?
+
     var verbose: Bool {
         self.runtime?.configuration.verbose ?? self.runtimeOptions.verbose
     }
@@ -140,6 +142,10 @@ RuntimeBackedCommand {
 
     var requiresExactObservationTarget: Bool {
         self.pid != nil || self.windowId != nil
+    }
+
+    var mayMutateDuringObservation: Bool {
+        self.webFocus || self.menubar
     }
 
     func withCaptureFocusMutation(_ operation: () async throws -> Void) async rethrows {
@@ -173,7 +179,7 @@ RuntimeBackedCommand {
         }
 
         let commandCopy = self
-        let mayMutateDuringObservation = commandCopy.webFocus || commandCopy.menubar
+        let mayMutateDuringObservation = commandCopy.mayMutateDuringObservation
         let actionProgress = mayMutateDuringObservation ? DesktopObservationActionProgress() : nil
 
         do {
@@ -219,7 +225,9 @@ RuntimeBackedCommand {
                 let context = try await Self.withWallClockTimeout(
                     seconds: preparationTimeout,
                     timeoutErrorSeconds: overallTimeout,
-                    interactionMutationTracker: runtime.observationTimeoutMutationTracker
+                    interactionMutationTracker: runtime.observationTimeoutMutationTracker(
+                        mayMutateDesktop: mayMutateDuringObservation
+                    )
                 ) {
                     try await DesktopObservationActionProgressContext.$current.withValue(actionProgress) {
                         try await commandCopy.prepareResult(
@@ -307,12 +315,7 @@ RuntimeBackedCommand {
 
     private func validateObservationRuntime(_ runtime: CommandRuntime) throws {
         try self.validateBeforeRuntime()
-        if let requiredHostFailure = runtime.requiredHostFailure {
-            throw PeekabooBridgeErrorEnvelope(
-                code: .operationNotSupported,
-                message: requiredHostFailure
-            )
-        }
+        try runtime.requireCompatibleHost()
     }
 
     private func logSeeStart() {
@@ -512,47 +515,18 @@ RuntimeBackedCommand {
         }
     }
 
-    private func runPixelOnlyCapture() async throws {
-        try self.validateStdoutStreamingOptions()
-        let coordinateReceiptID: String? =
-            if self.publishesPixelCoordinateReceipt {
-                try await self.services.snapshots.createExplicitSnapshot()
-            } else {
-                nil
-            }
-
-        var captures: [ImageCapturedFile] = []
-        do {
-            captures = try await self.performPixelCapture(snapshotID: coordinateReceiptID)
-            try self.validatePixelCaptureForPublishing(captures)
-            if self.streamsImageToStdout {
-                try self.outputImageToStdout(captures)
-            } else if let prompt = self.analyze, let firstCapture = captures.first {
-                let analysis = try await self.analyzeImage(firstCapture.imageData, with: prompt)
-                try self.outputResultsWithAnalysis(captures, analysis: analysis)
-            } else {
-                try self.outputResults(captures)
-            }
-        } catch {
-            if let coordinateReceiptID {
-                try? await self.services.snapshots.cleanSnapshot(snapshotId: coordinateReceiptID)
-            }
-            let receipt = SeeExecutionReceipt.combining(captures.map(\.receipt))
-            throw receipt.preservingFailure(error, operation: "see pixel capture")
-        }
-    }
-
     var publishesPixelCoordinateReceipt: Bool {
         self.noElements && self.windowId != nil && !self.streamsImageToStdout
     }
 
-    private static func remainingObservationTimeout(
+    static func remainingObservationTimeout(
         until deadline: Date,
-        overallTimeout: TimeInterval
+        overallTimeout: TimeInterval,
+        timeoutError: (any Error)? = nil
     ) throws -> TimeInterval {
         let remaining = deadline.timeIntervalSinceNow
         guard remaining > 0 else {
-            throw CaptureError.detectionTimedOut(overallTimeout)
+            throw timeoutError ?? CaptureError.detectionTimedOut(overallTimeout)
         }
         return remaining
     }
@@ -584,14 +558,21 @@ RuntimeBackedCommand {
             requiresOutcome: self.webFocus || self.menubar
         )
         SeeCommandPreparationContext.didCapture?()
+        var captureMetadata: [String: Any] = [
+            "snapshotId": captureResult.snapshotId,
+            "elementCount": captureResult.elements.all.count,
+            "screenshotSize": captureResult.screenshotData?.count ?? 0,
+        ]
+        if logger.isVerbose {
+            captureMetadata["observedFocus"] = Self.observedFocusSummary(
+                elements: captureResult.elements.all,
+                metadata: captureResult.metadata
+            )
+        }
         logger.verbose(
             "Capture completed successfully",
             category: "Capture",
-            metadata: [
-                "snapshotId": captureResult.snapshotId,
-                "elementCount": captureResult.elements.all.count,
-                "screenshotSize": captureResult.screenshotData?.count ?? 0,
-            ]
+            metadata: captureMetadata
         )
 
         do {

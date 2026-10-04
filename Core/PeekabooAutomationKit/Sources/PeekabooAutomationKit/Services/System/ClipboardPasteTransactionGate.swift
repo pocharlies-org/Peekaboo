@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import PeekabooFoundation
 
 /// A Cmd+V request crossed the point where the receiver may have consumed it,
 /// but Peekaboo cannot truthfully claim a verified paste result.
@@ -14,19 +15,34 @@ public struct ClipboardPasteOutcomeError: LocalizedError, Sendable {
     public let clipboardRestoreAttempted: Bool
     public let clipboardRestoreErrorDescription: String?
     public let targetProcessIdentifier: pid_t?
+    public let clipboardCleanupStatus: ClipboardTemporaryCleanupStatus?
 
     public init(
         kind: Kind,
         causeDescription: String? = nil,
         clipboardRestoreAttempted: Bool,
         clipboardRestoreErrorDescription: String? = nil,
-        targetProcessIdentifier: pid_t? = nil)
+        targetProcessIdentifier: pid_t? = nil,
+        clipboardCleanupStatus: ClipboardTemporaryCleanupStatus? = nil)
     {
         self.kind = kind
         self.causeDescription = causeDescription
         self.clipboardRestoreAttempted = clipboardRestoreAttempted
         self.clipboardRestoreErrorDescription = clipboardRestoreErrorDescription
         self.targetProcessIdentifier = targetProcessIdentifier
+        self.clipboardCleanupStatus = clipboardCleanupStatus
+    }
+
+    public var clipboardRestoreSucceeded: Bool? {
+        if self.clipboardRestoreErrorDescription != nil {
+            return false
+        }
+        switch self.clipboardCleanupStatus {
+        case .restored: return true
+        case .preservedNewerContents: return false
+        case .notNeeded: return nil
+        case nil: return self.clipboardRestoreAttempted ? true : nil
+        }
     }
 
     public var errorDescription: String? {
@@ -39,6 +55,10 @@ public struct ClipboardPasteOutcomeError: LocalizedError, Sendable {
         let cause = self.causeDescription.map { " Delivery detail: \($0)" } ?? ""
         let restoration = if let clipboardRestoreErrorDescription {
             " Clipboard restoration failed: \(clipboardRestoreErrorDescription)"
+        } else if self.clipboardCleanupStatus == .preservedNewerContents {
+            " A newer clipboard update was preserved; the prior contents were not restored."
+        } else if self.clipboardCleanupStatus == .notNeeded {
+            " The clipboard was not changed by this transaction."
         } else if self.clipboardRestoreAttempted {
             " The prior clipboard state was restored before the transaction lock was released."
         } else {
@@ -58,6 +78,7 @@ public enum ClipboardPasteTransactionGate {
         case systemCall(operation: String, path: String, code: Int32)
         case unsafeDirectory(path: String)
         case unsafeLockFile(path: String)
+        case lockTimeout(path: String)
 
         var errorDescription: String? {
             switch self {
@@ -70,9 +91,14 @@ public enum ClipboardPasteTransactionGate {
                 return "Clipboard paste transaction lock directory is unsafe: \(path)"
             case let .unsafeLockFile(path):
                 return "Clipboard paste transaction lock is not a regular file owned by the current user: \(path)"
+            case let .lockTimeout(path):
+                return "Timed out waiting for the exclusive clipboard paste transaction lock at \(path)."
             }
         }
     }
+
+    /// Matches the exclusive ScreenCaptureKit and desktop-mutation flock waits.
+    static let maximumLockWait: Duration = .seconds(15)
 
     /// Serializes callers in a shared host before they enter the file-lock wait loop.
     @MainActor private static var isActive = false
@@ -81,19 +107,24 @@ public enum ClipboardPasteTransactionGate {
     public static func withExclusiveTransaction<T: Sendable>(
         _ operation: () async throws -> T) async throws -> T
     {
-        try await self.withExclusiveTransaction(lockPath: self.defaultLockPath, operation)
+        try await self.withExclusiveTransaction(lockPath: self.defaultLockPath, operation: operation)
     }
 
     @MainActor
     static func withExclusiveTransaction<T: Sendable>(
         lockPath: String,
-        _ operation: () async throws -> T) async throws -> T
+        lockWait: Duration = Self.maximumLockWait,
+        now: @MainActor () -> ContinuousClock.Instant = { ContinuousClock.now },
+        retrySleep: @MainActor () async throws -> Void = { try await Task.sleep(for: .milliseconds(10)) },
+        operation: () async throws -> T) async throws -> T
     {
+        let deadline = now().advanced(by: lockWait)
         try Task.checkCancellation()
         while self.isActive {
-            try Task.checkCancellation()
-            try await Task.sleep(for: .milliseconds(10))
+            try self.checkLockDeadline(deadline, now: now(), path: lockPath)
+            try await retrySleep()
         }
+        try self.checkLockDeadline(deadline, now: now(), path: lockPath)
         self.isActive = true
         defer { self.isActive = false }
 
@@ -127,13 +158,28 @@ public enum ClipboardPasteTransactionGate {
                 throw GateError.systemCall(operation: "flock", path: standardizedLockPath, code: errno)
             }
 
-            try Task.checkCancellation()
-            try await Task.sleep(for: .milliseconds(10))
+            try self.checkLockDeadline(deadline, now: now(), path: standardizedLockPath)
+            try await retrySleep()
         }
         defer { flock(fd, LOCK_UN) }
 
-        try Task.checkCancellation()
+        try self.checkLockDeadline(deadline, now: now(), path: standardizedLockPath)
         return try await operation()
+    }
+
+    @MainActor
+    private static func checkLockDeadline(
+        _ deadline: ContinuousClock.Instant,
+        now: ContinuousClock.Instant,
+        path: String) throws
+    {
+        try Task.checkCancellation()
+        guard now < deadline else {
+            throw DesktopActionFailure.preDispatchRefusal(
+                reason: .targetUnavailable,
+                message: GateError.lockTimeout(path: path).localizedDescription,
+                standardErrorCode: .timeout)
+        }
     }
 
     static var defaultLockPath: String {
@@ -178,11 +224,25 @@ public enum ClipboardPasteTransactionGate {
         SystemIdentityResolver.processStartIdentity(processIdentifier)
     }
 
-    /// Waits for the receiving application to consume Cmd+V without inheriting caller cancellation.
+    /// Matches Press delay/hold so a huge restore delay cannot hold the exclusive paste lock unbounded.
+    public static let maximumRestoreDelayMilliseconds = 10000
+
+    public static func cappedRestoreDelayMilliseconds(_ milliseconds: Int) -> Int {
+        min(max(0, milliseconds), self.maximumRestoreDelayMilliseconds)
+    }
+
+    static func pasteConsumptionSleepDuration(milliseconds: Int) -> Duration? {
+        let capped = self.cappedRestoreDelayMilliseconds(milliseconds)
+        guard capped > 0 else { return nil }
+        return .milliseconds(capped)
+    }
+
+    /// Waits for Cmd+V consumption, capped at ``maximumRestoreDelayMilliseconds``.
+    /// Detached so cancellation cannot restore the previous clipboard before the receiver reads it.
     public static func waitForPasteConsumption(milliseconds: Int) async {
-        guard milliseconds > 0 else { return }
+        guard let delay = self.pasteConsumptionSleepDuration(milliseconds: milliseconds) else { return }
         let settle = Task.detached {
-            try? await Task.sleep(for: .milliseconds(milliseconds))
+            try? await Task.sleep(for: delay)
         }
         await settle.value
     }

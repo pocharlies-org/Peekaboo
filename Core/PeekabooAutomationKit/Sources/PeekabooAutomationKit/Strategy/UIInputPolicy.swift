@@ -48,14 +48,19 @@ public struct AppUIInputPolicy: Codable, Equatable, Sendable {
 
 /// Resolved input policy for action/synthesis dispatch.
 public struct UIInputPolicy: Codable, Equatable, Sendable {
-    public static let currentBehavior = UIInputPolicy(
-        defaultStrategy: .synthFirst,
+    public static let currentBehavior = UIInputPolicy.applicationDefaults(resolving: AppUIInputPolicy(
         click: .actionFirst,
         scroll: .actionFirst,
         setValue: .actionOnly,
-        performAction: .actionOnly)
+        performAction: .actionOnly))
 
-    public var defaultStrategy: UIInputStrategy
+    public var defaultStrategy: UIInputStrategy {
+        didSet {
+            self.backgroundTypingDefault = nil
+            self.backgroundSelectAllDefault = nil
+        }
+    }
+
     public var click: UIInputStrategy?
     public var scroll: UIInputStrategy?
     public var type: UIInputStrategy?
@@ -63,6 +68,10 @@ public struct UIInputPolicy: Codable, Equatable, Sendable {
     public var setValue: UIInputStrategy?
     public var performAction: UIInputStrategy?
     public var perApp: [String: AppUIInputPolicy]
+    /// Applies only to targeted typing when no explicit type or per-app selection wins.
+    public private(set) var backgroundTypingDefault: UIInputStrategy?
+    /// Prefers focused text selection only, not app-wide menus, for targeted Cmd+A without an explicit selection.
+    public private(set) var backgroundSelectAllDefault: UIInputStrategy?
 
     public init(
         defaultStrategy: UIInputStrategy = .synthFirst,
@@ -82,13 +91,60 @@ public struct UIInputPolicy: Codable, Equatable, Sendable {
         self.setValue = setValue
         self.performAction = performAction
         self.perApp = perApp
+        self.backgroundTypingDefault = nil
+        self.backgroundSelectAllDefault = nil
+    }
+
+    /// Keep resolved selections authoritative while preserving the absence of a global override.
+    public static func applicationDefaults(
+        resolving selections: AppUIInputPolicy,
+        perApp: [String: AppUIInputPolicy] = [:]) -> Self
+    {
+        var policy = Self(
+            defaultStrategy: selections.defaultStrategy ?? .synthFirst,
+            click: selections.click,
+            scroll: selections.scroll,
+            type: selections.type,
+            hotkey: selections.hotkey,
+            setValue: selections.setValue,
+            performAction: selections.performAction,
+            perApp: perApp)
+        if selections.defaultStrategy == nil {
+            policy.backgroundTypingDefault = .actionFirst
+            policy.backgroundSelectAllDefault = .actionFirst
+        }
+        return policy
+    }
+
+    public func backgroundTypingStrategy(bundleIdentifier: String? = nil) -> UIInputStrategy {
+        self.appStrategy(for: .type, bundleIdentifier: bundleIdentifier) ?? self.type ??
+            self.backgroundTypingDefault ?? self.defaultStrategy
+    }
+
+    public func backgroundSelectAllStrategy(bundleIdentifier: String? = nil) -> UIInputStrategy {
+        self.resolvedBackgroundHotkeyStrategy(isSelectAll: true, bundleIdentifier: bundleIdentifier).strategy
+    }
+
+    struct BackgroundHotkeyStrategy: Sendable {
+        let strategy: UIInputStrategy
+        let usesBuiltInPreference: Bool
+    }
+
+    func resolvedBackgroundHotkeyStrategy(
+        isSelectAll: Bool,
+        bundleIdentifier: String? = nil) -> BackgroundHotkeyStrategy
+    {
+        if let explicit = self.appStrategy(for: .hotkey, bundleIdentifier: bundleIdentifier) ?? self.hotkey {
+            return .init(strategy: explicit, usesBuiltInPreference: false)
+        }
+        if isSelectAll, let backgroundSelectAllDefault {
+            return .init(strategy: backgroundSelectAllDefault, usesBuiltInPreference: true)
+        }
+        return .init(strategy: self.defaultStrategy, usesBuiltInPreference: false)
     }
 
     public func strategy(for verb: UIInputVerb, bundleIdentifier: String? = nil) -> UIInputStrategy {
-        if let bundleIdentifier,
-           let appPolicy = self.perApp[bundleIdentifier],
-           let appStrategy = appPolicy.strategy(for: verb)
-        {
+        if let appStrategy = self.appStrategy(for: verb, bundleIdentifier: bundleIdentifier) {
             return appStrategy
         }
 
@@ -106,5 +162,9 @@ public struct UIInputPolicy: Codable, Equatable, Sendable {
         case .performAction:
             return self.performAction ?? self.defaultStrategy
         }
+    }
+
+    private func appStrategy(for verb: UIInputVerb, bundleIdentifier: String?) -> UIInputStrategy? {
+        bundleIdentifier.flatMap { self.perApp[$0]?.strategy(for: verb) }
     }
 }

@@ -462,6 +462,11 @@ struct SeeCommandAnnotationTests {
         #expect(decoded.coordinate_context?.viewport?.logicalBounds == viewport.logicalBounds)
         #expect(bounds["x"] as? Double == 5)
         #expect(bounds["y"] as? Double == 5)
+        // Pins the `ui_elements[]` wire shape shared with MCP `include_elements`: absent values are omitted.
+        #expect(Set(elements.first?.keys.map(\.self) ?? []) == [
+            "id", "role", "ax_role", "title", "bounds", "is_actionable", "is_enabled",
+        ])
+        #expect(Set(bounds.keys) == ["x", "y", "width", "height"])
     }
 
     @Test

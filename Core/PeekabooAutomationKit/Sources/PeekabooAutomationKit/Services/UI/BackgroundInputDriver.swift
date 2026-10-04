@@ -306,58 +306,43 @@ enum BackgroundInputDriver {
     }
 
     @discardableResult
+    @MainActor
     static func replaceFocusedText(
         with text: String,
-        targetProcessIdentifier: pid_t) throws -> Bool
+        targetProcessIdentifier: pid_t,
+        exactWindow: UIAutomationTarget.ExactWindow? = nil,
+        phase: KeyboardFocusValidationPhase = .initial,
+        validatedReceiver: Element? = nil) async throws -> FocusedTextKeyDispatch
     {
         try self.validateLiveTarget(targetProcessIdentifier)
-        guard let element = try self.focusedEditableTextElement(targetProcessIdentifier: targetProcessIdentifier) else {
-            return false
-        }
-        guard try self.setText(text, on: element) else {
-            return false
-        }
-        _ = self.setSelectedTextRange(CFRange(location: text.utf16.count, length: 0), on: element)
-        return true
+        return try await self.replaceFocusedText(
+            with: text,
+            exactWindow: exactWindow,
+            phase: phase,
+            validatedReceiver: validatedReceiver,
+            access: self.focusedTextEditAccess(
+                targetProcessIdentifier: targetProcessIdentifier,
+                exactWindow: exactWindow))
     }
 
     @discardableResult
+    @MainActor
     static func insertTextIntoFocusedText(
         _ text: String,
-        targetProcessIdentifier: pid_t) throws -> Bool
+        targetProcessIdentifier: pid_t,
+        exactWindow: UIAutomationTarget.ExactWindow? = nil,
+        phase: KeyboardFocusValidationPhase = .initial,
+        validatedReceiver: Element? = nil) async throws -> FocusedTextKeyDispatch
     {
         try self.validateLiveTarget(targetProcessIdentifier)
-        guard let element = try self.focusedEditableTextElement(targetProcessIdentifier: targetProcessIdentifier),
-              let currentText = try self.textValue(from: element)
-        else {
-            return false
-        }
-
-        let selectedRange = self.selectedTextRange(from: element)
-        let edit = self.textByReplacingSelection(in: currentText, selection: selectedRange, replacement: text)
-        guard try self.setText(edit.text, on: element) else {
-            return false
-        }
-        _ = self.setSelectedTextRange(CFRange(location: edit.cursorLocation, length: 0), on: element)
-        return true
-    }
-
-    @discardableResult
-    static func performFocusedTextHotkey(
-        primaryKey: String,
-        modifierFlags: CGEventFlags,
-        targetProcessIdentifier: pid_t) throws -> Bool
-    {
-        try self.validateLiveTarget(targetProcessIdentifier)
-        guard modifierFlags == .maskCommand,
-              primaryKey == "a",
-              let element = try self.focusedEditableTextElement(targetProcessIdentifier: targetProcessIdentifier),
-              let currentText = try self.textValue(from: element)
-        else {
-            return false
-        }
-
-        return self.setSelectedTextRange(CFRange(location: 0, length: currentText.utf16.count), on: element)
+        return try await self.insertTextIntoFocusedText(
+            text,
+            exactWindow: exactWindow,
+            phase: phase,
+            validatedReceiver: validatedReceiver,
+            access: self.focusedTextEditAccess(
+                targetProcessIdentifier: targetProcessIdentifier,
+                exactWindow: exactWindow))
     }
 
     private static func post(_ event: CGEvent, to pid: pid_t) {
@@ -502,13 +487,16 @@ enum BackgroundInputDriver {
 
     static func unicodeKeyboardEvents(
         for character: Character,
-        targetProcessIdentifier: pid_t) throws -> (keyDown: CGEvent, keyUp: CGEvent)
+        targetProcessIdentifier: pid_t,
+        makeEvent: (CGEventSource?, Bool) -> CGEvent? = {
+            CGEvent(keyboardEventSource: $0, virtualKey: 0, keyDown: $1)
+        }) throws -> (keyDown: CGEvent, keyUp: CGEvent)
     {
         let string = String(character)
         let source = CGEventSource(stateID: .hidSystemState)
 
-        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
+        guard let keyDown = makeEvent(source, true),
+              let keyUp = makeEvent(source, false)
         else {
             throw PeekabooError.operationError(message: "Failed to create background unicode keyboard events")
         }
@@ -518,6 +506,10 @@ enum BackgroundInputDriver {
             keyDown.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: buffer.baseAddress!)
             keyUp.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: buffer.baseAddress!)
         }
+
+        // Literal text must not inherit held user modifiers and become a shortcut.
+        keyDown.flags = []
+        keyUp.flags = []
 
         self.stampKeyboardRoutingFields(on: keyDown, targetProcessIdentifier: targetProcessIdentifier)
         self.stampKeyboardRoutingFields(on: keyUp, targetProcessIdentifier: targetProcessIdentifier)
@@ -643,8 +635,9 @@ enum BackgroundInputDriver {
         return String.Index(utf16Index, within: text)
     }
 
-    private static func focusedEditableTextElement(targetProcessIdentifier: pid_t) throws -> AXUIElement? {
+    private static func focusedTextElement(targetProcessIdentifier: pid_t) throws -> AXUIElement? {
         let application = AXUIElementCreateApplication(targetProcessIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.05)
         var focusedValue: CFTypeRef?
         let focusedError = AXUIElementCopyAttributeValue(
             application,
@@ -661,13 +654,7 @@ enum BackgroundInputDriver {
             return nil
         }
 
-        let element = unsafeDowncast(focusedValue, to: AXUIElement.self)
-        guard !self.isSecureTextElement(element),
-              self.isValueSettable(element)
-        else {
-            return nil
-        }
-        return element
+        return unsafeDowncast(focusedValue, to: AXUIElement.self)
     }
 
     private static func isValueSettable(_ element: AXUIElement) -> Bool {
@@ -700,19 +687,29 @@ enum BackgroundInputDriver {
         return value as? String
     }
 
-    private static func setText(_ text: String, on element: AXUIElement) throws -> Bool {
-        let error = AXUIElementSetAttributeValue(
-            element,
-            kAXValueAttribute as CFString,
-            text as CFTypeRef)
-        switch error {
-        case .success:
-            return true
-        case .apiDisabled:
-            throw PeekabooError.permissionDeniedAccessibility
-        default:
-            return false
-        }
+    @MainActor
+    private static func setText(
+        _ text: String,
+        on element: AXUIElement,
+        beforeMutation: @MainActor () throws -> Void) async throws -> FocusedTextKeyDispatch
+    {
+        try await ActionInputDriver().performObservedMutation(
+            on: AutomationElement(Element(element)),
+            attribute: .value,
+            beforeMutation: beforeMutation,
+            mutation: {
+                try self.textMutationAccepted(AXUIElementSetAttributeValue(
+                    element,
+                    kAXValueAttribute as CFString,
+                    text as CFTypeRef)) ? .accessibilityValue : .unsupported
+            },
+            matches: { sample in
+                if let sample {
+                    guard case let .string(value)? = sample.value else { return false }
+                    return self.exactTextMatches(value, text)
+                }
+                return self.exactTextMatches(try? self.textValue(from: element), text)
+            })
     }
 
     private static func selectedTextRange(from element: AXUIElement) -> CFRange? {
@@ -721,31 +718,24 @@ enum BackgroundInputDriver {
             element,
             kAXSelectedTextRangeAttribute as CFString,
             &value)
-        guard error == .success,
-              let value,
-              CFGetTypeID(value) == AXValueGetTypeID()
-        else {
-            return nil
-        }
-
-        var range = CFRange(location: 0, length: 0)
-        let axValue = unsafeDowncast(value, to: AXValue.self)
-        guard AXValueGetValue(axValue, .cfRange, &range) else {
-            return nil
-        }
-        return range
+        guard error == .success else { return nil }
+        return TextSelectionRange(nativeValue: value)?.nativeRange
     }
 
     @discardableResult
-    private static func setSelectedTextRange(_ range: CFRange, on element: AXUIElement) -> Bool {
+    private static func setSelectedTextRange(
+        _ range: CFRange,
+        on element: AXUIElement,
+        operation: InputDeliveryIndeterminateError.Operation = .type) throws -> Bool
+    {
         var range = range
         guard let value = AXValueCreate(.cfRange, &range) else {
             return false
         }
-        return AXUIElementSetAttributeValue(
+        return try self.textMutationAccepted(AXUIElementSetAttributeValue(
             element,
             kAXSelectedTextRangeAttribute as CFString,
-            value) == .success
+            value), operation: operation)
     }
 
     private static func stringAttribute(_ attributeName: CFString, from element: AXUIElement) -> String? {
@@ -935,66 +925,539 @@ enum BackgroundInputDriver {
 }
 
 extension BackgroundInputDriver {
-    static func performFocusedTextKey(
-        _ key: PeekabooFoundation.SpecialKey,
-        targetProcessIdentifier: pid_t) throws -> FocusedTextKeyDispatch
+    @MainActor
+    private static func setSelectedTextRangeAndObserve(
+        _ range: CFRange,
+        on element: AXUIElement,
+        beforeMutation: @MainActor () throws -> Bool) async throws -> FocusedTextKeyDispatch
+    {
+        let matches = {
+            guard let actual = self.selectedTextRange(from: element) else { return false }
+            return actual.location == range.location && actual.length == range.length
+        }
+        return try await ActionInputDriver().performObservedMutation(
+            on: AutomationElement(Element(element)),
+            attribute: .selectedTextRange,
+            mutation: {
+                if try beforeMutation() {
+                    return .noChange
+                }
+                return try self.setSelectedTextRange(range, on: element) ? .accessibilityValue : .unsupported
+            },
+            matches: { sample in
+                if let sample {
+                    guard let expected = TextSelectionRange(location: range.location, length: range.length) else {
+                        return false
+                    }
+                    return sample.selectedTextRange == expected
+                }
+                return matches()
+            })
+    }
+
+    static func exactTextMatches(_ left: String?, _ right: String?) -> Bool {
+        // AX ranges use UTF-16 offsets; canonical String equality is insufficient for focused text edits.
+        switch (left, right) {
+        case (nil, nil): true
+        case let (.some(left), .some(right)): left.utf16.elementsEqual(right.utf16)
+        default: false
+        }
+    }
+
+    struct FocusedTextEditState: Equatable {
+        let text: String?
+        let selection: CFRange?
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            BackgroundInputDriver.exactTextMatches(lhs.text, rhs.text) &&
+                lhs.selection?.location == rhs.selection?.location &&
+                lhs.selection?.length == rhs.selection?.length
+        }
+    }
+
+    @MainActor
+    struct FocusedTextEditAccess<Receiver> {
+        let focusedElement: () throws -> Receiver?
+        let isEditable: (Receiver) throws -> Bool
+        let textValue: (Receiver) throws -> String?
+        let selectedRange: (Receiver) -> CFRange?
+        let focusSnapshot: (Receiver) -> ExactWindowFocusSnapshot?
+        let setText: (String, Receiver, FocusedTextEditState) async throws -> FocusedTextKeyDispatch
+        let selectRange: (CFRange, Receiver, FocusedTextEditState) async throws -> FocusedTextKeyDispatch
+
+        func state(of receiver: Receiver) throws -> FocusedTextEditState {
+            try FocusedTextEditState(text: self.textValue(receiver), selection: self.selectedRange(receiver))
+        }
+
+        private static func readBeforeMutation<Value>(_ read: () throws -> Value) throws -> Value {
+            try Task.checkCancellation()
+            do {
+                let value = try read()
+                try Task.checkCancellation()
+                return value
+            } catch let cancellation as CancellationError {
+                throw cancellation
+            } catch let failure as DesktopActionFailure {
+                throw failure
+            } catch {
+                try Task.checkCancellation()
+                throw DesktopActionFailure.preDispatchRefusal(
+                    reason: .targetUnavailable,
+                    message: "The focused receiver state could not be read before mutation.")
+            }
+        }
+
+        init(
+            focusedElement: @escaping () throws -> Receiver?,
+            sameReceiver: @escaping (Receiver, Receiver) -> Bool,
+            isEditable: @escaping (Receiver) throws -> Bool,
+            textValue: @escaping (Receiver) throws -> String?,
+            selectedRange: @escaping (Receiver) -> CFRange?,
+            focusSnapshot: @escaping (Receiver) -> ExactWindowFocusSnapshot?,
+            validateReceiver: @escaping (Receiver) throws -> Void,
+            setText: @escaping (String, Receiver, @MainActor () throws -> Void) async throws -> FocusedTextKeyDispatch,
+            selectRange: @escaping (CFRange, Receiver, @MainActor () throws -> Bool) async throws
+                -> FocusedTextKeyDispatch)
+        {
+            let readFocusedElement = { try Self.readBeforeMutation(focusedElement) }
+            let readTextValue = { (receiver: Receiver) in try Self.readBeforeMutation { try textValue(receiver) } }
+            self.focusedElement = readFocusedElement
+            self.isEditable = isEditable
+            self.textValue = readTextValue
+            self.selectedRange = selectedRange
+            self.focusSnapshot = focusSnapshot
+            let beforeMutation = { (receiver: Receiver, expected: FocusedTextEditState, selection: CFRange?) in
+                try Task.checkCancellation()
+                try validateReceiver(receiver)
+                let currentState = try FocusedTextEditState(
+                    text: readTextValue(receiver),
+                    selection: selectedRange(receiver))
+                try Task.checkCancellation()
+                let alreadySelected = selection.map {
+                    currentState == FocusedTextEditState(text: expected.text, selection: $0)
+                } ?? false
+                guard currentState == expected || alreadySelected else {
+                    throw DesktopActionFailure.preDispatchRefusal(
+                        reason: .targetUnavailable,
+                        message: "The focused text or selection changed before mutation; observe it again.")
+                }
+                guard let current = try readFocusedElement(), sameReceiver(current, receiver) else {
+                    throw DesktopActionFailure.preDispatchRefusal(
+                        reason: .targetUnavailable,
+                        message: "The focused Accessibility text receiver changed before mutation.")
+                }
+                try Task.checkCancellation()
+                return alreadySelected
+            }
+            self.setText = { text, receiver, expectedState in
+                _ = try beforeMutation(receiver, expectedState, nil)
+                guard !BackgroundInputDriver.exactTextMatches(expectedState.text, text) else { return .noChange }
+                return try await setText(text, receiver) { _ = try beforeMutation(receiver, expectedState, nil) }
+            }
+            self.selectRange = { range, receiver, expectedState in
+                if try beforeMutation(receiver, expectedState, range) {
+                    return .noChange
+                }
+                // A range reached during preflight permits a no-op, never a rebased selection write.
+                return try await selectRange(range, receiver) { try beforeMutation(receiver, expectedState, range) }
+            }
+        }
+    }
+
+    @MainActor
+    private static func focusedTextEditAccess(
+        targetProcessIdentifier: pid_t,
+        exactWindow: UIAutomationTarget.ExactWindow?) -> FocusedTextEditAccess<AXUIElement>
+    {
+        let expectedGeneration = exactWindow?.identity.ownerProcessStartIdentity ??
+            SystemIdentityResolver.processStartIdentity(targetProcessIdentifier)
+        let validateReceiver = { (element: AXUIElement) throws in
+            guard let expectedGeneration,
+                  SystemIdentityResolver.processStartIdentity(targetProcessIdentifier) == expectedGeneration
+            else {
+                throw DesktopActionFailure.preDispatchRefusal(
+                    reason: .targetUnavailable,
+                    message: "The Accessibility text receiver process changed before mutation.")
+            }
+            if let exactWindow {
+                try self.validateExactWindowTextReceiver(
+                    DetachedExactWindowFocusReader.read(element: element, processIdentifier: targetProcessIdentifier),
+                    exactWindow: exactWindow,
+                    phase: .continuation)
+                guard let keyWindow = DetachedExactWindowFocusReader.readKeyWindow(
+                    processIdentifier: targetProcessIdentifier),
+                    keyWindow.processIdentifier == targetProcessIdentifier,
+                    keyWindow.windowID == exactWindow.identity.windowID,
+                    !keyWindow.hasAttachedSheet
+                else {
+                    throw DesktopActionFailure.preDispatchRefusal(
+                        reason: .targetUnavailable,
+                        message: "The exact text receiver window lost keyboard authority before mutation.")
+                }
+            }
+            AXUIElementSetMessagingTimeout(element, 0.05)
+            defer { AXUIElementSetMessagingTimeout(element, 0) }
+            guard Element(element).isFocused() == true else {
+                throw DesktopActionFailure.preDispatchRefusal(
+                    reason: .targetUnavailable,
+                    message: "The Accessibility text receiver no longer confirms keyboard focus.")
+            }
+        }
+        return FocusedTextEditAccess(
+            focusedElement: { try self.focusedTextElement(targetProcessIdentifier: targetProcessIdentifier) },
+            sameReceiver: { CFEqual($0, $1) },
+            isEditable: { element in
+                guard !self.isSecureTextElement(element), self.isValueSettable(element) else { return false }
+                return try self.permitsAccessibilityTextEditing(
+                    element,
+                    targetProcessIdentifier: targetProcessIdentifier)
+            },
+            textValue: { try self.textValue(from: $0) },
+            selectedRange: { self.selectedTextRange(from: $0) },
+            focusSnapshot: {
+                DetachedExactWindowFocusReader.read(element: $0, processIdentifier: targetProcessIdentifier)
+            },
+            validateReceiver: validateReceiver,
+            setText: { text, element, beforeMutation in
+                try await self.setText(text, on: element, beforeMutation: beforeMutation)
+            },
+            selectRange: { range, element, beforeMutation in
+                try await self.setSelectedTextRangeAndObserve(range, on: element, beforeMutation: beforeMutation)
+            })
+    }
+
+    private static func permitsAccessibilityTextEditing(
+        _ element: AXUIElement,
+        targetProcessIdentifier: pid_t) throws -> Bool
+    {
+        // Ownership validation precedes this route gate; never retry accepted web AX writes as events.
+        try TextInputRoute.resolve(
+            focusedElement: element,
+            application: AXUIElementCreateApplication(targetProcessIdentifier),
+            targetProcessIdentifier: targetProcessIdentifier).permitsAccessibilityEditing()
+    }
+
+    @MainActor
+    private static func focusedEditableTextElement<Receiver>(
+        exactWindow: UIAutomationTarget.ExactWindow?,
+        phase: KeyboardFocusValidationPhase,
+        validatedReceiver: Element?,
+        access: FocusedTextEditAccess<Receiver>) throws -> Receiver?
+    {
+        guard let element = try access.focusedElement() else {
+            if let exactWindow {
+                try self.validateExactWindowTextReceiver(nil, exactWindow: exactWindow, phase: phase)
+            }
+            return nil
+        }
+        if let exactWindow {
+            let focused = access.focusSnapshot(element)
+            let validatedNativeElement = validatedReceiver.map { RetainedFocusElement(element: $0.underlyingElement) }
+            // Continuation permits reflow, but a different native receiver must never inherit that permission.
+            let receiverMatches = exactWindow.focusedElement == nil ||
+                (validatedNativeElement != nil && focused?.nativeElement == validatedNativeElement)
+            try self.validateExactWindowTextReceiver(
+                receiverMatches ? focused : nil, exactWindow: exactWindow, phase: phase)
+        }
+        guard try access.isEditable(element) else { return nil }
+        return element
+    }
+
+    @MainActor
+    static func replaceFocusedText(
+        with text: String,
+        exactWindow: UIAutomationTarget.ExactWindow?,
+        phase: KeyboardFocusValidationPhase = .initial,
+        validatedReceiver: Element? = nil,
+        access: FocusedTextEditAccess<some Any>) async throws -> FocusedTextKeyDispatch
+    {
+        guard let element = try self.focusedEditableTextElement(
+            exactWindow: exactWindow, phase: phase, validatedReceiver: validatedReceiver, access: access)
+        else { return .unsupported }
+        let state = try access.state(of: element)
+        let valueDispatch = try await access.setText(text, element, state)
+        guard valueDispatch != .unsupported else { return .unsupported }
+        return try await self.completeTextEdit(
+            CFRange(location: text.utf16.count, length: 0),
+            element: element,
+            valueDispatch: valueDispatch,
+            expectedText: text,
+            sourceSelection: state.selection,
+            access: access)
+    }
+
+    @MainActor
+    static func insertTextIntoFocusedText(
+        _ text: String,
+        exactWindow: UIAutomationTarget.ExactWindow?,
+        phase: KeyboardFocusValidationPhase = .initial,
+        validatedReceiver: Element? = nil,
+        access: FocusedTextEditAccess<some Any>) async throws -> FocusedTextKeyDispatch
+    {
+        guard let element = try self.focusedEditableTextElement(
+            exactWindow: exactWindow, phase: phase, validatedReceiver: validatedReceiver, access: access)
+        else { return .unsupported }
+        let state = try access.state(of: element)
+        guard let currentText = state.text else { return .unsupported }
+        let edit = self.textByReplacingSelection(
+            in: currentText, selection: state.selection, replacement: text)
+        let valueDispatch = try await access.setText(edit.text, element, state)
+        guard valueDispatch != .unsupported else { return .unsupported }
+        return try await self.completeTextEdit(
+            CFRange(location: edit.cursorLocation, length: 0),
+            element: element,
+            valueDispatch: valueDispatch,
+            expectedText: edit.text,
+            sourceSelection: state.selection,
+            access: access)
+    }
+
+    @MainActor
+    private static func completeTextEdit<Receiver>(
+        _ range: CFRange,
+        element: Receiver,
+        valueDispatch: FocusedTextKeyDispatch,
+        expectedText: String,
+        sourceSelection: CFRange?,
+        access: FocusedTextEditAccess<Receiver>) async throws -> FocusedTextKeyDispatch
+    {
+        do {
+            try Task.checkCancellation()
+            let state = FocusedTextEditState(text: expectedText, selection: sourceSelection)
+            switch try await access.selectRange(range, element, state) {
+            case .accessibilityValue:
+                return .accessibilityValue
+            case .noChange:
+                return valueDispatch
+            case .unsupported:
+                guard valueDispatch == .accessibilityValue else { return .unsupported }
+                throw ActionInputError.unsupported(.attributeUnsupported)
+            }
+        } catch {
+            guard valueDispatch == .accessibilityValue else { throw error }
+            throw DesktopActionFailure.indeterminate(
+                delivery: .init(mechanism: .accessibilityValue, mode: .background),
+                evidence: .completionUnknown,
+                unitCount: .one,
+                message: "The text value was written, but its selection could not be confirmed.",
+                hint: "Observe the exact target before deciding whether to retry typing.",
+                causeDescription: error.localizedDescription)
+        }
+    }
+
+    struct FocusedTextHotkeyAccess<Receiver> {
+        let focusedElement: () throws -> Receiver?
+        let textValue: (Receiver) throws -> String?
+        let focusSnapshot: (Receiver) -> ExactWindowFocusSnapshot?
+        let selectRange: (CFRange, Receiver) throws -> Bool
+    }
+
+    @discardableResult
+    static func performFocusedTextHotkey(
+        primaryKey: String,
+        modifierFlags: CGEventFlags,
+        targetProcessIdentifier: pid_t,
+        exactWindow: UIAutomationTarget.ExactWindow? = nil) throws -> Bool
     {
         try self.validateLiveTarget(targetProcessIdentifier)
-        guard let element = try self.focusedEditableTextElement(targetProcessIdentifier: targetProcessIdentifier),
-              let currentText = try self.textValue(from: element)
+        return try self.performFocusedTextHotkey(
+            primaryKey: primaryKey,
+            modifierFlags: modifierFlags,
+            exactWindow: exactWindow,
+            access: FocusedTextHotkeyAccess(
+                focusedElement: { try self.focusedTextElement(targetProcessIdentifier: targetProcessIdentifier) },
+                textValue: { element in
+                    guard !self.isSecureTextElement(element), self.isValueSettable(element) else { return nil }
+                    guard try self.permitsAccessibilityTextEditing(
+                        element, targetProcessIdentifier: targetProcessIdentifier)
+                    else { return nil }
+                    return try self.textValue(from: element)
+                },
+                focusSnapshot: {
+                    DetachedExactWindowFocusReader.read(element: $0, processIdentifier: targetProcessIdentifier)
+                },
+                selectRange: { try self.setSelectedTextRange($0, on: $1, operation: .hotkey) }))
+    }
+
+    static func performFocusedTextHotkey(
+        primaryKey: String,
+        modifierFlags: CGEventFlags,
+        exactWindow: UIAutomationTarget.ExactWindow?,
+        access: FocusedTextHotkeyAccess<some Any>) throws -> Bool
+    {
+        guard HotkeyService.isSelectAllShortcut(primaryKey: primaryKey, flags: modifierFlags) else { return false }
+        guard let element = try access.focusedElement() else {
+            if let exactWindow {
+                try self.validateExactWindowTextReceiver(nil, exactWindow: exactWindow)
+            }
+            return false
+        }
+        if let exactWindow {
+            // Validate the retained object before AX eligibility can trigger an unsupported fallback.
+            try self.validateExactWindowTextReceiver(access.focusSnapshot(element), exactWindow: exactWindow)
+        }
+        guard let currentText = try access.textValue(element) else { return false }
+        return try access.selectRange(
+            CFRange(location: 0, length: currentText.utf16.count),
+            element)
+    }
+
+    static func validateExactWindowTextReceiver(
+        _ focused: ExactWindowFocusSnapshot?,
+        exactWindow: UIAutomationTarget.ExactWindow,
+        phase: KeyboardFocusValidationPhase = .initial) throws
+    {
+        let refusal = DesktopActionFailure.preDispatchRefusal(
+            reason: .targetUnavailable,
+            message: "The Accessibility text receiver no longer matches the exact target; observe it again.")
+        guard let focused,
+              focused.processIdentifier == exactWindow.identity.ownerProcessIdentifier,
+              focused.windowID == exactWindow.identity.windowID,
+              !focused.frame.isEmpty,
+              exactWindow.bounds.contains(CGPoint(x: focused.frame.midX, y: focused.frame.midY))
+        else {
+            throw refusal
+        }
+        if let expected = exactWindow.focusedElement {
+            guard let windowID = focused.windowID,
+                  let role = focused.role,
+                  FocusedElementReceiptResolver.matches(
+                      FocusedElementIdentity(
+                          processIdentifier: focused.processIdentifier,
+                          windowID: windowID,
+                          role: role,
+                          title: focused.title,
+                          identifier: focused.identifier,
+                          frame: focused.frame),
+                      expected: expected,
+                      phase: phase)
+            else {
+                throw refusal
+            }
+        }
+    }
+
+    static func textMutationAccepted(
+        _ error: AXError,
+        operation: InputDeliveryIndeterminateError.Operation = .type) throws -> Bool
+    {
+        if error == .success {
+            return true
+        }
+        switch ActionInputDriver.classify(error) {
+        case .unsupported:
+            return false
+        case .permissionDenied:
+            throw DesktopActionFailure.preDispatchRefusal(
+                reason: .permissionDenied,
+                message: "Accessibility permission is denied for the text edit.")
+        case .staleElement:
+            throw DesktopActionFailure.preDispatchRefusal(
+                reason: .targetUnavailable,
+                message: "The accessibility text receiver is stale; observe it again.")
+        case .targetUnavailable, .failed:
+            throw InputDeliveryIndeterminateError(
+                operation: operation,
+                causeDescription: "Accessibility text mutation returned AX error \(error.rawValue).",
+                delivery: .init(mechanism: .accessibilityValue, mode: .background))
+        }
+    }
+
+    @MainActor
+    static func performFocusedTextKey(
+        _ key: PeekabooFoundation.SpecialKey,
+        targetProcessIdentifier: pid_t,
+        exactWindow: UIAutomationTarget.ExactWindow? = nil,
+        phase: KeyboardFocusValidationPhase = .initial,
+        validatedReceiver: Element? = nil) async throws -> FocusedTextKeyDispatch
+    {
+        guard key.mayUseAccessibilityValueDelivery else { return .unsupported }
+        try self.validateLiveTarget(targetProcessIdentifier)
+        return try await self.performFocusedTextKey(
+            key,
+            exactWindow: exactWindow,
+            phase: phase,
+            validatedReceiver: validatedReceiver,
+            access: self.focusedTextEditAccess(
+                targetProcessIdentifier: targetProcessIdentifier,
+                exactWindow: exactWindow))
+    }
+
+    @MainActor
+    static func performFocusedTextKey(
+        _ key: PeekabooFoundation.SpecialKey,
+        exactWindow: UIAutomationTarget.ExactWindow?,
+        phase: KeyboardFocusValidationPhase = .initial,
+        validatedReceiver: Element? = nil,
+        access: FocusedTextEditAccess<some Any>) async throws -> FocusedTextKeyDispatch
+    {
+        guard let element = try self.focusedEditableTextElement(
+            exactWindow: exactWindow, phase: phase, validatedReceiver: validatedReceiver, access: access)
         else {
             return .unsupported
         }
+        let state = try access.state(of: element)
+        guard let currentText = state.text else { return .unsupported }
 
         let textLength = currentText.utf16.count
-        let selection = self.clampedSelection(self.selectedTextRange(from: element), textLength: textLength)
+        let selection = self.clampedSelection(state.selection, textLength: textLength)
 
         switch key {
         case .leftArrow:
             let location = self.cursorLocationMovingLeft(from: selection, in: currentText)
-            return self.setSelectedTextRange(CFRange(location: location, length: 0), on: element)
-                ? .accessibilityValue
-                : .unsupported
+            return try await access.selectRange(CFRange(location: location, length: 0), element, state)
 
         case .rightArrow:
             let location = self.cursorLocationMovingRight(from: selection, in: currentText)
-            return self.setSelectedTextRange(CFRange(location: location, length: 0), on: element)
-                ? .accessibilityValue
-                : .unsupported
+            return try await access.selectRange(CFRange(location: location, length: 0), element, state)
 
         case .home:
-            return self.setSelectedTextRange(CFRange(location: 0, length: 0), on: element)
-                ? .accessibilityValue
-                : .unsupported
+            return try await access.selectRange(CFRange(location: 0, length: 0), element, state)
 
         case .end:
-            return self.setSelectedTextRange(CFRange(location: textLength, length: 0), on: element)
-                ? .accessibilityValue
-                : .unsupported
+            return try await access.selectRange(CFRange(location: textLength, length: 0), element, state)
 
         case .delete:
             guard let editRange = self.deletionRangeBeforeSelection(selection, in: currentText) else {
                 return .noChange
             }
             let edit = self.textByReplacingSelection(in: currentText, selection: editRange, replacement: "")
-            guard try self.setText(edit.text, on: element) else { return .unsupported }
-            _ = self.setSelectedTextRange(CFRange(location: edit.cursorLocation, length: 0), on: element)
-            return .accessibilityValue
+            let valueDispatch = try await access.setText(edit.text, element, state)
+            guard valueDispatch != .unsupported else { return .unsupported }
+            return try await self.completeTextEdit(
+                CFRange(location: edit.cursorLocation, length: 0),
+                element: element,
+                valueDispatch: valueDispatch,
+                expectedText: edit.text,
+                sourceSelection: state.selection,
+                access: access)
 
         case .forwardDelete:
             guard let editRange = self.deletionRangeAfterSelection(selection, in: currentText) else {
                 return .noChange
             }
             let edit = self.textByReplacingSelection(in: currentText, selection: editRange, replacement: "")
-            guard try self.setText(edit.text, on: element) else { return .unsupported }
-            _ = self.setSelectedTextRange(CFRange(location: edit.cursorLocation, length: 0), on: element)
-            return .accessibilityValue
+            let valueDispatch = try await access.setText(edit.text, element, state)
+            guard valueDispatch != .unsupported else { return .unsupported }
+            return try await self.completeTextEdit(
+                CFRange(location: edit.cursorLocation, length: 0),
+                element: element,
+                valueDispatch: valueDispatch,
+                expectedText: edit.text,
+                sourceSelection: state.selection,
+                access: access)
 
         case .space:
             let edit = self.textByReplacingSelection(in: currentText, selection: selection, replacement: " ")
-            guard try self.setText(edit.text, on: element) else { return .unsupported }
-            _ = self.setSelectedTextRange(CFRange(location: edit.cursorLocation, length: 0), on: element)
-            return .accessibilityValue
+            let valueDispatch = try await access.setText(edit.text, element, state)
+            guard valueDispatch != .unsupported else { return .unsupported }
+            return try await self.completeTextEdit(
+                CFRange(location: edit.cursorLocation, length: 0),
+                element: element,
+                valueDispatch: valueDispatch,
+                expectedText: edit.text,
+                sourceSelection: state.selection,
+                access: access)
 
         default:
             return .unsupported
@@ -1004,8 +1467,15 @@ extension BackgroundInputDriver {
     @MainActor
     static func performPositionalClickAction(
         _ action: PositionalClickAction,
-        on element: any AutomationElementRepresenting) async throws -> DesktopActionOutcome
+        on element: any AutomationElementRepresenting,
+        allowsAccessibilityValueDelivery: Bool = true) async throws -> DesktopActionOutcome
     {
+        if !allowsAccessibilityValueDelivery, action == .select || action == .focus {
+            throw DesktopActionFailure.preDispatchRefusal(
+                reason: .operationUnsupported,
+                message: "Targeted click Accessibility-value delivery is disabled.",
+                hint: "Use an allowed Accessibility action or explicitly admit value delivery.")
+        }
         switch action {
         case .press:
             return try await self.performDetachedAction(
@@ -1174,7 +1644,8 @@ extension BackgroundInputDriver {
         targetProcessIdentifier: pid_t,
         targetWindowID: CGWindowID? = nil,
         expectedWindowIdentity: WindowMutationIdentity? = nil,
-        expectedWindowBounds: CGRect? = nil) async throws -> DesktopActionOutcome
+        expectedWindowBounds: CGRect? = nil,
+        allowsAccessibilityValueDelivery: Bool = true) async throws -> DesktopActionOutcome
     {
         guard targetProcessIdentifier > 0, self.isProcessAlive(targetProcessIdentifier) else {
             throw PeekabooError.invalidInput("Target process identifier is not running: \(targetProcessIdentifier)")
@@ -1241,7 +1712,10 @@ extension BackgroundInputDriver {
             try self.assertBelongsToTargetWindow(resolved.element, targetWindowID: targetWindowID, at: point)
         }
 
-        return try await self.performPositionalClickAction(resolved.action, on: resolved.element)
+        return try await self.performPositionalClickAction(
+            resolved.action,
+            on: resolved.element,
+            allowsAccessibilityValueDelivery: allowsAccessibilityValueDelivery)
     }
 }
 

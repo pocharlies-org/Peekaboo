@@ -15,6 +15,7 @@ struct SeeRequest {
     let webFocus: Bool
     let traversalBudget: AXTraversalBudget
     let roi: CaptureRegionOfInterest?
+    let includeElements: Bool
 
     init(arguments: ToolArguments) throws {
         self.appTarget = arguments.getString("app_target")
@@ -25,6 +26,7 @@ struct SeeRequest {
         self.annotate = arguments.getBool("annotate") ?? false
         self.ocr = arguments.getBool("ocr") ?? false
         self.webFocus = arguments.getBool("web_focus") ?? false
+        self.includeElements = arguments.getBool(ObservedElementTableMetadata.argumentName) ?? false
         if let rawROI = arguments.getString("roi")?.trimmingCharacters(in: .whitespacesAndNewlines),
            !rawROI.isEmpty
         {
@@ -67,10 +69,11 @@ struct SeeRequest {
     }
 }
 
-struct ScreenshotOutput {
+struct SeeResponseOutput {
     let screenshotPath: String
     let annotatedPath: String?
     let imageData: Data
+    let includeElements: Bool
 }
 
 struct SeeCaptureArtifact {
@@ -139,12 +142,14 @@ struct SeeSummaryBuilder {
     let screenshotPath: String
     let truncationInfo: DetectionTruncationInfo?
     let traversalBudget: AXTraversalBudget?
+    let selectionSummaries: [String]
 
     func build() async -> String {
         var lines = self.headerLines()
         await lines.append(contentsOf: self.metadataLines())
         lines.append("Screenshot: \(self.screenshotPath)")
         lines.append("Elements found: \(self.elements.count)")
+        lines.append(contentsOf: self.selectionSummaries)
         lines.append(contentsOf: self.truncationWarningLines())
         lines.append("")
         lines.append(contentsOf: self.elementSection())

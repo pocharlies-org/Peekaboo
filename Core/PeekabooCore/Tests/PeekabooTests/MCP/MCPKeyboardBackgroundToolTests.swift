@@ -228,6 +228,8 @@ struct MCPKeyboardBackgroundToolTests {
     @Test
     func `Type tool dispatches to snapshot process without claiming unconfirmed characters`() async throws {
         await Self.uiSnapshots.removeAllSnapshots()
+        let snapshots = await InMemorySnapshotManager()
+        let snapshotId = try await snapshots.createSnapshot()
         let automation = await MainActor.run { MockAutomationService(accessibilityGranted: true) }
         let applications = await MainActor.run {
             MockApplicationService(applications: [AutomationTestFixtures.application(
@@ -239,9 +241,9 @@ struct MCPKeyboardBackgroundToolTests {
         let context = await MCPToolTestHelpers.makeContext(
             automation: automation,
             applications: applications,
+            snapshots: snapshots,
             snapshotOwner: Self.uiSnapshots.owner)
-        let snapshot = await Self.uiSnapshots.createSnapshot()
-        let snapshotId = await snapshot.id
+        let snapshot = await Self.uiSnapshots.createSnapshot(id: snapshotId)
         await snapshot.setScreenshot(
             path: "/tmp/screenshot.png",
             metadata: CaptureMetadata(
@@ -405,6 +407,8 @@ struct MCPKeyboardBackgroundToolTests {
 
     @Test
     func `Type tool preserves background focus and typing dispatch without false character claims`() async throws {
+        let snapshots = await InMemorySnapshotManager()
+        let snapshotId = try await snapshots.createSnapshot()
         let automation = await MainActor.run { MockAutomationService(accessibilityGranted: true) }
         let applications = await MainActor.run {
             MockApplicationService(applications: [AutomationTestFixtures.application(
@@ -416,9 +420,9 @@ struct MCPKeyboardBackgroundToolTests {
         let context = await MCPToolTestHelpers.makeContext(
             automation: automation,
             applications: applications,
+            snapshots: snapshots,
             snapshotOwner: Self.uiSnapshots.owner)
-        let snapshot = await Self.uiSnapshots.createSnapshot()
-        let snapshotId = await snapshot.id
+        let snapshot = await Self.uiSnapshots.createSnapshot(id: snapshotId)
         await snapshot.setScreenshot(
             path: "/tmp/screenshot.png",
             metadata: CaptureMetadata(
@@ -539,6 +543,8 @@ struct MCPKeyboardBackgroundToolTests {
     @Test
     func `Type tool reports failure after background focus click as retry unsafe`() async throws {
         await Self.uiSnapshots.removeAllSnapshots()
+        let snapshots = await InMemorySnapshotManager()
+        let snapshotId = try await snapshots.createSnapshot()
         let automation = await MainActor.run {
             let automation = MockAutomationService(accessibilityGranted: true)
             automation.pinnedTypeError = { _ in
@@ -553,9 +559,9 @@ struct MCPKeyboardBackgroundToolTests {
                 processStartIdentity: 13,
                 bundleIdentifier: "com.example.snapshot",
                 name: "SnapshotApp")]),
+            snapshots: snapshots,
             snapshotOwner: Self.uiSnapshots.owner)
-        let snapshot = await Self.uiSnapshots.createSnapshot()
-        let snapshotId = await snapshot.id
+        let snapshot = await Self.uiSnapshots.createSnapshot(id: snapshotId)
         await snapshot.setScreenshot(
             path: "/tmp/screenshot.png",
             metadata: CaptureMetadata(
@@ -608,6 +614,7 @@ struct MCPKeyboardBackgroundToolTests {
     @Test
     func `indeterminate typing after focus never reports emitted units as typed characters`() async throws {
         await Self.uiSnapshots.removeAllSnapshots()
+        let snapshots = await InMemorySnapshotManager()
         let automation = await MainActor.run {
             let automation = MockAutomationService(accessibilityGranted: true)
             automation.pinnedTypeError = { _ in
@@ -625,8 +632,11 @@ struct MCPKeyboardBackgroundToolTests {
                 processStartIdentity: 15,
                 bundleIdentifier: "com.example.snapshot",
                 name: "SnapshotApp")]),
+            snapshots: snapshots,
             snapshotOwner: Self.uiSnapshots.owner)
+        let authoritativeSnapshotID = try await snapshots.createSnapshot()
         let snapshotId = await self.makeTypingSnapshot(
+            snapshotID: authoritativeSnapshotID,
             processIdentifier: 115,
             processStartIdentity: 15)
 
@@ -649,6 +659,7 @@ struct MCPKeyboardBackgroundToolTests {
     @Test
     func `Type tool does not count an indeterminate focus click as typed characters`() async throws {
         await Self.uiSnapshots.removeAllSnapshots()
+        let snapshots = await InMemorySnapshotManager()
         let automation = await MainActor.run {
             let automation = MockAutomationService(accessibilityGranted: true)
             automation.pinnedClickError = { _ in
@@ -666,8 +677,11 @@ struct MCPKeyboardBackgroundToolTests {
                 processStartIdentity: 14,
                 bundleIdentifier: "com.example.snapshot",
                 name: "SnapshotApp")]),
+            snapshots: snapshots,
             snapshotOwner: Self.uiSnapshots.owner)
+        let authoritativeSnapshotID = try await snapshots.createSnapshot()
         let snapshotId = await self.makeTypingSnapshot(
+            snapshotID: authoritativeSnapshotID,
             processIdentifier: 114,
             processStartIdentity: 14)
 
@@ -904,10 +918,11 @@ extension MCPKeyboardBackgroundToolTests {
     }
 
     private func makeTypingSnapshot(
+        snapshotID: String,
         processIdentifier: pid_t,
         processStartIdentity: UInt64) async -> String
     {
-        let snapshot = await Self.uiSnapshots.createSnapshot()
+        let snapshot = await Self.uiSnapshots.createSnapshot(id: snapshotID)
         let snapshotId = await snapshot.id
         await snapshot.setScreenshot(
             path: "/tmp/screenshot.png",
@@ -961,53 +976,5 @@ struct PressToolParsingValidationTests {
     }
 }
 
-private final class MockClipboardService: ClipboardServiceProtocol, @unchecked Sendable {
-    private var current: ClipboardReadResult?
-    private var slots: [String: ClipboardReadResult] = [:]
-    private let restoreError: ClipboardServiceError?
-    private(set) var restoreCallCount = 0
-
-    init(current: ClipboardReadResult? = nil, restoreError: ClipboardServiceError? = nil) {
-        self.current = current
-        self.restoreError = restoreError
-    }
-
-    func get(prefer _: UTType?) throws -> ClipboardReadResult? {
-        self.current
-    }
-
-    func set(_ request: ClipboardWriteRequest) throws -> ClipboardReadResult {
-        guard let representation = request.representations.first else {
-            throw ClipboardServiceError.writeFailed("No representations provided")
-        }
-        let result = ClipboardReadResult(
-            utiIdentifier: representation.utiIdentifier,
-            data: representation.data,
-            textPreview: request.alsoText)
-        self.current = result
-        return result
-    }
-
-    func clear() {
-        self.current = nil
-    }
-
-    func save(slot: String) throws {
-        guard let current else {
-            throw ClipboardServiceError.empty
-        }
-        self.slots[slot] = current
-    }
-
-    func restore(slot: String) throws -> ClipboardReadResult {
-        self.restoreCallCount += 1
-        if let restoreError {
-            throw restoreError
-        }
-        guard let saved = self.slots[slot] else {
-            throw ClipboardServiceError.slotNotFound(slot)
-        }
-        self.current = saved
-        return saved
-    }
-}
+@MainActor
+private final class MockClipboardService: ScriptedClipboardService {}

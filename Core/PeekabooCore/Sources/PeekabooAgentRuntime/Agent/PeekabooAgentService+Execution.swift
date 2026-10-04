@@ -22,7 +22,8 @@ extension PeekabooAgentService {
         let temperature = self.shouldOmitTemperature(for: model) ? nil : self.configuredTemperature(for: model)
 
         return switch model {
-        case .openai(.gpt56Sol), .openai(.gpt56Terra), .openai(.gpt56Luna),
+        case .openai(.gpt61Sol), .openai(.gpt6Astra), .openai(.gpt6Sol), .openai(.gpt6Luna),
+             .openai(.gpt56Sol), .openai(.gpt56Terra), .openai(.gpt56Luna),
              .openai(.gpt55), .openai(.gpt54), .openai(.gpt54Mini), .openai(.gpt54Nano), .openai(.gpt5):
             GenerationSettings(
                 maxTokens: maxTokens,
@@ -80,7 +81,7 @@ extension PeekabooAgentService {
     private func shouldOmitTemperature(for model: LanguageModel) -> Bool {
         switch model {
         case let .openRouter(modelId), let .together(modelId), let .openaiCompatible(modelId, _):
-            return self.isOpenAIGPT5TemperatureExcludedModel(modelId)
+            return self.isOpenAITemperatureExcludedModel(modelId)
         case let .custom(provider):
             guard let parsed = ProviderParser.parse(provider.modelId) else {
                 return false
@@ -88,14 +89,14 @@ extension PeekabooAgentService {
 
             let isOpenAICompatible = CustomProviderRegistry.shared.get(parsed.provider)?.kind == .openai ||
                 self.services.configuration.getCustomProvider(id: parsed.provider)?.type == .openai
-            return isOpenAICompatible && self.isOpenAIGPT5TemperatureExcludedModel(parsed.model)
+            return isOpenAICompatible && self.isOpenAITemperatureExcludedModel(parsed.model)
         default:
             return false
         }
     }
 
-    private func isOpenAIGPT5TemperatureExcludedModel(_ modelId: String) -> Bool {
-        if LanguageModel.OpenAI.gpt56Model(for: modelId) != nil {
+    private func isOpenAITemperatureExcludedModel(_ modelId: String) -> Bool {
+        if LanguageModel.OpenAI.gpt56Model(for: modelId) != nil || self.isGPT6Model(modelId) {
             return true
         }
 
@@ -112,6 +113,18 @@ extension PeekabooAgentService {
             true
         default:
             false
+        }
+    }
+
+    private func isGPT6Model(_ modelId: String) -> Bool {
+        let component = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: "/", omittingEmptySubsequences: false).last ?? ""
+        // Routing suffixes affect provider selection, not the model's request limits.
+        let parts = component.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let name = parts.first, parts.count == 1 || !parts[1].isEmpty else { return false }
+        return switch LanguageModel.parse(from: String(name)) {
+        case .openai(.gpt61Sol), .openai(.gpt6Astra), .openai(.gpt6Sol), .openai(.gpt6Luna): true
+        default: false
         }
     }
 
@@ -134,6 +147,10 @@ extension PeekabooAgentService {
         case let .openai(openAIModel):
             switch openAIModel {
             case .chatLatest,
+                 .gpt61Sol,
+                 .gpt6Astra,
+                 .gpt6Sol,
+                 .gpt6Luna,
                  .gpt56Sol,
                  .gpt56Terra,
                  .gpt56Luna,
@@ -167,7 +184,7 @@ extension PeekabooAgentService {
             if let maxOutputTokens = AnthropicModelCapabilityInference.capabilities(for: modelId)?.maxOutputTokens {
                 maxOutputTokens
             } else {
-                LanguageModel.OpenAI.gpt56Model(for: modelId) == nil ? 4096 : 128_000
+                LanguageModel.OpenAI.gpt56Model(for: modelId) != nil || self.isGPT6Model(modelId) ? 128_000 : 4096
             }
         case let .anthropicCompatible(modelId, _):
             AnthropicModelCapabilityInference.capabilities(for: modelId)?.maxOutputTokens ?? 8192
@@ -199,40 +216,18 @@ extension PeekabooAgentService {
         queueMode: QueueMode,
         eventDelegate: any AgentEventDelegate) async throws -> AgentExecutionResult
     {
-        let unsafeDelegate = UnsafeTransfer<any AgentEventDelegate>(eventDelegate)
-        let (eventStream, eventContinuation) = AsyncStream<AgentEvent>.makeStream()
-
-        let eventTask = Task { @MainActor in
-            let delegate = unsafeDelegate.wrappedValue
-            delegate.agentDidEmitEvent(.started(task: input))
-            for await event in eventStream {
-                delegate.agentDidEmitEvent(event)
-            }
-        }
-
-        let eventHandler = EventHandler { event in
-            eventContinuation.yield(event)
-        }
-
-        let streamingDelegate = await MainActor.run {
-            StreamingEventDelegate { chunk in
-                await eventHandler.send(.assistantMessage(content: chunk))
-            }
-        }
-
-        do {
+        try await self.withAgentEventDelivery(task: input, delegate: eventDelegate) { eventHandler in
             let sessionContext = try await self.prepareSession(
                 task: input,
                 model: self.defaultLanguageModel,
                 label: "audio-stream",
                 logBehavior: .always)
 
-            let result = if self.defaultLanguageModel.supportsStreaming {
+            return if self.defaultLanguageModel.supportsStreaming {
                 try await self.executeWithStreaming(
                     context: sessionContext,
                     model: self.defaultLanguageModel,
                     maxSteps: maxSteps,
-                    streamingDelegate: streamingDelegate,
                     queueMode: queueMode,
                     eventHandler: eventHandler)
             } else {
@@ -242,20 +237,6 @@ extension PeekabooAgentService {
                     maxSteps: maxSteps,
                     eventHandler: eventHandler)
             }
-
-            await eventHandler.send(.completed(summary: result.content, usage: result.usage))
-            eventContinuation.finish()
-            await eventTask.value
-            return result
-        } catch let error as CancellationError {
-            eventContinuation.finish()
-            await eventTask.value
-            throw error
-        } catch {
-            await eventHandler.send(.error(message: error.localizedDescription))
-            eventContinuation.finish()
-            await eventTask.value
-            throw error
         }
     }
 }
@@ -271,17 +252,6 @@ actor EventHandler {
 
     func send(_ event: AgentEvent) async {
         await self.handler(event)
-    }
-}
-
-// MARK: - Unsafe Transfer
-
-/// Safely transfer non-Sendable values across isolation boundaries
-struct UnsafeTransfer<T>: @unchecked Sendable {
-    let wrappedValue: T
-
-    init(_ value: T) {
-        self.wrappedValue = value
     }
 }
 
@@ -336,9 +306,9 @@ extension PeekabooAgentService {
         context: SessionContext,
         model: LanguageModel,
         maxSteps: Int = 20,
-        streamingDelegate: StreamingEventDelegate,
         queueMode: QueueMode = .oneAtATime,
         eventHandler: EventHandler? = nil,
+        textHandler: TextStreamHandler? = nil,
         enhancementOptions: AgentEnhancementOptions? = nil) async throws -> AgentExecutionResult
     {
         defer {
@@ -347,7 +317,6 @@ extension PeekabooAgentService {
                 executionGeneration: context.executionGeneration)
         }
         let maxSteps = try AgentStepBudget.validate(maxSteps)
-        _ = streamingDelegate
         let snapshotOwner = MCPToolSnapshotOwner(sessionID: context.id)
         await MCPToolUISnapshotStore(owner: snapshotOwner).retainOwner()
         defer { self.scheduleSnapshotOwnerRelease(snapshotOwner) }
@@ -367,6 +336,7 @@ extension PeekabooAgentService {
             tools: tools,
             sessionId: context.id,
             eventHandler: eventHandler,
+            textHandler: textHandler,
             enhancementOptions: enhancementOptions,
             executionPolicy: context.toolExecutionPolicy)
 
@@ -418,7 +388,8 @@ extension PeekabooAgentService {
             throw AgentStepLimitExceededError(
                 maxSteps: maxSteps,
                 sessionId: context.id,
-                sessionWasPersisted: context.isPersistent)
+                sessionWasPersisted: context.isPersistent,
+                executionTrace: AgentExecutionTrace(messages: outcome.messages))
         }
 
         let result = AgentExecutionResult(
@@ -518,7 +489,8 @@ extension PeekabooAgentService {
             throw AgentStepLimitExceededError(
                 maxSteps: maxSteps,
                 sessionId: context.id,
-                sessionWasPersisted: context.isPersistent)
+                sessionWasPersisted: context.isPersistent,
+                executionTrace: AgentExecutionTrace(messages: outcome.messages))
         }
 
         let result = AgentExecutionResult(
@@ -603,7 +575,9 @@ extension PeekabooAgentService {
                     provider: provider),
                 tools: configuration.tools.isEmpty ? nil : configuration.tools,
                 settings: self.generationSettings(for: configuration.model))
-            let response = try await provider.generateText(request: request)
+            let response = try await self.withAgentPhaseTiming(.providerGenerate, stepIndex: stepIndex) {
+                try await provider.generateText(request: request)
+            }
             state.messages.removeConsumedAgentToolImageContext()
 
             if let usage = response.usage {

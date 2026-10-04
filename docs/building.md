@@ -103,8 +103,9 @@ navigator package-root reference. Promoting Commander to a root package also res
 dependency, which is outside the consuming graph's canonical lock. Keep Commander as a dependency rather than adding
 it as another workspace root; the compile-only real-submodule fixture verifies that its uncommitted source stays live.
 
-The public root `Package.swift` retains AXorcist exact `0.1.9`. Standalone AutomationKit, Foundation, Protocols, Visualizer,
-and submodule builds are not given a Commander override: those graphs do not select Peekaboo's live Commander package.
+The public root `Package.swift` pins AXorcist exact `0.1.11`, matching the internal AXorcist submodule.
+Standalone AutomationKit, Foundation, Protocols, Visualizer, and submodule builds are not given a Commander override:
+those graphs do not select Peekaboo's live Commander package.
 Adding another consuming package requires adding its explicit context to the helper and qualifying it. A transitive
 `.package(path:)` declaration is not an Xcode workspace-root override.
 
@@ -128,6 +129,26 @@ compiles inert SwiftPM and Xcode fixtures created with real absorbed Git submodu
 compilation against an uncommitted Commander symbol without running a test bundle or built product. It does not qualify
 Peekaboo's production graph or replace its compile, test, and release gates.
 
+## Swift runtime compatibility
+
+Swift Collections is constrained to exact 1.6.0 at the shared external-dependency boundary, including unlocked CLI
+source builds and release preflight. Version 1.7.0 can emit a strong `_swift_initBorrow` import from its
+availability-qualified borrowing helpers, causing CLI startup to fail on macOS 26 and earlier. The existing tracked
+consumer locks already select 1.6.0; do not advance this constraint until the built artifacts preserve the supported
+macOS runtime baseline. Release runtime verification rejects that strong import in every architecture, including
+reused binaries and extracted archives. Weak imports remain distinct; this does not weak-link the Swift runtime or
+replace system libraries. Successful execution on the build host alone does not prove older-macOS compatibility.
+
+## Tachikoma integration
+
+The internal CLI and Mac app consume the committed Tachikoma submodule revision. The tracked consumer
+locks retain their existing compatible versions, including Swift Crypto 4.5.2 and Peekaboo's pinned MCP SDK revision;
+Tachikoma's standalone `Package.resolved` does not replace those consumer locks.
+
+Keep Peekaboo's Agent schema conversion in the integration layer: its recursive union projection preserves structured
+`verify_state` predicate-array items that Tachikoma's legacy parameter projection still treats as strings. Updating the
+dependency does not replace that consumer contract or weaken Agent argument validation.
+
 ## Shared CodeQL build graph
 
 The workspace's `CodeQL` scheme builds the CLI, certification controller, Mac app, Playground, and Inspector
@@ -146,6 +167,11 @@ imports, source paths, and embedded Info.plist/source stamps remain unchanged.
 Normal macOS CI schedules package tests, app builds, and lint independently. The Peekaboo and Inspector builds use
 this same workspace, canonical package lock, and derived-data directory so Inspector can reuse matching dependency
 builds. Each package's tests retain serial execution within their job.
+
+The CLI job caches reusable SwiftPM dependency state, not its deliberately fresh `.build` tree. Cache identities
+include the selected Swift/Xcode toolchain, tracked Swift manifests and lockfiles, and submodule revisions; unrelated
+commits can reuse the same cache. Manifest/trait cleanup and the cold CLI build remain intentional safeguards against
+stale trait selections. This cache policy does not change the separate CodeQL or full-safe build graphs.
 
 Run `pnpm run test:codeql-build-graph` to check product coverage, internal ownership, and the CLI's exact
 `PeekabooMain.swift` entrypoint. These structural checks do not replace a successful hosted CodeQL build.

@@ -310,8 +310,10 @@ extension PeekabooBridgeServer {
         context: OperationReceiptEncodingContext) async throws -> Data
     {
         // Shipped clients reconstruct the digest after decoding. Project unknown fields before hashing or signing.
-        let response = response.projectingScreenCaptureKitDiagnostics(
+        let response = try response.projectingScreenCaptureKitDiagnostics(
             offered: context.claim.negotiatedCapabilities.screenCaptureKitOwnershipDiagnostics)
+            .projectingSetValueVerification(
+                offered: context.claim.negotiatedCapabilities.setValueVerification, request: context.request)
         let receiptPayload = try PeekabooBridgeOperationReceiptPayload(
             requestID: context.requestPayload.requestID,
             sessionID: context.requestPayload.sessionID,
@@ -457,11 +459,8 @@ extension PeekabooBridgeServer {
         let request = plan.carriageRequest
         if case let .projectedAction(payload) = request {
             do {
-                let nestedRequest = try payload.validatedRequest()
-                let nestedPlan = PeekabooBridgeOperationResultSemantics.requestPlan(
-                    for: nestedRequest,
-                    vocabulary: plan.vocabulary)
-                let handled = try await self.route(nestedPlan, peer: peer)
+                _ = try payload.validatedRequest()
+                let handled = try await self.route(plan, peer: peer)
                 return .init(
                     response: .projectedActionForCurrentRequestVocabulary(
                         response: handled.response,
