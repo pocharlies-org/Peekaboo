@@ -456,7 +456,7 @@ extension PeekabooBridgeOperationResultSemantics {
         case let .setValue(payload):
             .setValue(
                 target: payload.target,
-                value: self.canonicalSetValueDisplayString(payload.value))
+                value: self.canonicalSetValue(payload.value))
         case let .performAction(payload):
             .performAction(target: payload.target, actionName: payload.actionName)
         case .attestedOperation,
@@ -577,8 +577,8 @@ extension PeekabooBridgeOperationResultSemantics {
 
     /// Set-value response semantics must follow the signed wire value, not a caller's in-memory
     /// representation. JSON canonicalization intentionally collapses equivalent numbers such as
-    /// `-0.0` and `0`; strings that merely look numeric remain exact strings.
-    private static func canonicalSetValueDisplayString(_ value: UIElementValue) -> String {
+    /// `-0.0` and `0`; only a native verification witness can justify coercing a string request.
+    private static func canonicalSetValue(_ value: UIElementValue) -> UIElementValue {
         guard let data = try? PeekabooBridgeOperationReceiptCoding.canonicalData(value),
               let canonicalValue = try? JSONDecoder.peekabooBridgeDecoder().decode(
                   UIElementValue.self,
@@ -586,9 +586,9 @@ extension PeekabooBridgeOperationResultSemantics {
         else {
             // Non-encodable values cannot enter an attested request, but retaining the original
             // representation keeps legacy planning deterministic until request encoding rejects it.
-            return value.displayString
+            return value
         }
-        return canonicalValue.displayString
+        return canonicalValue
     }
 
     private static func allowedSuccessStates(
@@ -790,17 +790,25 @@ extension PeekabooBridgeOperationResultSemantics {
                 valueBackground: valueBackground,
                 processBackground: processBackground,
                 windowBackground: windowBackground)
-        case .targetedHotkey:
-            return [
+        case let .targetedHotkey(payload):
+            var rules = [
                 rule(axBackground, .variable),
                 rule(processBackground, .variable),
                 rule(windowBackground, .variable),
             ]
-        case .exactWindowTargetedHotkey:
-            return [
+            if HotkeyService.isSelectAllShortcut(payload.keys) {
+                rules.append(rule(valueBackground, .exact(1)))
+            }
+            return rules
+        case let .exactWindowTargetedHotkey(payload):
+            var rules = [
                 rule(axBackground, .variable),
                 rule(windowBackground, .variable),
             ]
+            if HotkeyService.isSelectAllShortcut(payload.keys) {
+                rules.append(rule(valueBackground, .exact(1)))
+            }
+            return rules
         case .beginExactWindowHeldPointer:
             return [rule(windowBackground, .exact(2), failureUnits: .oneOf([1, 2, 3]))]
         case .releaseExactWindowHeldPointer, .revokeExactWindowHeldPointer,
@@ -1002,8 +1010,8 @@ extension PeekabooBridgeOperationResultSemantics {
         windowBackground: DesktopActionOutcome.Delivery) -> [DeliveryRule]
     {
         let ax = DeliveryRule(delivery: axBackground, units: .exact(1))
-        // AXPress is absent on focusable text fields. ClickService truthfully falls back to one
-        // verified AXFocused value write, which is still a single background click action.
+        // An admitted click may write AXFocused or AXSelected. Its outcome retains whether the
+        // effect was confirmed; allowing one value-delivery unit does not upgrade that evidence.
         let value = payload.allowsAccessibilityValueDelivery != false
             ? [DeliveryRule(delivery: valueBackground, units: .exact(1))]
             : []
@@ -1030,7 +1038,7 @@ extension PeekabooBridgeOperationResultSemantics {
             }
         }
         return switch (payload.target, payload.clickType) {
-        case (.coordinates, .single): window.map { [$0] } ?? []
+        case (.coordinates, .single): [ax] + value + (window.map { [$0] } ?? [])
         case (.coordinates, .right), (.coordinates, .double), (.coordinates, .middle), (.coordinates, .triple):
             window.map { [$0] } ?? []
         case (.coordinates, .longPress): []

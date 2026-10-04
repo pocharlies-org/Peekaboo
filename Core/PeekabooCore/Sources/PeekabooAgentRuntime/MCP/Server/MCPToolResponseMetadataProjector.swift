@@ -38,6 +38,7 @@ enum MCPToolResponseMetadataProjector {
         "browser_execution",
         "error_code",
         "execution_policy",
+        "snapshot_invalidation",
         "target_identity",
         "target_receipt",
     ])
@@ -81,6 +82,11 @@ enum MCPToolResponseMetadataProjector {
         "screen_recording",
     ]
 
+    private static let observedElementTableKeys: Set<String> = [
+        ObservedElementTableMetadata.key,
+        "snapshot_id",
+    ]
+
     static func externalFields(from value: Value?, toolName: String?) -> [String: Value] {
         guard case let .object(fields)? = value else { return [:] }
         var allowed = Self.safetyKeys
@@ -91,6 +97,22 @@ enum MCPToolResponseMetadataProjector {
         }
         if toolName == "permissions" {
             allowed.formUnion(Self.permissionKeys)
+        }
+        if toolName == "clipboard" {
+            allowed.insert("clipboard_access")
+        }
+        if toolName == "see" || toolName == "inspect_ui" {
+            allowed.insert("focused_element")
+            // The opt-in element table (`include_elements`) is observation data, not an action outcome or
+            // policy claim: it lets a client act on element IDs without parsing the prose summary. The IDs
+            // are only meaningful with their snapshot, so `snapshot_id` travels with the table and stays
+            // internal when the table was not requested.
+            if fields[ObservedElementTableMetadata.key] != nil {
+                allowed.formUnion(Self.observedElementTableKeys)
+            }
+        }
+        if toolName == "agent" {
+            allowed.insert("recordedOutcomeNotice")
         }
         return fields.filter { allowed.contains($0.key) }
     }

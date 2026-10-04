@@ -160,6 +160,20 @@ enum RuntimeHostResolver {
                configurationInput: configurationInput,
                knownSnapshotInvalidationRemoteSocketPaths: snapshotInvalidationRemoteSocketPaths
            ) {
+            if let explicitSocket,
+               !options.permitsExplicitSocketDiagnosticFallback,
+               self.inputPolicyRequiresLocal(
+                   options: options,
+                   environment: environment,
+                   configurationInput: configurationInput
+               ) {
+                throw BridgeExplicitSocketUnavailableError(
+                    socketPath: NSString(string: explicitSocket).standardizingPath,
+                    failureMessage: "the requested input strategy policy requires the caller-local runtime",
+                    failureHint: "Remove --input-strategy and caller input-policy environment/config overrides " +
+                        "to use the selected host, or pass --no-remote to explicitly use the local runtime."
+                )
+            }
             return self.localResolution(
                 services: dependencies.makeLocalServices(options),
                 hostDescription: "local (in-process)",
@@ -495,6 +509,11 @@ extension RuntimeHostResolver {
         if options.requiresDesktopObservationOCR {
             return "No compatible Bridge host advertises desktopObservationOCR. Update and relaunch Peekaboo " +
                 "on the selected host, or pass --no-remote to explicitly run Vision OCR in the caller process."
+        }
+        if options.requiresDesktopObservationInlinePixels {
+            return "Capture engine '\(options.captureEnginePreference ?? "requested")' requires a Bridge host " +
+                "with desktopObservationInlinePixels support. Update and relaunch the selected host, " +
+                "or pass --no-remote to intentionally capture in the caller process."
         }
         if explicitSocket != nil, options.requiresExactWindowROIObservation {
             return "The explicitly selected Bridge host does not support exact-window ROI observation; " +
@@ -901,6 +920,7 @@ extension RuntimeHostResolver {
         )
         return RemotePeekabooServices(
             client: client,
+            capturePolicy: options.remoteCapturePolicy,
             supportsTargetedHotkeys: targetedHotkey.isEnabled,
             supportsProcessGenerationPinnedHotkeys:
             BridgeCapabilityPolicy.supportsProcessGenerationPinnedHotkeys(for: handshake),
@@ -956,6 +976,7 @@ extension RuntimeHostResolver {
             supportsDesktopObservation: observationCapabilities.desktopObservation,
             supportsDesktopObservationOCR: observationCapabilities.desktopObservationOCR,
             supportsDesktopObservationCaptureEngine: observationCapabilities.desktopObservationCaptureEngine,
+            supportsDesktopObservationInlinePixels: observationCapabilities.desktopObservationInlinePixels,
             supportsExactWindowROIObservation: observationCapabilities.exactWindowROIObservation,
             supportsImplicitLatestSnapshotInvalidation: BridgeCapabilityPolicy.supportsImplicitSnapshotInvalidation(
                 for: handshake
@@ -1004,6 +1025,13 @@ private func explicitSnapshotPublicationFailure(
     options: CommandRuntimeOptions
 ) -> String? {
     guard explicitSocket != nil, options.requiresExplicitSnapshotPublication else { return nil }
+    if options.requiresProducerBoundSnapshotReferences {
+        let version = PeekabooBridgeConstants.producerBoundSnapshotReferencesVersion
+        return "This command requires authenticated, producer-bound snapshots " +
+            "(Bridge protocol \(version.major).\(version.minor) or newer). Use a current signed Peekaboo host " +
+            "on its standard socket, or remove --bridge-socket for automatic host selection. " +
+            "Custom sockets without a host-signing policy cannot negotiate authenticated snapshots."
+    }
     return "The explicitly selected Bridge host cannot publish an explicit-reference-only coordinate " +
         "receipt; protocol 1.26 is required. Update and relaunch Peekaboo on that host, or remove " +
         "--bridge-socket so Peekaboo can select a current host."

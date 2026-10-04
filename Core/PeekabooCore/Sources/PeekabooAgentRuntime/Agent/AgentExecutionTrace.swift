@@ -93,6 +93,38 @@ public struct AgentExecutionTrace: Sendable, Codable, Equatable {
         self.totalCallCount = totalCallCount
         self.truncated = truncated
     }
+
+    /// Presentation of recorded results only; later observations never rewrite an action outcome.
+    public var recordedOutcomeNotice: String? {
+        let entries = self.entries.prefix(Self.maximumEntries)
+        var counts: [String: Int] = [:]
+        for entry in entries {
+            if let outcome = entry.actionOutcome?.outcome, !outcome.isConfirmed {
+                counts[outcome.state.rawValue, default: 0] += 1
+            }
+        }
+        let incomplete = self.truncated || entries.count < self.totalCallCount ||
+            entries.count < self.entries.count || entries.contains {
+                $0.disposition == .missingResult || ($0.mutationDispatch != nil && $0.actionOutcome == nil)
+            }
+        guard !counts.isEmpty || incomplete else { return nil }
+
+        var parts: [String] = []
+        if !counts.isEmpty {
+            let recordedCounts = counts.keys.sorted().map { "\($0)=\(counts[$0, default: 0])" }
+                .joined(separator: ", ")
+            parts.append("Recorded non-confirmed tool outcomes in this bounded trace: \(recordedCounts).")
+        }
+        if incomplete {
+            parts.append(
+                "This trace is incomplete or lacks canonical outcomes for some mutating calls; " +
+                    "omitted or unavailable outcomes are not confirmed.")
+        }
+        parts.append(
+            "Later observations can verify effects without changing recorded action outcomes. " +
+                "Model narrative is not receipt evidence.")
+        return parts.joined(separator: " ")
+    }
 }
 
 extension AgentExecutionResult {
@@ -100,11 +132,17 @@ extension AgentExecutionResult {
     public func executionTrace(maxEntries requestedLimit: Int = AgentExecutionTrace
         .maximumEntries) -> AgentExecutionTrace
     {
+        AgentExecutionTrace(messages: self.messages, maxEntries: requestedLimit)
+    }
+}
+
+extension AgentExecutionTrace {
+    init(messages: [ModelMessage], maxEntries requestedLimit: Int = AgentExecutionTrace.maximumEntries) {
         let limit = min(max(requestedLimit, 0), AgentExecutionTrace.maximumEntries)
         var calls: [AgentToolCall] = []
         var totalCallCount = 0
 
-        for message in self.messages {
+        for message in messages {
             for part in message.content {
                 guard case let .toolCall(call) = part else { continue }
                 totalCallCount += 1
@@ -119,7 +157,7 @@ extension AgentExecutionResult {
             requiredResultsByID[call.id, default: 0] += 1
         }
         var resultsByID: [String: [AgentToolResult]] = [:]
-        for message in self.messages {
+        for message in messages {
             for part in message.content {
                 guard case let .toolResult(result) = part,
                       let requiredCount = requiredResultsByID[result.toolCallId],
@@ -141,7 +179,7 @@ extension AgentExecutionResult {
             return AgentExecutionTraceBuilder.entry(for: call, result: result)
         }
 
-        return AgentExecutionTrace(
+        self.init(
             entries: entries,
             totalCallCount: totalCallCount,
             truncated: totalCallCount > entries.count)

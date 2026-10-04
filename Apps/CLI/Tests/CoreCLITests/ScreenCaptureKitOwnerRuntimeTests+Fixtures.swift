@@ -23,7 +23,7 @@ extension ScreenCaptureKitOwnerRuntimeTests {
         handshake: PeekabooBridgeHandshakeResponse,
         options: CommandRuntimeOptions
     ) -> any PeekabooServiceProviding {
-        OwnerPolicyFixtureServices(ownerAware: true, remoteClient: client)
+        OwnerPolicyFixtureServices(ownerAware: true, remoteClient: client, capturePolicy: options.remoteCapturePolicy)
     }
 
     static func inertHandshakeCache() -> RuntimeHostResolver.RemoteHandshakeCache {
@@ -49,7 +49,9 @@ extension ScreenCaptureKitOwnerRuntimeTests {
             .ScreenCaptureKitSafetyInspector = { _, _, _, _ in nil },
         recordScreenCaptureKitSafetyBlocker: @escaping RuntimeHostResolver.ScreenCaptureKitSafetyRecorder = { _ in },
         remoteCandidatePlan: RuntimeHostResolver.RemoteCandidatePlanner? = nil,
-        makeRemoteHandshakeCache: RuntimeHostResolver.RemoteHandshakeCacheFactory? = nil
+        makeRemoteHandshakeCache: RuntimeHostResolver.RemoteHandshakeCacheFactory? = nil,
+        snapshotAffinityProbe: @escaping RuntimeHostResolver.SnapshotAffinityProbe = RuntimeHostResolver
+            .liveSnapshotAffinityProbe
     ) -> RuntimeHostResolver.Dependencies {
         .init(
             makeLocalServices: makeLocalServices,
@@ -75,6 +77,7 @@ extension ScreenCaptureKitOwnerRuntimeTests {
                         []
                 )
             },
+            snapshotAffinityProbe: snapshotAffinityProbe,
             makeRemoteHandshakeCache: makeRemoteHandshakeCache ?? { self.inertHandshakeCache() },
             makeRemoteServices: self.makeInertRemoteServices
         )
@@ -200,15 +203,18 @@ final class OwnerPolicyFixtureServices: PeekabooBridgeServiceProviding, Peekaboo
         ownerAware: Bool,
         observation: (any DesktopObservationServiceProtocol)? = nil,
         snapshots: any SnapshotManagerProtocol = InMemorySnapshotManager(),
-        remoteClient: PeekabooBridgeClient? = nil
+        windows: any WindowManagementServiceProtocol = MockWindowService(result: []),
+        remoteClient: PeekabooBridgeClient? = nil,
+        capturePolicy: RemoteCapturePolicy = .unrestricted
     ) {
         self.supportsScreenCaptureKitProcessOwnership = ownerAware
         self.supportsClassicCaptureWithoutScreenCaptureKit = ownerAware
         self.remoteClient = remoteClient
         self.snapshots = snapshots
+        self.windows = windows
         if let remoteClient {
             self.desktopObservation = RemoteDesktopObservationService(
-                client: remoteClient, supportsDesktopObservationCaptureEngine: true
+                client: remoteClient, capturePolicy: capturePolicy, supportsDesktopObservationCaptureEngine: true
             )
         } else {
             self.desktopObservation = observation ?? ClassicDispatchSentinelObservationService()
@@ -216,7 +222,7 @@ final class OwnerPolicyFixtureServices: PeekabooBridgeServiceProviding, Peekaboo
         // Capability reads are inert; an unexpected operation has no ambient endpoint.
         let client = PeekabooBridgeClient(socketPath: FileManager.default.temporaryDirectory
             .appendingPathComponent("absent-\(UUID().uuidString).sock").path)
-        self.screenCapture = RemoteScreenCaptureService(client: client)
+        self.screenCapture = RemoteScreenCaptureService(client: remoteClient ?? client, capturePolicy: capturePolicy)
         self.browser = RemoteBrowserMCPClient(client: client)
         self.applications = RemoteApplicationService(
             client: client,
@@ -242,7 +248,7 @@ final class OwnerPolicyFixtureServices: PeekabooBridgeServiceProviding, Peekaboo
         loggingService: MockLoggingService()
     )
     let screenCapture: any ScreenCaptureServiceProtocol
-    let windows: any WindowManagementServiceProtocol = MockWindowService(result: [])
+    let windows: any WindowManagementServiceProtocol
     let menu: any MenuServiceProtocol = MockMenuService(barItems: [])
     let dock: any DockServiceProtocol = MockDockService(items: [])
 

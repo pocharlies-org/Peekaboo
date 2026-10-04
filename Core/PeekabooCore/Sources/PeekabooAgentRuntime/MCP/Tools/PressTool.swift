@@ -66,7 +66,8 @@ public struct PressTool: MCPTool {
                 maximum: 10000,
                 default: 100),
             "hold": SchemaBuilder.integer(
-                description: "Optional duration to hold each chord in milliseconds. Default: 50.",
+                description: "Hold duration for synthesized chords in milliseconds (default: 50). " +
+                    "Semantic AX/menu actions do not hold keys.",
                 minimum: 0,
                 maximum: 10000,
                 default: 50),
@@ -140,11 +141,33 @@ public struct PressTool: MCPTool {
             let targetFocusCompleted = deliveryPlan.focusResult != nil
 
             let startTime = Date()
-            let run = try await self.dispatchSequence(
-                chords: chords,
-                parameters: parameters,
-                target: deliveryPlan.target,
-                focusResult: deliveryPlan.focusResult)
+            let result = try await self.context.snapshots.withSnapshotMutation(
+                snapshotId: snapshotID,
+                targetIdentity: deliveryPlan.target.exactWindow.map { DesktopTargetIdentity(exactWindow: $0) },
+                operation: {
+                    do {
+                        return try await Result<PressSequenceRun, PressSequenceFailure>.success(self.dispatchSequence(
+                            chords: chords,
+                            parameters: parameters,
+                            target: deliveryPlan.target,
+                            focusResult: deliveryPlan.focusResult))
+                    } catch let failure as PressSequenceFailure {
+                        return .failure(failure)
+                    }
+                },
+                outcome: { result in
+                    switch result {
+                    case let .success(run): run.resolution.outcome
+                    case let .failure(failure): failure.failure.outcome
+                    }
+                },
+                fallbackRequiresFreshObservation: { result in
+                    switch result {
+                    case let .success(run): run.resolution.requiresFreshObservation
+                    case let .failure(failure): failure.failure.outcome.projection.requiresFreshObservation
+                    }
+                })
+            let run = try result.get()
             let display = chords.map(\.displayValue)
             let elapsed = Date().timeIntervalSince(startTime)
             let sequenceResolution = run.resolution
@@ -191,7 +214,9 @@ public struct PressTool: MCPTool {
                 actionDescription: "Press",
                 waitDurationMs: Double(hold),
                 notes: display.joined(separator: " → "))
-            let meta = try MCPToolResponseMetadataProjector.metadata(merging: baseMeta, outcome: outcome)
+            let meta = try MCPToolResponseMetadataProjector.metadata(
+                merging: MCPDesktopTargetMetadataProjector.fields(run.targetIdentity, merging: baseMeta),
+                outcome: outcome)
             return ToolResponse.text(message, meta: ToolEventSummary.merge(summary: summary, into: meta))
         } catch let error as MCPInteractionTargetError {
             return MCPToolResponseMetadataProjector.preDispatchRefusalResponse(
@@ -234,9 +259,9 @@ public struct PressTool: MCPTool {
         target: UIAutomationTarget,
         focusResult: MCPInteractionFocusResult?) async throws -> PressSequenceRun
     {
-        var sequence = DesktopActionSequenceAccumulator()
+        var sequence = UIAutomationActionResultSequenceAccumulator()
         if let focusResult {
-            focusResult.record(into: &sequence)
+            sequence.record(focusResult.actionResult, attribution: .operationTarget, defaultDispatchedUnitCount: .one)
         }
         var chordSequence = DesktopActionSequenceAccumulator()
         var completedPresses = 0
@@ -248,16 +273,18 @@ public struct PressTool: MCPTool {
                         chord: chord,
                         hold: parameters.hold,
                         target: target)
-                    try DesktopActionFailure.requireConfirmedIfReported(
-                        result.outcome,
-                        operation: "Raw chord \(chord.displayValue)")
                     if let outcome = result.outcome {
+                        _ = try UIAutomationActionResultSemantics.requireAcceptedOutcome(
+                            result,
+                            policy: .confirmed,
+                            operation: "Raw chord \(chord.displayValue)",
+                            rejectedOutcomeMessage: "Raw chord \(chord.displayValue) did not return a confirmed outcome.")
                         allChordsConfirmedNoChange = allChordsConfirmedNoChange &&
                             outcome.state == .confirmedNoChange
                         let step = DesktopActionSequenceAccumulator.Step.reportedOutcome(
                             outcome,
                             defaultDispatchedUnitCount: .one)
-                        sequence.record(step)
+                        sequence.record(step, targetIdentity: result.targetIdentity, attribution: .operationTarget)
                         chordSequence.record(step)
                     } else {
                         allChordsConfirmedNoChange = false
@@ -265,7 +292,7 @@ public struct PressTool: MCPTool {
                             route: .local,
                             delivery: Self.delivery(for: target),
                             unitCount: Self.singleDispatchUnit)
-                        sequence.record(step)
+                        sequence.record(step, targetIdentity: result.targetIdentity, attribution: .operationTarget)
                         chordSequence.record(step)
                     }
                     completedPresses += 1
@@ -279,29 +306,27 @@ public struct PressTool: MCPTool {
             throw Self.sequenceFailure(
                 failure,
                 sequence: sequence,
-                focusResult: focusResult,
                 completedPresses: completedPresses,
                 chordDisposition: chordSequence.mutationDisposition)
         } catch let error as InputDeliveryIndeterminateError {
             throw Self.sequenceFailure(
                 error.desktopActionFailure(delivery: Self.delivery(for: target)),
                 sequence: sequence,
-                focusResult: focusResult,
                 completedPresses: completedPresses,
                 chordDisposition: chordSequence.mutationDisposition,
                 causeDescription: error.causeDescription ?? error.localizedDescription)
         } catch {
-            guard sequence.mutationDisposition.mutationDispatched else { throw error }
+            guard sequence.resolution.mutationDisposition.mutationDispatched else { throw error }
             throw Self.sequenceFailure(
                 .preDispatchRefusal(reason: .operationUnsupported, message: error.localizedDescription),
                 sequence: sequence,
-                focusResult: focusResult,
                 completedPresses: completedPresses,
                 chordDisposition: chordSequence.mutationDisposition,
                 causeDescription: error.localizedDescription)
         }
         return PressSequenceRun(
-            resolution: sequence.successResolution(),
+            resolution: sequence.sequenceResolution,
+            targetIdentity: sequence.resolution.targetIdentity,
             completedPresses: completedPresses,
             allChordsConfirmedNoChange: allChordsConfirmedNoChange)
     }
@@ -320,7 +345,7 @@ public struct PressTool: MCPTool {
                 throw PressToolValidationError(
                     message: "Exact-window background hotkeys require a focused-element receipt.")
             }
-            return try await ExactWindowKeyboardRuntime.validateRouteReceipt(
+            return try await ExactWindowKeyboardRuntime.validateHotkeyRouteReceipt(
                 outcomeAutomation.hotkeyWithOutcome(
                     keys: chord.serviceKeys,
                     holdDuration: hold,
@@ -328,6 +353,7 @@ public struct PressTool: MCPTool {
                         windowIdentity: exactWindow.identity,
                         windowBounds: exactWindow.bounds,
                         focusedElement: focusedElement)),
+                keys: chord.serviceKeys,
                 operation: "Background hotkeys")
         }
         if let automation = self.context.automation as? any UIAutomationActionOutcomeProviding {
@@ -339,19 +365,19 @@ public struct PressTool: MCPTool {
 
     private static func sequenceFailure(
         _ leafFailure: DesktopActionFailure,
-        sequence: DesktopActionSequenceAccumulator,
-        focusResult: MCPInteractionFocusResult?,
+        sequence: UIAutomationActionResultSequenceAccumulator,
         completedPresses: Int,
         chordDisposition: DesktopActionMutationDisposition,
         causeDescription: String? = nil) -> PressSequenceFailure
     {
         let failure = sequence.failure(
             combining: leafFailure,
+            operation: "Press sequence",
             message: "Press sequence stopped after \(completedPresses) completed press(es).",
             hint: "Observe the target before deciding whether to continue the sequence.",
             causeDescription: causeDescription)
         return PressSequenceFailure(
-            failure: focusResult?.attributing(failure) ?? failure,
+            failure: failure,
             compatibility: PressFailureCompatibility(
                 prefixDisposition: chordDisposition,
                 leafFailure: leafFailure))
@@ -641,6 +667,7 @@ private struct PressExecutionParameters {
 
 private struct PressSequenceRun {
     let resolution: DesktopActionSequenceAccumulator.Resolution
+    let targetIdentity: DesktopTargetIdentity?
     let completedPresses: Int
     let allChordsConfirmedNoChange: Bool
 }

@@ -5,6 +5,61 @@ All notable changes to Peekaboo CLI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 4.7.0 - 2026-09-29
+
+**Highlights:** Fix the 4.6.0 CLI startup failure on Macs without the macOS 27 runtime, add GPT-6 Astra, Sol, and Luna plus GPT-6.1 Sol models, keep unattended clipboard reads from triggering macOS privacy prompts, give MCP and JSON clients structured element tables, focused text selection, and visible display bounds, and make compatible-provider Agent streaming reliable.
+
+- Keep CLI builds on Swift Collections 1.6.0 and reject unsupported strong borrowing-runtime imports in release artifacts, preventing the 4.6.0 startup failure on supported Macs without the macOS 27 runtime. Thanks @changexbc and @jandubois! #831.
+- Add GPT-6 Astra, Sol, and Luna selection through Tachikoma, preserving the chosen tier and 128K output allowance for native and compatible agent routes, and omitting unsupported temperature controls on reasoning routes.
+- Add GPT-6.1 Sol selection through Tachikoma, retaining its 128K output allowance on native and compatible Agent routes and validating its supported reasoning settings.
+- Refuse unattended clipboard reads before macOS privacy prompts, including Agent context and current-clipboard paste; share read admission with temporary writes, preserve retry-unsafe writes when readback is unavailable, and add content-free `clipboard status` plus explicit manual CLI `--allow-prompt` opt-in.
+- Preserve newer user or application clipboard updates during CLI and MCP paste cleanup, including cancellation and partial-write failures; require silent clipboard-read access and complete prior contents before replacement, restore only while the temporary generation is owned, and retain earlier clipboard effects when input is refused.
+- Add opt-in `include_elements` to the `see` and `inspect_ui` MCP tools, returning the element table as structured `_meta.ui_elements` (same fields as `see --json`) with its `snapshot_id`, so clients can act on element IDs without parsing the text summary; default responses are unchanged. Thanks @gxcsoccer.
+- Expose bounded, privacy-checked focused text selection as UTF-16 ranges in CLI JSON and MCP/Agent observations; consolidate native range decoding and preserve the existing signed receipt shape.
+- Include full visible work-area bounds in `screen list` JSON and its origin in human output, reusing global logical coordinates while preserving the existing display and visible-size fields.
+- Update Chrome DevTools MCP to 1.10.1 with its per-server browser owner, preserving one-socket verification, telemetry isolation, redirect/reconnect refusal, and exact-page element routing; keep unprojected CSS response references unavailable.
+- Update Tachikoma to 0.5.1 for cancellable provider streams, correct LM Studio tool-call history, and preserved numeric tool values, retaining Peekaboo's existing tool schemas and compatible dependency pins.
+- Update Tachikoma to remove compatible streaming request dumps that could expose prompts/tool schemas and contaminate Agent JSON or quiet output, without changing provider requests or stream delivery.
+- Preserve fragmented tool arguments in compatible-provider Agent streams, validate complete call batches before execution, and retain explicit empty no-argument calls along with existing terminal, schema, and background-authority safeguards.
+- Preserve native scalar tool arguments in Agent provider schemas and preflight validation so `set_value` accepts Boolean and numeric values without string coercion; retain existing structured-schema compatibility and native safety checks.
+- Keep help, version, shell completions, and Agent dry-run output independent of configuration parsing, avoiding unnecessary startup reads and malformed-config warnings that corrupt JSON previews.
+- Honor `see --timeout` for pixel-only, raw-output, area, and multi-window captures, sharing the remaining budget with the selected host and preventing late successful output after timeout or cancellation.
+- Keep screenshot-free `verify` independent of capture-owner readiness and ambient capture-engine settings while preserving screenshot safety; clarify that `--on` matches an app's AXIdentifier or exact role and label, not snapshot-local element IDs.
+- Avoid a redundant all-app inventory before `verify` final screenshots so unrelated app warnings cannot omit an exact-target image; preserve process-generation checks across permission waits and exact-window checks around capture.
+- Honor classic capture for `verify --screenshot` on an explicitly selected compatible Bridge host, preserving optional-image failures, exact-target checks, and screenshot-free verification without extra permission probes.
+- Explain authenticated producer-bound snapshot requirements when an explicit Bridge host cannot serve `see`, instead of suggesting the older protocol 1.26 publication capability is sufficient; preserve host trust and refusal behavior.
+- Refuse exact-window `actionOnly` hotkeys before invoking an app-wide menu, preserving receipt-pinned `actionFirst` fallback, process-scoped menus, and truthful paste retry safety.
+- Refuse conflicting explicit Bridge sockets and caller-local input-policy overrides before constructing local services or sending input; preserve explicit local opt-in, implicit policy-local routing, and concrete snapshot producer affinity.
+- Honor live/action capture-engine overrides on explicitly selected capable Bridge hosts using verified inline pixels, preserving implicit caller-local overrides, default routing, and background focus; avoid redundant frontmost app inventories during observation.
+- Confirm daemon shutdown when its socket is gone and the process has exited but awaits parent reaping, avoiding false refusal/timeouts in synchronous automation; distinguish accepted shutdown timeouts from explicit refusals while preserving uncertain-state and probe-error safeguards.
+
+### Compatibility
+
+- CLI `clipboard get` and `clipboard save`, plus `clipboard set --verify` readback, now refuse instead of showing the macOS clipboard privacy alert unless the reader already has silent access. Check `peekaboo clipboard status`, and use `--allow-prompt` only for an attended permission bootstrap; MCP and automatic Agent or paste reads cannot opt in.
+
+## 4.6.0 - 2026-09-25
+
+**Highlights:** Safer typing and bounded clipboard/desktop waits, restored Codex MCP and GUI Bridge connections, explicit background typing strategies, and optional Agent desktop context.
+
+- Reject paste restore delays above 10 seconds while preserving the 150ms default and cancellation-safe clipboard restoration. Thanks @SebTardif! #759.
+- Bound clipboard-backed paste admission to one 15-second monotonic deadline across in-process and file-lock waits; report retry-safe `TIMEOUT` before clipboard or input changes even after late acquisition, without timing out admitted settle and restoration. Thanks @SebTardif! #793.
+- Bound desktop operation lane admission to a shared 15-second deadline across turnstiles and scoped locks; refuse late acquisition before dispatch while preserving earlier effects and admitted operation lifetimes. Thanks @SebTardif! #794.
+- Accept structured MCP experimental capabilities during initialization, restoring Codex connections; pin the upstream decoder repair and document its Swift dictionary-type migration. Thanks @Wudib! #745.
+- Restore default MCP startup on capable explicitly selected GUI Bridge hosts without dropping the browser tool or borrowing shared connections. Thanks @smhanov! #744.
+- Honor MCP query-click waits with fresh, receipt-pinned Accessibility reads without screenshots; refuse changed targets and late matches while preserving the original modifier-click authority. Thanks @SebTardif! #785.
+- Distinguish Agent narrative from recorded action outcomes with bounded runtime notices in JSON, non-quiet completion output, and MCP; preserve quiet text, original outcomes, and successful workflow semantics when later observations verify effects.
+- Expose already-observed focus identity in `see --json` and `see`/`inspect_ui` MCP metadata without extra Accessibility reads, preserving unknown focus and existing input guards.
+- Stop reporting hidden windows as on screen when native visibility metadata is omitted or as minimized in text listings; align native and classic capture metadata while preserving exact-window targeting and partial-inventory diagnostics. #779.
+- Preserve typed desktop-action timeout, snapshot, and element error codes consistently across CLI JSON renderers without changing prior-effect or retry-safety metadata. #793.
+- Preserve implicit observations after canonical no-dispatch paste refusals when no focus or clipboard effect occurred, while retaining conservative invalidation for partial clipboard writes and uncertain input and preserving other operations' pending barriers.
+- Limit ambiguous application suggestions to tied matching names and PIDs instead of exposing the entire running-app inventory, while keeping selector ambiguity fail-closed.
+- Update AXorcist to 0.1.11 for native numeric fidelity, geometry/range parsing improvements, and invalid-scroll refusal before input dispatch.
+- Refuse live/action capture-engine and explicit-host conflicts before runtime setup; explain how to retain the selected host or explicitly opt into caller-local capture.
+- Stop inventing local `see --json` UI-map paths for in-memory and Bridge-hosted snapshots; keep reusable snapshot references and inline elements available without a disk artifact.
+- Avoid duplicating native tool observations in Agent context while preserving action safety metadata, verification receipts, and image attachments.
+
+- Update subprocess integration guidance for background-first host routing, producer-bound snapshots, shell-free Node.js calls, and structured failures without automatic input replay.
+
 ## 4.5.0 - 2026-09-22
 
 **Highlights:** Prevent snapshot data loss, crashes, and stuck desktop mutations; restore reliable Chrome connections; and ship smaller architecture-specific CLI downloads with automatic Homebrew selection.

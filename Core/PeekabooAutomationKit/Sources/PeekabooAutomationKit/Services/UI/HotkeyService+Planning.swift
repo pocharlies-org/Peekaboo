@@ -3,11 +3,20 @@ import Foundation
 import PeekabooFoundation
 
 extension HotkeyService {
+    public nonisolated static func isSelectAllShortcut(_ keys: String) -> Bool {
+        guard let chord = try? HotkeyChord(keys: self.parsedKeys(keys)) else { return false }
+        return self.isSelectAllShortcut(primaryKey: chord.plan.primaryKey, flags: chord.plan.modifierFlags)
+    }
+
+    nonisolated static func isSelectAllShortcut(primaryKey: String, flags: CGEventFlags) -> Bool {
+        primaryKey == "a" && flags == .maskCommand
+    }
+
     func makeHotkeyPlan(_ keys: [String]) throws -> HotkeyPlan {
         try HotkeyChord(keys: keys).plan
     }
 
-    func parsedKeys(_ keys: String) throws -> [String] {
+    nonisolated static func parsedKeys(_ keys: String) throws -> [String] {
         let parsed = keys
             .components(separatedBy: CharacterSet(charactersIn: ",+").union(.whitespacesAndNewlines))
             .map { HotkeyKey.normalizedName(for: $0) }

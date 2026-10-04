@@ -1,11 +1,14 @@
 import Foundation
 import PeekabooFoundation
 
-private typealias ResolvedElementMutationTarget = (
-    element: AutomationElement,
-    description: String,
-    bundleIdentifier: String?,
-    windowContext: WindowContext?)
+private struct ResolvedElementMutationTarget {
+    let element: AutomationElement
+    let description: String
+    let bundleIdentifier: String?
+    let windowContext: WindowContext?
+    let elementIdentity: FocusedElementIdentity?
+    let role: String?
+}
 
 extension UIAutomationService: ElementActionAutomationServiceProtocol {
     public var supportsSetValueResultTargetBinding: Bool {
@@ -37,6 +40,7 @@ extension UIAutomationService: ElementActionAutomationServiceProtocol {
         var resolved: ResolvedElementMutationTarget?
         var oldValue: String?
         var newValue: String?
+        var valueVerification: ElementValueVerification?
         let plan = try DesktopOperationPlan(
             verb: .setValue,
             selector: .element(target),
@@ -65,7 +69,14 @@ extension UIAutomationService: ElementActionAutomationServiceProtocol {
                 }
                 try self.validateElementMutationTarget(resolved, receipt: captureReceipt)
                 do {
-                    return try self.actionInputDriver.trySetValue(element: resolved.element, value: value)
+                    let action = try await self.actionInputDriver.trySetValue(
+                        element: resolved.element,
+                        value: value,
+                        beforeMutation: {
+                            try self.validateElementMutationTarget(resolved, receipt: captureReceipt)
+                        })
+                    valueVerification = action.valueVerification
+                    return action
                 } catch let error as ActionInputError where error.isUnsupportedValueMutation {
                     throw PeekabooError.invalidInput(Self.unsupportedSetValueMessage(
                         target: resolved.description,
@@ -81,7 +92,21 @@ extension UIAutomationService: ElementActionAutomationServiceProtocol {
                 guard let resolved else {
                     throw PeekabooError.operationError(message: "Element mutation target was not prepared")
                 }
-                newValue = self.elementMutationValueReader(resolved.element)
+                if let valueVerification {
+                    newValue = valueVerification.displayString
+                    guard valueVerification.matches(
+                        requested: value, newValue: newValue, actionName: result.actionName)
+                    else {
+                        throw DesktopActionFailure.indeterminate(
+                            delivery: result.outcome.delivery,
+                            evidence: .completionUnknown,
+                            unitCount: result.outcome.dispatchState.unitCount,
+                            message: "Accessibility value verification did not match its native result",
+                            hint: "Observe the target before retrying this value mutation.")
+                    }
+                } else {
+                    newValue = self.elementMutationValueReader(resolved.element)
+                }
                 guard newValue != nil else {
                     throw DesktopActionFailure.indeterminate(
                         delivery: result.outcome.delivery,
@@ -107,7 +132,8 @@ extension UIAutomationService: ElementActionAutomationServiceProtocol {
                 actionName: result.actionName,
                 anchorPoint: nil,
                 oldValue: oldValue,
-                newValue: newValue),
+                newValue: newValue,
+                valueVerification: valueVerification),
             outcome: result.outcome,
             targetIdentity: execution.targetIdentity)
     }
@@ -243,11 +269,13 @@ extension UIAutomationService: ElementActionAutomationServiceProtocol {
                     "Resolved element belongs to a different process than the snapshot receipt.",
                     standardErrorCode: .snapshotStale)
             }
-            return (
-                element,
-                Self.describe(detected),
-                detectionResult.metadata.windowContext?.applicationBundleId,
-                detectionResult.metadata.windowContext)
+            return ResolvedElementMutationTarget(
+                element: element,
+                description: Self.describe(detected),
+                bundleIdentifier: detectionResult.metadata.windowContext?.applicationBundleId,
+                windowContext: detectionResult.metadata.windowContext,
+                elementIdentity: element.focusedElementIdentity,
+                role: element.role)
         }
 
         throw Self.elementMutationRefusal(
@@ -332,6 +360,19 @@ extension UIAutomationService: ElementActionAutomationServiceProtocol {
                 "Resolved element belongs to a different process than the snapshot receipt.",
                 standardErrorCode: .snapshotStale)
         }
+        if let expected = target.elementIdentity {
+            guard let current = target.element.focusedElementIdentity,
+                  FocusedElementReceiptResolver.matches(current, expected: expected)
+            else {
+                throw Self.elementMutationRefusal(
+                    "The resolved element changed before mutation; capture a fresh target snapshot.",
+                    standardErrorCode: .snapshotStale)
+            }
+        } else if target.element.focusedElementIdentity != nil || target.element.role != target.role {
+            throw Self.elementMutationRefusal(
+                "The resolved element changed before mutation; capture a fresh target snapshot.",
+                standardErrorCode: .snapshotStale)
+        }
     }
 
     private func normalizingElementMutationErrors<T>(
@@ -394,22 +435,7 @@ extension UIAutomationService: ElementActionAutomationServiceProtocol {
     }
 
     static func safeValueDescription(_ value: Any?) -> String? {
-        switch value {
-        case let value as String:
-            value
-        case let value as Bool:
-            String(value)
-        case let value as Int:
-            String(value)
-        case let value as Double:
-            String(value)
-        case let value as Float:
-            String(value)
-        case let value?:
-            String(describing: value)
-        case nil:
-            nil
-        }
+        NativeElementValuePresentation.describe(value)
     }
 }
 

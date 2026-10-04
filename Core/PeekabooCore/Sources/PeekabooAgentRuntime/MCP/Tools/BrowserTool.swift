@@ -128,7 +128,7 @@ public struct BrowserTool: MCPTool {
             "insight_name": SchemaBuilder.string(description: "Insight name from trace summary."),
             "mcp_tool": SchemaBuilder.string(
                 description: foregroundCapable
-                    ? "Advanced: audited Chrome DevTools MCP v1.9.0 tool name for call. " +
+                    ? "Advanced: audited Chrome DevTools MCP v1.10.1 tool name for call. " +
                     "Routes that enter page evaluation use foreground browser authority."
                     : "Audited raw tool whose complete path cannot grant browser user activation.",
                 enum: BrowserMCPUserActivationPolicy.catalogToolNames(foregroundCapable: foregroundCapable)),
@@ -513,7 +513,14 @@ public struct BrowserTool: MCPTool {
             }
             try Self.checkCancellationBeforeProviderEntry()
             do {
-                return try await self.client.executeSequence(calls, channel: channel)
+                let response = try await self.client.executeSequence(calls, channel: channel)
+                return try ToolResponse(
+                    content: response.content,
+                    isError: response.isError,
+                    meta: MCPToolResponseMetadataProjector.metadata(
+                        merging: MCPToolResponseMetadataProjector.providerFields(from: response.meta),
+                        outcome: nil),
+                    structuredContent: response.structuredContent)
             } catch is CancellationError where semantics == .readOnly {
                 return ToolResponse.error("Browser read was cancelled after provider entry.")
             }
@@ -1080,7 +1087,9 @@ public enum BrowserMCPCallMapper {
         guard let toolName = arguments.getString("mcp_tool"), !toolName.isEmpty else {
             throw BrowserToolError.missingParameter("mcp_tool")
         }
-        guard let routing = BrowserMCPPageRoutingContract.routing(for: toolName) else {
+        guard let routing = BrowserMCPPageRoutingContract.routing(for: toolName),
+              !BrowserMCPPageRoutingContract.unsupportedResponseToolNames.contains(toolName)
+        else {
             throw BrowserToolError.unsupportedRawTool(toolName)
         }
         if routing == .blockedSelectedPage {

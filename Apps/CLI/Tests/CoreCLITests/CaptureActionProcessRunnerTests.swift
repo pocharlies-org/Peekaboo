@@ -121,15 +121,34 @@ struct CaptureActionProcessRunnerTests {
 
     @Test
     func `runner escalates timeout for TERM ignoring child`() async throws {
-        let started = Date()
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("peekaboo-action-term-ignore-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ready = root.appendingPathComponent("ready")
         let result = try await CaptureActionProcessRunner.run(
-            command: ["/bin/sh", "-c", "trap '' TERM; while true; do sleep 0.2; done"],
-            timeoutSeconds: 0.1
+            command: [
+                "/usr/bin/perl",
+                "-e",
+                "$SIG{TERM} = 'IGNORE'; open(my $ready, '>', $ARGV[0]) or die $!; " +
+                    "print $ready \"$$\\n\"; close($ready) or die $!; sleep 10; exit 42;",
+                ready.path,
+            ],
+            timeoutSeconds: 1
         )
 
+        let readyPID = try #require(pid_t(
+            String(contentsOf: ready, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        ))
+        try #require(readyPID == result.processIdentifier)
         #expect(result.timedOut == true)
-        #expect(result.exitCode != 0)
-        #expect(Date().timeIntervalSince(started) < 2)
+        #expect(result.processGroupCleaned == true)
+        #expect(result.exitCode == 128 + SIGKILL)
+        let lifecycleLimitMs = Int(
+            (result.timeoutSeconds + CaptureActionProcessRunner.completionReserveSeconds) * 1000
+        )
+        #expect(result.durationMs <= lifecycleLimitMs)
     }
 
     @Test
@@ -455,21 +474,42 @@ struct CaptureActionProcessRunnerTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
+        let ready = root.appendingPathComponent("descendant-ready")
+        let release = root.appendingPathComponent("release-descendant")
         let marker = root.appendingPathComponent("descendant-survived")
+        let watchdog = root.appendingPathComponent("watchdog-expired")
         let result = try await CaptureActionProcessRunner.run(
             command: [
-                "/bin/sh",
-                "-c",
-                "trap '' TERM; (trap '' TERM; sleep 1; touch \"$1\") & wait",
-                "sh",
+                "/usr/bin/perl",
+                "-e",
+                "use POSIX (); $SIG{TERM} = 'IGNORE'; my $child = fork(); defined($child) or die $!; " +
+                    "if ($child == 0) { open(my $ready, '>', $ARGV[0]) or die $!; " +
+                    "print $ready \"$$ \" . POSIX::getpgrp() . \"\\n\"; close($ready); " +
+                    "my $deadline = time() + 10; " +
+                    "while (!-e $ARGV[1] && time() < $deadline) { select undef, undef, undef, 0.01; } " +
+                    "unless (-e $ARGV[1]) { open(my $expired, '>', $ARGV[3]) or die $!; " +
+                    "close($expired); exit 0; } " +
+                    "open(my $marker, '>', $ARGV[2]) or die $!; close($marker); exit 0; } wait;",
+                ready.path,
+                release.path,
                 marker.path,
+                watchdog.path,
             ],
-            timeoutSeconds: 0.1
+            timeoutSeconds: 1
         )
 
-        try await Task.sleep(nanoseconds: 1_200_000_000)
         #expect(result.timedOut == true)
+        #expect(result.processGroupCleaned == true)
+        let identity = try String(contentsOf: ready, encoding: .utf8).split(whereSeparator: \.isWhitespace)
+        try #require(identity.count == 2)
+        let descendantPID = try #require(pid_t(identity[0]))
+        try #require(descendantPID > 0 && descendantPID != result.processIdentifier)
+        try #require(pid_t(identity[1]) == result.processIdentifier)
+        // Only a descendant surviving the completed cleanup boundary can create this witness.
+        try Data().write(to: release)
+        try await Self.waitUntilProcessIsGone(descendantPID)
         #expect(FileManager.default.fileExists(atPath: marker.path) == false)
+        #expect(FileManager.default.fileExists(atPath: watchdog.path) == false)
     }
 
     @Test

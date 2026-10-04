@@ -506,6 +506,39 @@ extension PasteCommandTests {
 
     @Test
     @MainActor
+    func `Foreground current clipboard refusal retains only the completed focus`() async throws {
+        let windows = PasteFocusWindowService()
+        let automation = OutcomeStubAutomationService()
+        let clipboard = StubClipboardService()
+        clipboard.getError = DesktopActionFailure.preDispatchRefusal(
+            reason: .permissionDenied, message: "Synthetic clipboard policy refusal"
+        )
+        let services = TestServicesFactory.makePeekabooServices(
+            windows: windows, clipboard: clipboard, automation: automation
+        )
+        let result = try await InProcessCommandRunner.run([
+            "paste", "--window-id", String(PasteFocusWindowService.windowID),
+            "--foreground", "--focus-timeout", "1ms", "--focus-retry-count", "0", "--json", "--no-remote",
+        ], services: services)
+        let envelope = try ActionEnvelopeTestProbe.decode(result.stdout)
+
+        #expect(result.exitStatus != 0)
+        #expect(windows.pinnedFocusCalls.count == 1)
+        #expect(clipboard.getCallCount == 1)
+        #expect(clipboard.setCallCount == 0)
+        #expect(clipboard.restoreCallCount == 0)
+        #expect(automation.outcomeHotkeyCallCount == 0)
+        #expect(automation.hotkeyCalls.isEmpty)
+        let expected = DesktopActionOutcome.indeterminate(
+            delivery: .init(mechanism: .accessibilityAction, mode: .foreground),
+            evidence: .completionUnknown,
+            unitCount: .one
+        )
+        ActionEnvelopeTestAssertions.expectCanonicalOutcome(expected, in: envelope)
+    }
+
+    @Test
+    @MainActor
     func `Foreground paste composes a hotkey refusal after focus`() async throws {
         let windows = PasteFocusWindowService()
         let automation = OutcomeStubAutomationService()
@@ -547,27 +580,29 @@ extension PasteCommandTests {
         )
         let outcome = try #require(object["outcome"] as? [String: Any])
         let error = try #require(object["error"] as? [String: Any])
-        let targetReceipt = try #require(object["target_receipt"] as? [String: Any])
-
         #expect(result.exitStatus == 1)
         #expect(windows.pinnedFocusCalls.count == 1)
+        #expect(windows.pinnedFocusCalls.first?.identity.windowID == PasteFocusWindowService.windowID)
         #expect(automation.outcomeHotkeyCallCount == 1)
         #expect(automation.hotkeyCalls.isEmpty)
         #expect(clipboard.current?.textPreview == "prior")
         #expect(clipboard.restoreCallCount == 1)
         #expect(object["effect"] as? String == "unverifiable")
         #expect(outcome["state"] as? String == "indeterminate")
-        #expect(outcome["dispatched_unit_count"] as? Int == 1)
+        #expect(outcome["dispatched_unit_count"] == nil)
         #expect(outcome["mutation_dispatched"] as? Bool == true)
         #expect(outcome["retry_safe"] as? Bool == false)
         #expect(error["mutation_dispatched"] as? Bool == true)
         #expect(error["retry_safe"] as? Bool == false)
-        #expect(targetReceipt["window_id"] as? Int == PasteFocusWindowService.windowID)
+        #expect(outcome["requires_fresh_observation"] as? Bool == true)
+        #expect(error["clipboard_cleanup_status"] as? String == "restored")
+        #expect(object["target_receipt"] == nil)
+        #expect(object["target_identity"] == nil)
     }
 }
 
 @MainActor
-private struct ExactBackgroundTextPasteFixture {
+struct ExactBackgroundTextPasteFixture {
     static let processIdentifier: pid_t = 2468
     static let processStartIdentity: UInt64 = 71
     static let windowID = 901
@@ -575,8 +610,12 @@ private struct ExactBackgroundTextPasteFixture {
 
     let automation: OutcomeStubAutomationService
     let services: PeekabooServices
+    let windows: StubWindowService
 
-    init() {
+    init(
+        snapshots: any SnapshotManagerProtocol = StubSnapshotManager(),
+        clipboard: StubClipboardService = StubClipboardService()
+    ) {
         let application = ServiceApplicationInfo(
             processIdentifier: Self.processIdentifier,
             processStartIdentity: Self.processStartIdentity,
@@ -606,10 +645,14 @@ private struct ExactBackgroundTextPasteFixture {
             windowID: Self.windowID,
             identifier: "editor"
         )
+        let windows = StubWindowService(windowsByApp: ["TextEdit": [window]])
         self.automation = automation
+        self.windows = windows
         self.services = TestServicesFactory.makePeekabooServices(
             applications: StubApplicationService(applications: [application]),
-            windows: StubWindowService(windowsByApp: ["TextEdit": [window]]),
+            windows: windows,
+            snapshots: snapshots,
+            clipboard: clipboard,
             automation: automation
         )
     }
@@ -630,7 +673,7 @@ private struct ExactBackgroundTextPasteFixture {
 }
 
 @MainActor
-private final class PasteFocusWindowService: StubWindowService, WindowManagementPinnedFocusActionResultProviding {
+final class PasteFocusWindowService: StubWindowService, WindowManagementPinnedFocusActionResultProviding {
     static let windowID = 2_000_000_001
     static let processIdentifier: pid_t = 42
     static let processStartIdentity: UInt64 = 7

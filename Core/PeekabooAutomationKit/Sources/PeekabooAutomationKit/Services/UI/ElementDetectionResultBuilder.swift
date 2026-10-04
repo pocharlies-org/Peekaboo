@@ -13,6 +13,7 @@ import PeekabooFoundation
         detectionTime: TimeInterval = 0.0,
         truncationInfo: DetectionTruncationInfo? = nil,
         applicationScopedAccessibilityFallbackOrigin: ApplicationScopedAccessibilityFallbackOrigin? = nil,
+        corroboratedFocusedElementID: String? = nil,
         additionalWarnings: [String] = []) -> ElementDetectionResult
     {
         var warnings: [String] = []
@@ -41,12 +42,26 @@ import PeekabooFoundation
         } else {
             FocusedElementReceiptResolver.attachingObservedFocus(
                 to: windowContext,
-                elements: elements)
+                elements: elements,
+                corroboratedElementID: truncationInfo?.isTruncated == true ||
+                    warnings.contains(DetectionMetadata.applicationScopedAccessibilityFallbackWarning)
+                    ? nil : corroboratedFocusedElementID)
+        }
+        let focusedSelectionAvailable = !usedCache && truncationInfo?.isTruncated != true &&
+            applicationScopedAccessibilityFallbackOrigin == nil &&
+            !warnings.contains(DetectionMetadata.applicationScopedAccessibilityFallbackWarning)
+        let selectedElements = elements.map { element in
+            guard element.selectedTextRange != nil, focusedSelectionAvailable, let context = resolvedWindowContext,
+                  let focused = context.focusedElement, element.isFocused == true,
+                  let identity = try? FocusedElementReceiptResolver.receipt(element: element, context: context),
+                  FocusedElementReceiptResolver.matches(identity, expected: focused)
+            else { return element.replacingSelectedTextRange(nil) }
+            return element
         }
         return ElementDetectionResult(
             snapshotId: snapshotId,
             screenshotPath: screenshotPath,
-            elements: self.group(elements),
+            elements: self.group(selectedElements),
             metadata: DetectionMetadata(
                 detectionTime: detectionTime,
                 elementCount: elements.count,

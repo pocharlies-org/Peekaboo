@@ -126,9 +126,14 @@ The native mutation inventory excludes an unreadable helper without marking the 
 
 LaunchServices can also retain records for processes that have exited. Two consecutive failed full-BSD generation
 reads with explicit `ESRCH` confirm native absence and exclude that stale row without making mutation inventory
-partial. A partial native read, arbitrary failure, or transition between absence and a readable generation remains
-an uncertain omission. A process that disappears after its generation was read also remains an omission; retry with
-a fresh inventory. Read-only listing and explicit-PID targeting keep their existing behavior.
+partial. Read-only application discovery also excludes a stale row when its initial process-generation identity is
+missing and two consecutive native observations both confirm absence. A permission denial, unavailable observation,
+or transition from absence to a readable generation must still keep read-only inventory partial. This does not apply
+the mutation-only prohibited-helper exclusion to read-only discovery.
+
+A partial native read, arbitrary failure, or transition between absence and a readable generation remains an uncertain
+omission. A process that disappears after its generation was read also remains an omission; retry with a fresh
+inventory. Generation-pinned explicit-PID targeting is unchanged.
 
 ### Allowed Redundancy
 
@@ -153,6 +158,24 @@ peekaboo window close --app "PID:12345" --pid 67890
 A textual app/PID mismatch is not synchronously detectable in the legacy resolver. This is why interaction and observation commands reject the pair instead of choosing one.
 
 ## Implementation Details
+
+### Swift running-state checks
+
+`ApplicationService.isApplicationRunning(identifier:)` is now `async throws`. Direct concrete-service callers must
+change `await` to `try await` and either handle or propagate lookup failures:
+
+```swift
+let running = try await applicationService.isApplicationRunning(identifier: "PID:12345")
+```
+
+A unique running match returns `true`; a missing match returns `false`. Ambiguous names or bundle IDs and other
+resolution failures throw instead of reporting that the application stopped. Avoid `try? ... ?? false`, which would
+restore that ambiguity-to-stopped behavior. Use a PID from the ambiguity suggestions to select one instance.
+
+The `ApplicationServiceProtocol` and Bridge-backed service signatures were already throwing. Bridge transports failures
+in its existing error envelope, including the ambiguity message and tied PIDs; it does not preserve the native Swift
+error enum. Dock launch verification also surfaces the lookup failure, but only after the launch may have dispatched:
+inspect the action outcome before retrying it.
 
 ### ApplicationResolvable Protocol
 
@@ -261,6 +284,10 @@ peekaboo space move-window --pid 12345 --to 2
 3. Use `--pid 12345` for direct numeric PIDs
 
 ### Multiple Matches
+
+Ambiguity errors list only the tied winning matches, with a PID beside each name. Other running applications and
+lower-priority fuzzy matches are not suggestions. Multiple processes can share an exact name or bundle ID; use a
+listed PID with `--pid <pid>` or `--app "PID:<pid>"` to select the intended instance.
 
 **Symptoms:**
 - Fuzzy matching finds wrong app

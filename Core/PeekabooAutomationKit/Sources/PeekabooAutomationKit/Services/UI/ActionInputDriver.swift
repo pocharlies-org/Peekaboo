@@ -60,34 +60,51 @@ extension ActionInputError: LocalizedError {
 
 @MainActor
 protocol ActionInputDriving: Sendable {
-    func tryClick(element: AutomationElement) throws -> UIInputExecutionResult.Action
+    func tryClick(element: AutomationElement, beforeMutation: @MainActor () throws -> Void) async throws
+        -> UIInputExecutionResult.Action
     func tryClick(
         element: AutomationElement,
-        allowAccessibilityValueFallback: Bool) throws -> UIInputExecutionResult.Action
-    func tryFocus(element: any AutomationElementRepresenting) throws -> UIInputExecutionResult.Action
+        allowAccessibilityValueFallback: Bool,
+        beforeMutation: @MainActor () throws -> Void) async throws
+        -> UIInputExecutionResult.Action
+    func tryFocus(
+        element: any AutomationElementRepresenting,
+        beforeMutation: @MainActor () throws -> Void) async throws -> UIInputExecutionResult.Action
     func tryRightClick(element: any AutomationElementRepresenting) async throws -> UIInputExecutionResult.Action
     func tryScroll(
         element: AutomationElement,
         direction: PeekabooFoundation.ScrollDirection,
         pages: Int) throws -> UIInputExecutionResult.Action
-    func trySetText(element: AutomationElement, text: String, replace: Bool) throws -> UIInputExecutionResult.Action
+    func trySetText(
+        element: AutomationElement,
+        text: String,
+        replace: Bool,
+        beforeMutation: @MainActor () throws -> Void) async throws -> UIInputExecutionResult
+        .Action
     func tryHotkey(application: NSRunningApplication, keys: [String]) throws -> UIInputExecutionResult.Action
-    func trySetValue(element: AutomationElement, value: UIElementValue) throws -> UIInputExecutionResult.Action
+    func trySetValue(
+        element: AutomationElement,
+        value: UIElementValue,
+        beforeMutation: @MainActor () throws -> Void) async throws -> UIInputExecutionResult.Action
     func tryPerformAction(element: AutomationElement, actionName: String) throws -> UIInputExecutionResult.Action
 }
 
 extension ActionInputDriving {
     func tryClick(
         element: AutomationElement,
-        allowAccessibilityValueFallback: Bool) throws -> UIInputExecutionResult.Action
+        allowAccessibilityValueFallback: Bool,
+        beforeMutation: @MainActor () throws -> Void) async throws -> UIInputExecutionResult.Action
     {
         guard allowAccessibilityValueFallback else {
             throw ActionInputError.unsupported(.actionUnsupported)
         }
-        return try self.tryClick(element: element)
+        return try await self.tryClick(element: element, beforeMutation: beforeMutation)
     }
 
-    func tryFocus(element _: any AutomationElementRepresenting) throws -> UIInputExecutionResult.Action {
+    func tryFocus(
+        element _: any AutomationElementRepresenting,
+        beforeMutation: @MainActor () throws -> Void) async throws -> UIInputExecutionResult.Action
+    {
         throw ActionInputError.unsupported(.attributeUnsupported)
     }
 }
@@ -95,6 +112,26 @@ extension ActionInputDriving {
 /// Accessibility action implementation for action-first UI input.
 @MainActor
 struct ActionInputDriver: ActionInputDriving {
+    private let observationDelay: @MainActor @Sendable () async throws -> Void
+    private let processStartIdentity: @Sendable (pid_t) -> UInt64?
+    private let nativeReader: AXMutationNativeReader
+    private let menuReader: MenuShortcutReader
+
+    init(
+        observationDelay: @escaping @MainActor @Sendable () async throws -> Void = {
+            try await Task.sleep(for: .milliseconds(20))
+        },
+        processStartIdentity: @escaping @Sendable (pid_t) -> UInt64? =
+            SystemIdentityResolver.processStartIdentity,
+        nativeReader: @escaping AXMutationNativeReader = DetachedAXMutationReader.read,
+        menuReader: MenuShortcutReader = MenuShortcutReader())
+    {
+        self.observationDelay = observationDelay
+        self.processStartIdentity = processStartIdentity
+        self.nativeReader = nativeReader
+        self.menuReader = menuReader
+    }
+
     private static let accessibilityActionDelivery = DesktopActionOutcome.Delivery(
         mechanism: .accessibilityAction,
         mode: .background)
@@ -102,16 +139,20 @@ struct ActionInputDriver: ActionInputDriving {
         mechanism: .accessibilityValue,
         mode: .background)
 
-    func tryClick(element: AutomationElement) throws -> UIInputExecutionResult.Action {
-        try self.tryClick(element: element, allowAccessibilityValueFallback: true)
+    func tryClick(
+        element: AutomationElement,
+        beforeMutation: @MainActor () throws -> Void = {}) async throws -> UIInputExecutionResult.Action
+    {
+        try await self.tryClick(element: element, allowAccessibilityValueFallback: true, beforeMutation: beforeMutation)
     }
 
     func tryClick(
         element: AutomationElement,
-        allowAccessibilityValueFallback: Bool) throws -> UIInputExecutionResult.Action
+        allowAccessibilityValueFallback: Bool,
+        beforeMutation: @MainActor () throws -> Void = {}) async throws -> UIInputExecutionResult.Action
     {
         do {
-            return try self.performAction(AXActionNames.kAXPressAction, on: element)
+            return try self.performAction(AXActionNames.kAXPressAction, on: element, beforeMutation: beforeMutation)
         } catch let error as ActionInputError
             where error == .unsupported(.actionUnsupported) &&
             allowAccessibilityValueFallback &&
@@ -121,15 +162,18 @@ struct ActionInputDriver: ActionInputDriving {
                 isValueSettable: element.isValueSettable,
                 isFocusedSettable: element.isFocusedSettable)
         {
-            return try self.focusForClick(element)
+            return try await self.focusForClick(element, beforeMutation: beforeMutation)
         }
     }
 
-    func tryFocus(element: any AutomationElementRepresenting) throws -> UIInputExecutionResult.Action {
+    func tryFocus(
+        element: any AutomationElementRepresenting,
+        beforeMutation: @MainActor () throws -> Void = {}) async throws -> UIInputExecutionResult.Action
+    {
         guard element.isFocusedSettable else {
             throw FocusedElementReceiptError.focusedAttributeNotSettable
         }
-        return try self.focusForClick(element)
+        return try await self.focusForClick(element, beforeMutation: beforeMutation)
     }
 
     func tryRightClick(element: any AutomationElementRepresenting) async throws -> UIInputExecutionResult.Action {
@@ -183,12 +227,17 @@ struct ActionInputDriver: ActionInputDriving {
         try self.performScrollActions(element: element, direction: direction, pages: pages)
     }
 
-    func trySetText(element: AutomationElement, text: String, replace: Bool) throws
-    -> UIInputExecutionResult.Action {
+    func trySetText(
+        element: AutomationElement,
+        text: String,
+        replace: Bool,
+        beforeMutation: @MainActor () throws -> Void = {}) async throws
+        -> UIInputExecutionResult.Action
+    {
         guard replace else {
             throw ActionInputError.unsupported(.attributeUnsupported)
         }
-        return try self.trySetValue(element: element, value: .string(text))
+        return try await self.trySetValue(element: element, value: .string(text), beforeMutation: beforeMutation)
     }
 
     func tryHotkey(application: NSRunningApplication, keys: [String]) throws -> UIInputExecutionResult.Action {
@@ -198,15 +247,19 @@ struct ActionInputDriver: ActionInputDriving {
             throw ActionInputError.unsupported(.missingElement)
         }
 
-        guard let menuItem = self.findMenuItem(matching: chord, in: menuBar) else {
+        guard let menuItem = try self.findMenuItem(matching: chord, in: menuBar) else {
             throw ActionInputError.unsupported(.menuShortcutUnavailable)
         }
 
         return try self.performAction(AXActionNames.kAXPressAction, on: menuItem)
     }
 
-    func trySetValue(element: AutomationElement, value: UIElementValue) throws -> UIInputExecutionResult.Action {
-        try self.setValue(value, on: element)
+    func trySetValue(
+        element: AutomationElement,
+        value: UIElementValue,
+        beforeMutation: @MainActor () throws -> Void = {}) async throws -> UIInputExecutionResult.Action
+    {
+        try await self.setValue(value, on: element, beforeMutation: beforeMutation)
     }
 
     func tryPerformAction(element: AutomationElement, actionName: String) throws -> UIInputExecutionResult.Action {
@@ -288,7 +341,7 @@ struct ActionInputDriver: ActionInputDriving {
         error ?? .unsupported(.actionUnsupported)
     }
 
-    private nonisolated static func scrollFailureMayHaveDispatched(_ error: ActionInputError) -> Bool {
+    nonisolated static func nativeMutationFailureMayHaveDispatched(_ error: ActionInputError) -> Bool {
         switch error {
         case .targetUnavailable, .failed:
             true
@@ -324,11 +377,20 @@ struct ActionInputDriver: ActionInputDriving {
             causeDescription: cause.localizedDescription)
     }
 
-    private func performAction(_ actionName: String, on element: any AutomationElementRepresenting)
-        throws -> UIInputExecutionResult.Action
+    private func performAction(
+        _ actionName: String,
+        on element: any AutomationElementRepresenting,
+        beforeMutation: @MainActor () throws -> Void = {}) throws -> UIInputExecutionResult.Action
     {
+        if actionName == AXActionNames.kAXPressAction {
+            try Task.checkCancellation()
+        }
         guard element.supportsAction(actionName) else {
             throw ActionInputError.unsupported(.actionUnsupported)
+        }
+        try beforeMutation()
+        if actionName == AXActionNames.kAXPressAction {
+            try Task.checkCancellation()
         }
 
         do {
@@ -346,8 +408,11 @@ struct ActionInputDriver: ActionInputDriving {
         }
     }
 
-    private func focusForClick(_ element: any AutomationElementRepresenting) throws
-    -> UIInputExecutionResult.Action {
+    private func focusForClick(
+        _ element: any AutomationElementRepresenting,
+        beforeMutation: @MainActor () throws -> Void = {}) async throws
+        -> UIInputExecutionResult.Action
+    {
         guard let wasFocused = element.focusedState else {
             throw FocusedElementReceiptError.focusedAttributeUnreadable
         }
@@ -362,12 +427,27 @@ struct ActionInputDriver: ActionInputDriving {
                 elementRole: element.role,
                 focusedElement: focusedElement)
         }
+        let observationTarget = try await self.observationTarget(element)
+        try Self.validateBeforeMutation(beforeMutation)
         do {
             try element.setAutomationFocused(true)
         } catch {
             throw Self.classify(error)
         }
-        guard element.focusedState == true else {
+        var confirmedIdentity: FocusedElementIdentity?
+        guard await self.observeMutation(
+            on: element,
+            target: observationTarget,
+            attribute: .focused,
+            matches: { sample in
+                if let sample {
+                    confirmedIdentity = sample.identity
+                    return sample.focused == true
+                }
+                confirmedIdentity = element.focusedElementIdentity
+                return element.focusedState == true
+            })
+        else {
             throw DesktopActionFailure.indeterminate(
                 delivery: Self.accessibilityValueDelivery,
                 evidence: .completionUnknown,
@@ -375,7 +455,7 @@ struct ActionInputDriver: ActionInputDriving {
                 message: FocusedElementReceiptError.focusNotConfirmed.localizedDescription,
                 hint: "Observe the exact field before deciding whether to retry focus.")
         }
-        guard let focusedElement = element.focusedElementIdentity else {
+        guard let focusedElement = confirmedIdentity else {
             throw DesktopActionFailure.indeterminate(
                 delivery: Self.accessibilityValueDelivery,
                 evidence: .completionUnknown,
@@ -388,13 +468,16 @@ struct ActionInputDriver: ActionInputDriving {
                 delivery: Self.accessibilityValueDelivery,
                 unitCount: .one),
             actionName: AXAttributeNames.kAXFocusedAttribute,
-            anchorPoint: element.anchorPoint,
-            elementRole: element.role,
+            anchorPoint: CGPoint(x: focusedElement.frame.midX, y: focusedElement.frame.midY),
+            elementRole: focusedElement.role,
             focusedElement: focusedElement)
     }
 
-    private func setValue(_ value: UIElementValue, on element: any AutomationElementRepresenting)
-        throws -> UIInputExecutionResult.Action
+    private func setValue(
+        _ value: UIElementValue,
+        on element: any AutomationElementRepresenting,
+        beforeMutation: @MainActor () throws -> Void = {})
+        async throws -> UIInputExecutionResult.Action
     {
         if let rejectionReason = Self.setValueRejectionReason(
             role: element.role,
@@ -407,53 +490,247 @@ struct ActionInputDriver: ActionInputDriving {
 
         do {
             if !element.isValueSettable, element.isSelectedSettable {
-                let requested = try Self.booleanValue(value, role: element.role)
+                let requested = try ElementValueMutationSemantics.booleanValue(value, role: element.role)
                 let selectedBefore = element.selectedValue
-                let alreadyMatched = selectedBefore == requested
-                if alreadyMatched {
+                if let selectedBefore, selectedBefore == requested {
                     return UIInputExecutionResult.Action(
                         outcome: .confirmedNoChange(),
                         actionName: kAXSelectedAttribute as String,
                         anchorPoint: element.anchorPoint,
-                        elementRole: element.role)
+                        elementRole: element.role,
+                        valueVerification: .init(
+                            attribute: .selected, resolvedKind: .bool, readback: .bool(selectedBefore)))
                 }
+                let observationTarget = try await self.observationTarget(element)
+                try Self.validateBeforeMutation(beforeMutation)
                 try element.setAutomationSelected(requested)
-                guard element.selectedValue == requested else {
+                var selectedAfter: Bool?
+                var observedIdentity: FocusedElementIdentity?
+                guard await self.observeMutation(
+                    on: element,
+                    target: observationTarget,
+                    attribute: .selected,
+                    matches: { sample in
+                        observedIdentity = sample?.identity
+                        selectedAfter = if let sample {
+                            sample.selected
+                        } else {
+                            element.selectedValue
+                        }
+                        return selectedAfter == requested
+                    }), let selectedAfter
+                else {
                     throw Self.unverifiedValueMutationFailure(attribute: kAXSelectedAttribute as String)
                 }
                 let outcome = Self.dispatchedValueMutationOutcome(preStateKnown: selectedBefore != nil)
                 return UIInputExecutionResult.Action(
                     outcome: outcome,
                     actionName: kAXSelectedAttribute as String,
-                    anchorPoint: element.anchorPoint,
-                    elementRole: element.role)
+                    anchorPoint: observedIdentity.map { CGPoint(x: $0.frame.midX, y: $0.frame.midY) } ?? element
+                        .anchorPoint,
+                    elementRole: observedIdentity?.role ?? element.role,
+                    valueVerification: .init(
+                        attribute: .selected, resolvedKind: .bool, readback: .bool(selectedAfter)))
             }
 
             let valueBefore = element.value
+            let readbackBefore = ElementValueReadback(nativeValue: valueBefore)
+            guard !(valueBefore is NSNumber) || readbackBefore != nil else {
+                throw ActionInputError.failed("Native accessibility integer is outside the supported Int range")
+            }
             let requested = try Self.coerceValue(value, currentValue: valueBefore, role: element.role)
-            let alreadyMatched = Self.value(valueBefore, matches: requested)
+            let alreadyMatched = ElementValueMutationSemantics.matches(readbackBefore, expected: requested)
             if alreadyMatched {
+                guard let readbackBefore, readbackBefore.isFinite else {
+                    throw ActionInputError.failed("Expected a finite native readback")
+                }
                 return UIInputExecutionResult.Action(
                     outcome: .confirmedNoChange(),
                     actionName: AXActionNames.kAXSetValueAction,
                     anchorPoint: element.anchorPoint,
-                    elementRole: element.role)
+                    elementRole: element.role,
+                    valueVerification: .init(
+                        attribute: .value,
+                        resolvedKind: requested.comparisonKind,
+                        readback: readbackBefore,
+                        legacyPresentation: NativeElementValuePresentation.describe(valueBefore)))
             }
+            let observationTarget = try await self.observationTarget(element)
+            try Self.validateBeforeMutation(beforeMutation)
             try element.setAutomationValue(requested)
-            guard Self.value(element.value, matches: requested) else {
+            var presentationAfter: String?
+            var readbackAfter: ElementValueReadback?
+            var observedIdentity: FocusedElementIdentity?
+            guard await self.observeMutation(
+                on: element,
+                target: observationTarget,
+                attribute: .value,
+                matches: { sample in
+                    if let sample {
+                        observedIdentity = sample.identity
+                        presentationAfter = sample.legacyPresentation
+                        readbackAfter = sample.value
+                    } else {
+                        guard element.role != "AXSecureTextField", element.subrole != "AXSecureTextField" else {
+                            return false
+                        }
+                        let valueAfter = element.value
+                        presentationAfter = NativeElementValuePresentation.describe(valueAfter)
+                        readbackAfter = ElementValueReadback(nativeValue: valueAfter)
+                    }
+                    return readbackAfter?.isFinite == true &&
+                        ElementValueMutationSemantics.matches(readbackAfter, expected: requested)
+                }), let readbackAfter
+            else {
                 throw Self.unverifiedValueMutationFailure(attribute: AXActionNames.kAXSetValueAction)
             }
             let outcome = Self.dispatchedValueMutationOutcome(preStateKnown: valueBefore != nil)
             return UIInputExecutionResult.Action(
                 outcome: outcome,
                 actionName: AXActionNames.kAXSetValueAction,
-                anchorPoint: element.anchorPoint,
-                elementRole: element.role)
+                anchorPoint: observedIdentity.map { CGPoint(x: $0.frame.midX, y: $0.frame.midY) } ?? element
+                    .anchorPoint,
+                elementRole: observedIdentity?.role ?? element.role,
+                valueVerification: .init(
+                    attribute: .value,
+                    resolvedKind: requested.comparisonKind,
+                    readback: readbackAfter,
+                    legacyPresentation: presentationAfter))
+        } catch let cancellation as CancellationError {
+            throw cancellation
         } catch let failure as DesktopActionFailure {
             throw failure
         } catch {
             throw Self.classify(error)
         }
+    }
+
+    func performObservedMutation(
+        on element: any AutomationElementRepresenting,
+        attribute: AXMutationObservationAttribute,
+        beforeMutation: @MainActor () throws -> Void = {},
+        mutation: () throws -> FocusedTextKeyDispatch,
+        matches: (AXMutationObservationSnapshot?) -> Bool) async throws -> FocusedTextKeyDispatch
+    {
+        let target = try await self.observationTarget(element)
+        try Self.validateBeforeMutation(beforeMutation)
+        let dispatch = try mutation()
+        guard dispatch == .accessibilityValue else { return dispatch }
+        guard await self.observeMutation(on: element, target: target, attribute: attribute, matches: matches) else {
+            throw Self.unverifiedValueMutationFailure(attribute: String(describing: attribute))
+        }
+        return dispatch
+    }
+
+    private static func validateBeforeMutation(_ beforeMutation: @MainActor () throws -> Void) throws {
+        try beforeMutation()
+        try Task.checkCancellation()
+    }
+
+    private struct ObservationTarget {
+        let element: FocusedElementIdentity
+        let processGeneration: UInt64
+    }
+
+    private func observationTarget(_ element: any AutomationElementRepresenting) async throws -> ObservationTarget? {
+        try Task.checkCancellation()
+        if let native = element.underlyingAXElement {
+            let unavailable = DesktopActionFailure.preDispatchRefusal(
+                reason: .targetUnavailable,
+                message: "The native Accessibility target could not be revalidated before mutation.")
+            do {
+                var pid: pid_t = 0
+                guard AXUIElementGetPid(native, &pid) == .success,
+                      let generation = self.processStartIdentity(pid)
+                else { throw unavailable }
+                let sample = try await self.nativeReader(
+                    RetainedFocusElement(element: native),
+                    AXMutationObservationTarget(processIdentifier: pid, processStartIdentity: generation),
+                    .identity,
+                    .milliseconds(250))
+                try Task.checkCancellation()
+                guard let sample, self.processStartIdentity(pid) == generation else { throw unavailable }
+                return ObservationTarget(element: sample.identity, processGeneration: generation)
+            } catch let cancellation as CancellationError {
+                throw cancellation
+            } catch {
+                try Task.checkCancellation()
+                throw unavailable
+            }
+        }
+        guard let identity = element.focusedElementIdentity,
+              let generation = self.processStartIdentity(identity.processIdentifier)
+        else { return nil }
+        return ObservationTarget(element: identity, processGeneration: generation)
+    }
+
+    private func observationTargetIsCurrent(
+        _ target: ObservationTarget,
+        element: any AutomationElementRepresenting) -> Bool
+    {
+        guard self.processStartIdentity(target.element.processIdentifier) == target.processGeneration,
+              let current = element.focusedElementIdentity,
+              FocusedElementReceiptResolver.matches(current, expected: target.element, phase: .continuation)
+        else { return false }
+        return true
+    }
+
+    /// AX setters may acknowledge queued work before the app publishes its new tree.
+    /// Re-observe the same element; never redispatch the mutation or resolve a replacement.
+    private func observeMutation(
+        on element: any AutomationElementRepresenting,
+        target: ObservationTarget?,
+        attribute: AXMutationObservationAttribute,
+        matches: (AXMutationObservationSnapshot?) -> Bool) async -> Bool
+    {
+        let nativeElement = element.underlyingAXElement.map { RetainedFocusElement(element: $0) }
+        guard nativeElement == nil || target != nil else { return false }
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(250))
+        for sampleIndex in 0..<14 {
+            guard !Task.isCancelled, ContinuousClock.now < deadline else { return false }
+            let matched: Bool
+            if let nativeElement, let target {
+                let remaining = ContinuousClock.now.duration(to: deadline)
+                let sample: AXMutationObservationSnapshot?
+                do {
+                    sample = try await self.nativeReader(
+                        nativeElement,
+                        AXMutationObservationTarget(
+                            processIdentifier: target.element.processIdentifier,
+                            processStartIdentity: target.processGeneration,
+                            expectedIdentity: target.element),
+                        attribute,
+                        remaining)
+                } catch {
+                    return false
+                }
+                guard !Task.isCancelled,
+                      ContinuousClock.now < deadline,
+                      self.processStartIdentity(target.element.processIdentifier) == target.processGeneration
+                else { return false }
+                matched = sample.map { matches($0) } ?? false
+            } else {
+                if let target, !self.observationTargetIsCurrent(target, element: element) {
+                    return false
+                }
+                matched = matches(nil)
+                if let target, !self.observationTargetIsCurrent(target, element: element) {
+                    return false
+                }
+            }
+            if matched {
+                return true
+            }
+            guard target != nil, sampleIndex < 13,
+                  ContinuousClock.now.advanced(by: .milliseconds(20)) < deadline
+            else { return false }
+            do {
+                try await self.observationDelay()
+            } catch {
+                return false
+            }
+        }
+        return false
     }
 
     private static func unverifiedValueMutationFailure(attribute: String) -> DesktopActionFailure {
@@ -480,144 +757,27 @@ struct ActionInputDriver: ActionInputDriving {
         currentValue: Any?,
         role: String?) throws -> UIElementValue
     {
+        let currentKind = ElementValueReadback(nativeValue: currentValue)?.kind
         if self.isTextRole(role) || currentValue is String {
-            return .string(requested.displayString)
+            return try ElementValueMutationSemantics.coerce(requested, to: .string)
         }
-        if self.isBooleanRole(role) || self.valueKind(currentValue) == .bool {
-            return try .bool(self.booleanValue(requested, role: role))
+        if self.isBooleanRole(role) || currentKind == .bool {
+            return try ElementValueMutationSemantics.coerce(requested, to: .bool, role: role)
         }
         if self.isNumericRole(role) {
-            return try .double(self.doubleValue(requested))
+            return try ElementValueMutationSemantics.coerce(requested, to: .double)
         }
 
-        switch self.valueKind(currentValue) {
+        switch currentKind {
         case .int:
-            return try .int(self.integerValue(requested))
+            return try ElementValueMutationSemantics.coerce(requested, to: .int)
         case .double:
-            return try .double(self.doubleValue(requested))
+            return try ElementValueMutationSemantics.coerce(requested, to: .double)
         case .bool, .string:
             // Handled above.
             return requested
-        case .unknown:
+        case nil:
             return requested
-        }
-    }
-
-    private nonisolated static func booleanValue(_ value: UIElementValue, role: String?) throws -> Bool {
-        switch value {
-        case let .bool(value):
-            return value
-        case let .int(value) where value == 0 || value == 1:
-            return value == 1
-        case let .double(value) where value == 0 || value == 1:
-            return value == 1
-        case let .string(value):
-            switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "true", "1", "yes", "on":
-                return true
-            case "false", "0", "no", "off":
-                return false
-            default:
-                break
-            }
-        default:
-            break
-        }
-        let target = role.map { " for \($0)" } ?? ""
-        throw ActionInputError.failed("Expected a boolean value\(target)")
-    }
-
-    private nonisolated static func integerValue(_ value: UIElementValue) throws -> Int {
-        switch value {
-        case let .int(value):
-            return value
-        case let .double(value) where value.isFinite:
-            if let integer = Int(exactly: value) {
-                return integer
-            }
-        case let .string(value):
-            let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let integer = Int(value) {
-                return integer
-            }
-            if let double = Double(value), double.isFinite, let integer = Int(exactly: double) {
-                return integer
-            }
-        case let .bool(value):
-            return value ? 1 : 0
-        default:
-            break
-        }
-        throw ActionInputError.failed("Expected an integer value")
-    }
-
-    private nonisolated static func doubleValue(_ value: UIElementValue) throws -> Double {
-        let result: Double? = switch value {
-        case let .double(value):
-            value
-        case let .int(value):
-            Double(value)
-        case let .string(value):
-            Double(value.trimmingCharacters(in: .whitespacesAndNewlines))
-        case let .bool(value):
-            value ? 1 : 0
-        }
-        guard let result, result.isFinite else {
-            throw ActionInputError.failed("Expected a finite numeric value")
-        }
-        return result
-    }
-
-    private nonisolated static func value(_ actual: Any?, matches expected: UIElementValue) -> Bool {
-        guard let actual else { return false }
-        switch expected {
-        case let .bool(expected):
-            if self.valueKind(actual) == .bool, let actual = actual as? Bool {
-                return actual == expected
-            }
-            if let number = actual as? NSNumber {
-                return number.intValue == (expected ? 1 : 0)
-            }
-            return false
-        case let .int(expected):
-            guard let number = actual as? NSNumber else { return false }
-            return !self.numberIsFloatingPoint(number) && number.intValue == expected
-        case let .double(expected):
-            guard let number = actual as? NSNumber else { return false }
-            let actual = number.doubleValue
-            let tolerance = max(1e-9, abs(expected) * 1e-9)
-            return actual.isFinite && abs(actual - expected) <= tolerance
-        case let .string(expected):
-            return (actual as? String) == expected
-        }
-    }
-
-    private enum ValueKind: Equatable {
-        case bool
-        case int
-        case double
-        case string
-        case unknown
-    }
-
-    private nonisolated static func valueKind(_ value: Any?) -> ValueKind {
-        guard let value else { return .unknown }
-        if value is String {
-            return .string
-        }
-        guard let number = value as? NSNumber else { return .unknown }
-        if CFGetTypeID(number) == CFBooleanGetTypeID() {
-            return .bool
-        }
-        return self.numberIsFloatingPoint(number) ? .double : .int
-    }
-
-    private nonisolated static func numberIsFloatingPoint(_ number: NSNumber) -> Bool {
-        switch String(cString: number.objCType) {
-        case "f", "d", "D":
-            true
-        default:
-            false
         }
     }
 
@@ -663,14 +823,28 @@ extension ActionInputDriver {
         direction: PeekabooFoundation.ScrollDirection,
         pages: Int) throws -> UIInputExecutionResult.Action
     {
+        let scrollBar = self.findScrollBar(in: element, direction: direction)
+        if let scrollBar,
+           let change = Self.scrollBarValueChange(scrollBar, direction: direction, pages: pages)
+        {
+            // Some native scroll areas advertise page actions that fail even though their bar is writable.
+            // Choose the verifiable value route before dispatch; never retry an ambiguous action through it.
+            do {
+                return try self.performScrollbarValueScroll(scrollBar, change: change)
+            } catch let error as ActionInputError where Self.shouldContinueTryingScrollAction(after: error) {
+                // A definitively rejected value write leaves the page and increment routes available.
+            }
+        }
+
         do {
             return try self.performPageScrollActions(
                 element: element,
                 direction: direction,
                 pages: pages)
         } catch let error as ActionInputError where Self.shouldContinueTryingScrollAction(after: error) {
-            return try self.performScrollbarScroll(
-                element: element,
+            guard let scrollBar else { throw error }
+            return try self.performScrollbarActions(
+                scrollBar,
                 direction: direction,
                 pages: pages,
                 pageActionError: error)
@@ -699,7 +873,7 @@ extension ActionInputDriver {
                     break
                 } catch let error as ActionInputError {
                     lastError = error
-                    if Self.scrollFailureMayHaveDispatched(error) {
+                    if Self.nativeMutationFailureMayHaveDispatched(error) {
                         throw Self.scrollProgressFailure(
                             completedUnitCount: completedPages,
                             currentUnitMayHaveDispatched: true,
@@ -745,19 +919,12 @@ extension ActionInputDriver {
             elementRole: element.role)
     }
 
-    /// Standard AppKit scroll areas commonly expose no page-scroll action on the container. Their
-    /// descendant AXScrollBar is nevertheless a settable native Accessibility control, so mutate
-    /// that value before declaring background scrolling unsupported.
-    private func performScrollbarScroll(
-        element: any AutomationElementRepresenting,
+    private func performScrollbarActions(
+        _ scrollBar: any AutomationElementRepresenting,
         direction: PeekabooFoundation.ScrollDirection,
         pages: Int,
         pageActionError: ActionInputError) throws -> UIInputExecutionResult.Action
     {
-        guard let scrollBar = self.findScrollBar(in: element, direction: direction) else {
-            throw Self.scrollFallbackError(from: pageActionError)
-        }
-
         let actionName: String = switch direction {
         case .down, .right:
             AXActionNames.kAXIncrementAction
@@ -772,7 +939,7 @@ extension ActionInputDriver {
                     _ = try self.performAction(actionName, on: scrollBar)
                     completedPages += 1
                 } catch let error as ActionInputError {
-                    if Self.scrollFailureMayHaveDispatched(error) {
+                    if Self.nativeMutationFailureMayHaveDispatched(error) {
                         throw Self.scrollProgressFailure(
                             completedUnitCount: completedPages,
                             currentUnitMayHaveDispatched: true,
@@ -804,21 +971,32 @@ extension ActionInputDriver {
             }
         }
 
+        throw Self.scrollFallbackError(from: pageActionError)
+    }
+
+    private struct ScrollBarValueChange {
+        let currentValue: Double
+        let requestedValue: Double
+    }
+
+    private static func scrollBarValueChange(
+        _ scrollBar: any AutomationElementRepresenting,
+        direction: PeekabooFoundation.ScrollDirection,
+        pages: Int) -> ScrollBarValueChange?
+    {
         guard scrollBar.isValueSettable,
-              let currentValue = Self.numericValue(scrollBar.value)
-        else {
-            throw Self.scrollFallbackError(from: pageActionError)
-        }
+              let currentValue = self.numericValue(scrollBar.value)
+        else { return nil }
 
         let minimumValue = scrollBar.doubleAttribute(AXAttributeNames.kAXMinValueAttribute) ?? 0
         let maximumValue = scrollBar.doubleAttribute(AXAttributeNames.kAXMaxValueAttribute) ?? 1
-        guard maximumValue > minimumValue else {
-            throw Self.scrollFallbackError(from: pageActionError)
-        }
-
         let range = maximumValue - minimumValue
+        guard minimumValue.isFinite, maximumValue.isFinite, range.isFinite, range > 0,
+              (minimumValue...maximumValue).contains(currentValue)
+        else { return nil }
+
         let advertisedIncrement = scrollBar.doubleAttribute(AXAttributeNames.kAXValueIncrementAttribute)
-        let singleStep = advertisedIncrement.flatMap { $0 > 0 ? min($0, range) : nil } ?? (range / 10)
+        let singleStep = advertisedIncrement.flatMap { $0.isFinite && $0 > 0 ? min($0, range) : nil } ?? (range / 10)
         let signedStep: Double = switch direction {
         case .down, .right:
             singleStep
@@ -828,14 +1006,22 @@ extension ActionInputDriver {
         let requestedValue = min(
             maximumValue,
             max(minimumValue, currentValue + signedStep * Double(max(1, pages))))
+        return ScrollBarValueChange(currentValue: currentValue, requestedValue: requestedValue)
+    }
 
-        let alreadyMatched = abs(requestedValue - currentValue) < 1e-9
+    private func performScrollbarValueScroll(
+        _ scrollBar: any AutomationElementRepresenting,
+        change: ScrollBarValueChange) throws -> UIInputExecutionResult.Action
+    {
+        let currentValue = change.currentValue
+        let requestedValue = change.requestedValue
+        let alreadyMatched = requestedValue == currentValue
         if !alreadyMatched {
             do {
                 try scrollBar.setAutomationValue(.double(requestedValue))
             } catch {
                 let classified = Self.classify(error)
-                if Self.scrollFailureMayHaveDispatched(classified) {
+                if Self.nativeMutationFailureMayHaveDispatched(classified) {
                     throw Self.scrollProgressFailure(
                         completedUnitCount: 0,
                         currentUnitMayHaveDispatched: true,
@@ -848,7 +1034,7 @@ extension ActionInputDriver {
         }
 
         let observedValue = Self.numericValue(scrollBar.value)
-        if requestedValue != currentValue, let observedValue, abs(observedValue - currentValue) < 1e-9 {
+        if !alreadyMatched, observedValue == currentValue {
             throw DesktopActionFailure.indeterminate(
                 delivery: Self.accessibilityValueDelivery,
                 evidence: .completionUnknown,
@@ -911,18 +1097,34 @@ extension ActionInputDriver {
         _ element: any AutomationElementRepresenting,
         matches direction: PeekabooFoundation.ScrollDirection) -> Bool
     {
-        guard let frame = element.frame else { return true }
-        switch direction {
+        let wantsVertical = switch direction {
         case .up, .down:
-            return frame.height >= frame.width
+            true
         case .left, .right:
-            return frame.width >= frame.height
+            false
         }
+        switch element.stringAttribute(AXAttributeNames.kAXOrientationAttribute) {
+        case kAXVerticalOrientationValue:
+            return wantsVertical
+        case kAXHorizontalOrientationValue:
+            return !wantsVertical
+        default:
+            break
+        }
+
+        guard let frame = element.frame,
+              frame.origin.x.isFinite, frame.origin.y.isFinite,
+              frame.size.width.isFinite, frame.size.height.isFinite,
+              frame.size.width > 0, frame.size.height > 0,
+              frame.size.width != frame.size.height
+        else { return false }
+        return (frame.size.height > frame.size.width) == wantsVertical
     }
 
     private static func numericValue(_ value: Any?) -> Double? {
         guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID()
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite
         else {
             return nil
         }
@@ -931,21 +1133,21 @@ extension ActionInputDriver {
 
     private func findMenuItem(
         matching chord: MenuHotkeyChord,
-        in menuBar: any AutomationElementRepresenting) -> (any AutomationElementRepresenting)?
+        in menuBar: any AutomationElementRepresenting) throws -> (any AutomationElementRepresenting)?
     {
         var remainingBudget = 600
 
-        for menuBarItem in menuBar.automationChildren {
+        for menuBarItem in try self.menuReader.children(of: menuBar) {
             guard remainingBudget > 0 else { return nil }
             remainingBudget -= 1
 
-            guard let menu = menuBarItem.automationChildren.first(where: { $0.role == AXRoleNames.kAXMenuRole }) else {
+            guard let menu = try self.submenu(of: menuBarItem) else {
                 continue
             }
 
-            if let match = self.findMenuItem(
+            if let match = try self.findMenuItem(
                 matching: chord,
-                inMenuChildren: menu.automationChildren,
+                inMenuChildren: self.menuReader.children(of: menu),
                 budget: &remainingBudget)
             {
                 return match
@@ -958,20 +1160,20 @@ extension ActionInputDriver {
     private func findMenuItem(
         matching chord: MenuHotkeyChord,
         inMenuChildren children: [any AutomationElementRepresenting],
-        budget: inout Int) -> (any AutomationElementRepresenting)?
+        budget: inout Int) throws -> (any AutomationElementRepresenting)?
     {
         for child in children {
             guard budget > 0 else { return nil }
             budget -= 1
 
-            if self.menuItem(child, matches: chord) {
+            if try self.menuItem(child, matches: chord) {
                 return child
             }
 
-            if let submenu = child.automationChildren.first(where: { $0.role == AXRoleNames.kAXMenuRole }),
-               let match = self.findMenuItem(
+            if let submenu = try self.submenu(of: child),
+               let match = try self.findMenuItem(
                    matching: chord,
-                   inMenuChildren: submenu.automationChildren,
+                   inMenuChildren: self.menuReader.children(of: submenu),
                    budget: &budget)
             {
                 return match
@@ -981,19 +1183,22 @@ extension ActionInputDriver {
         return nil
     }
 
-    private func menuItem(_ element: any AutomationElementRepresenting, matches chord: MenuHotkeyChord) -> Bool {
-        guard element.role == AXRoleNames.kAXMenuItemRole else { return false }
-        guard element.isEnabled else { return false }
+    private func submenu(of element: any AutomationElementRepresenting) throws -> (any AutomationElementRepresenting)? {
+        try self.menuReader.children(of: element).first { try self.menuReader.role(of: $0) == AXRoleNames.kAXMenuRole }
+    }
 
-        guard let commandCharacter = element.stringAttribute("AXMenuItemCmdChar"),
-              !commandCharacter.isEmpty
+    private func menuItem(_ element: any AutomationElementRepresenting, matches chord: MenuHotkeyChord) throws -> Bool {
+        guard try self.menuReader.role(of: element) == AXRoleNames.kAXMenuItemRole else { return false }
+        guard let commandCharacter = try self.menuReader.commandCharacter(of: element),
+              !commandCharacter.isEmpty,
+              MenuHotkeyChord.normalizedCommandCharacter(commandCharacter) == chord.key
         else {
             return false
         }
 
-        let modifiers = element.intAttribute("AXMenuItemCmdModifiers") ?? 0
-        return MenuHotkeyChord.normalizedCommandCharacter(commandCharacter) == chord.key &&
-            MenuHotkeyChord.modifiers(fromMenuItemModifiers: modifiers) == chord.modifiers
+        guard try self.menuReader.isEnabled(element) else { return false }
+        let modifiers = try self.menuReader.modifiers(of: element)
+        return MenuHotkeyChord.modifiers(fromMenuItemModifiers: modifiers) == chord.modifiers
     }
 }
 
@@ -1122,10 +1327,11 @@ private struct MenuHotkeyChord: Equatable {
 extension ActionInputDriver {
     func tryClickForTesting(
         element: any AutomationElementRepresenting,
-        allowAccessibilityValueFallback: Bool = true) throws -> UIInputExecutionResult.Action
+        allowAccessibilityValueFallback: Bool = true,
+        beforeMutation: @MainActor () throws -> Void = {}) async throws -> UIInputExecutionResult.Action
     {
         do {
-            return try self.performAction(AXActionNames.kAXPressAction, on: element)
+            return try self.performAction(AXActionNames.kAXPressAction, on: element, beforeMutation: beforeMutation)
         } catch let error as ActionInputError
             where error == .unsupported(.actionUnsupported) &&
             allowAccessibilityValueFallback &&
@@ -1135,15 +1341,17 @@ extension ActionInputDriver {
                 isValueSettable: element.isValueSettable,
                 isFocusedSettable: element.isFocusedSettable)
         {
-            return try self.focusForClick(element)
+            return try await self.focusForClick(element, beforeMutation: beforeMutation)
         }
     }
 
     func trySetValueForTesting(
         element: any AutomationElementRepresenting,
-        value: UIElementValue) throws -> UIInputExecutionResult.Action
+        value: UIElementValue,
+        beforeMutation: @MainActor () throws -> Void = {}) async throws -> UIInputExecutionResult
+        .Action
     {
-        try self.setValue(value, on: element)
+        try await self.setValue(value, on: element, beforeMutation: beforeMutation)
     }
 
     func tryScrollForTesting(
@@ -1166,7 +1374,7 @@ extension ActionInputDriver {
         menuBar: any AutomationElementRepresenting) throws -> UIInputExecutionResult.Action
     {
         let chord = try MenuHotkeyChord(keys: keys)
-        guard let menuItem = self.findMenuItem(matching: chord, in: menuBar) else {
+        guard let menuItem = try self.findMenuItem(matching: chord, in: menuBar) else {
             throw ActionInputError.unsupported(.menuShortcutUnavailable)
         }
         return try self.performAction(AXActionNames.kAXPressAction, on: menuItem)

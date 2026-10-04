@@ -461,9 +461,12 @@ struct ClickServiceTargetResolutionTests {
         }
     }
 
-    @Test
+    @Test(arguments: [false, true], [false, true])
     @MainActor
-    func `background element click uses action first with targeted synthetic fallback`() async throws {
+    func `background click retains value policy through action-to-positional fallback`(
+        allowed: Bool,
+        usesQuery: Bool) async throws
+    {
         let pid = getpid()
         let tracker = ClickWindowTracker(bounds: Self.testWindowBounds)
         try await WindowMovementTrackingProviderScope.withProvider(tracker) {
@@ -490,14 +493,33 @@ struct ClickServiceTargetResolutionTests {
                 snapshotManager: InMemorySnapshotManager.containing(detectionResult),
                 inputPolicy: UIInputPolicy(defaultStrategy: .actionFirst),
                 syntheticInputDriver: synthetic,
-                exactWindowIdentityValidator: { _, _ in true })
+                automationElementResolver: ClickMissingAutomationElementResolver(),
+                exactWindowIdentityValidator: { _, _ in true },
+                processStartIdentityProvider: { _ in 1 })
 
-            let result = try await service.click(
-                target: .elementId("B1"),
-                clickType: .single,
-                snapshotId: Self.snapshotID,
-                targetProcessIdentifier: pid)
+            let operation = {
+                try await service.click(
+                    target: usesQuery ? .query("Background Button") : .elementId("B1"),
+                    clickType: .single,
+                    snapshotId: Self.snapshotID,
+                    automationTarget: .exactWindow(.init(
+                        identity: Self.windowIdentity(processIdentifier: pid),
+                        bounds: Self.testWindowBounds)),
+                    validatesProcessIdentity: true,
+                    allowsAccessibilityValueDelivery: allowed)
+            }
+            guard allowed else {
+                let failure = await #expect(throws: DesktopActionFailure.self) {
+                    try await operation()
+                }
+                #expect(failure?.outcome.state == .refused)
+                #expect(failure?.localizedDescription.contains("cannot enforce") == true)
+                #expect(synthetic.targetedClickAttempts == 0)
+                #expect(synthetic.events.isEmpty)
+                return
+            }
 
+            let result = try await operation()
             #expect(result.path == .synth)
             #expect(result.strategy == .actionFirst)
             #expect(result.fallbackReason == .missingElement)
@@ -1486,7 +1508,10 @@ private final class ClickSuccessfulActionInputDriver: ActionInputDriving {
         self.afterAction = afterAction
     }
 
-    func tryClick(element _: AutomationElement) throws -> UIInputExecutionResult.Action {
+    func tryClick(
+        element _: AutomationElement,
+        beforeMutation _: @MainActor () throws -> Void) throws -> UIInputExecutionResult.Action
+    {
         self.clickCount += 1
         self.performedActionNames.append(AXActionNames.kAXPressAction)
         self.afterAction?()
@@ -1511,7 +1536,11 @@ private final class ClickSuccessfulActionInputDriver: ActionInputDriving {
         AutomationTestFixtures.uiActionReceipt()
     }
 
-    func trySetText(element _: AutomationElement, text _: String, replace _: Bool) throws
+    func trySetText(
+        element _: AutomationElement,
+        text _: String,
+        replace _: Bool,
+        beforeMutation _: @MainActor () throws -> Void) throws
     -> UIInputExecutionResult.Action {
         AutomationTestFixtures.uiActionReceipt()
     }
@@ -1521,7 +1550,10 @@ private final class ClickSuccessfulActionInputDriver: ActionInputDriving {
         AutomationTestFixtures.uiActionReceipt()
     }
 
-    func trySetValue(element _: AutomationElement, value _: UIElementValue) throws
+    func trySetValue(
+        element _: AutomationElement,
+        value _: UIElementValue,
+        beforeMutation _: @MainActor () throws -> Void) throws
     -> UIInputExecutionResult.Action {
         AutomationTestFixtures.uiActionReceipt()
     }
@@ -1559,7 +1591,10 @@ private final class ClickFailingActionInputDriver: ActionInputDriving {
         self.error = error
     }
 
-    func tryClick(element _: AutomationElement) throws -> UIInputExecutionResult.Action {
+    func tryClick(
+        element _: AutomationElement,
+        beforeMutation _: @MainActor () throws -> Void) throws -> UIInputExecutionResult.Action
+    {
         throw self.error
     }
 
@@ -1574,7 +1609,11 @@ private final class ClickFailingActionInputDriver: ActionInputDriving {
         throw self.error
     }
 
-    func trySetText(element _: AutomationElement, text _: String, replace _: Bool) throws
+    func trySetText(
+        element _: AutomationElement,
+        text _: String,
+        replace _: Bool,
+        beforeMutation _: @MainActor () throws -> Void) throws
     -> UIInputExecutionResult.Action {
         throw self.error
     }
@@ -1584,7 +1623,10 @@ private final class ClickFailingActionInputDriver: ActionInputDriving {
         throw self.error
     }
 
-    func trySetValue(element _: AutomationElement, value _: UIElementValue) throws
+    func trySetValue(
+        element _: AutomationElement,
+        value _: UIElementValue,
+        beforeMutation _: @MainActor () throws -> Void) throws
     -> UIInputExecutionResult.Action {
         throw self.error
     }

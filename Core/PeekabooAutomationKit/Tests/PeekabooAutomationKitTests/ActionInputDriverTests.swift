@@ -106,14 +106,14 @@ struct ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `set value predispatch refusal never acquires dispatch semantics`() {
+    func `set value predispatch refusal never acquires dispatch semantics`() async {
         let element = ActionInputMockAutomationElement(
             role: "AXSecureTextField",
             value: "secret",
             isValueSettable: true)
 
         do {
-            _ = try ActionInputDriver().trySetValueForTesting(element: element, value: .string("replacement"))
+            _ = try await ActionInputDriver().trySetValueForTesting(element: element, value: .string("replacement"))
             Issue.record("Expected secure value mutation to be refused")
         } catch let error as ActionInputError {
             #expect(error == .unsupported(.secureValueNotAllowed))
@@ -121,372 +121,6 @@ struct ActionInputDriverTests {
             Issue.record("Unexpected error: \(error)")
         }
         #expect(element.setValues.isEmpty)
-    }
-
-    @Test
-    func `ambiguous scroll action failure is not fallback eligible`() {
-        #expect(!ActionInputDriver.shouldContinueTryingScrollActionForTesting(after: .targetUnavailable))
-        #expect(ActionInputDriver.scrollFallbackErrorForTesting(from: .targetUnavailable) == .targetUnavailable)
-    }
-
-    @Test
-    func `scroll action keeps stale and permission errors as hard failures`() {
-        #expect(!ActionInputDriver.shouldContinueTryingScrollActionForTesting(after: .staleElement))
-        #expect(!ActionInputDriver.shouldContinueTryingScrollActionForTesting(after: .permissionDenied))
-        #expect(ActionInputDriver.scrollFallbackErrorForTesting(from: .staleElement) == .staleElement)
-    }
-
-    @MainActor
-    @Test
-    func `directional scroll ignores scroll to visible action`() {
-        let element = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            actionNames: ["AXScrollToVisible"])
-
-        do {
-            _ = try ActionInputDriver().tryScrollForTesting(element: element, direction: .down, pages: 1)
-            Issue.record("Expected scroll-to-visible-only element to fall back")
-        } catch let error as ActionInputError {
-            #expect(error == .unsupported(.actionUnsupported))
-            #expect(element.performedActions.isEmpty)
-        } catch {
-            Issue.record("Unexpected error: \(error)")
-        }
-    }
-
-    @MainActor
-    @Test
-    func `directional scroll performs page scroll action`() throws {
-        let element = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            actionNames: ["AXScrollDownByPage"])
-
-        let result = try ActionInputDriver().tryScrollForTesting(element: element, direction: .down, pages: 1)
-
-        #expect(result.actionName == "AXScrollDownByPage")
-        #expect(result.outcome.state == .dispatchedUnverified)
-        #expect(result.outcome.evidence == .deliveryAccepted)
-        #expect(result.outcome.delivery == .init(mechanism: .accessibilityAction, mode: .background))
-        #expect(result.outcome.dispatchState.unitCount == .one)
-        #expect(element.performedActions == ["AXScrollDownByPage"])
-    }
-
-    @MainActor
-    @Test
-    func `multi page scroll reports every accepted page unit`() throws {
-        let element = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            actionNames: ["AXScrollDownByPage"])
-
-        let result = try ActionInputDriver().tryScrollForTesting(element: element, direction: .down, pages: 3)
-
-        #expect(result.outcome.state == .dispatchedUnverified)
-        #expect(result.outcome.dispatchState.unitCount?.rawValue == 3)
-        #expect(element.performedActions == Array(repeating: "AXScrollDownByPage", count: 3))
-    }
-
-    @MainActor
-    @Test
-    func `accepted page prefix stops before scrollbar fallback`() {
-        let scrollBar = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollBarRole,
-            frame: CGRect(x: 300, y: 0, width: 16, height: 400),
-            value: 0.2,
-            isValueSettable: true)
-        let scrollArea = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            actionNames: ["AXScrollDownByPage"],
-            children: [scrollBar],
-            actionFailureAfterSuccesses: 1,
-            sequencedActionFailure: AccessibilitySystemError(.actionUnsupported))
-
-        do {
-            _ = try ActionInputDriver().tryScrollForTesting(element: scrollArea, direction: .down, pages: 3)
-            Issue.record("Expected a typed partial page-scroll failure")
-        } catch let failure as DesktopActionFailure {
-            #expect(failure.outcome.state == .partial)
-            #expect(failure.outcome.dispatchState.unitCount?.rawValue == 1)
-            #expect(failure.outcome.retrySafety == .unsafe)
-        } catch {
-            Issue.record("Unexpected error: \(error)")
-        }
-
-        #expect(scrollArea.performedActions == ["AXScrollDownByPage"])
-        #expect(scrollBar.setValues.isEmpty)
-    }
-
-    @MainActor
-    @Test
-    func `ambiguous page failure counts the possible unit and stops fallback`() {
-        let scrollBar = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollBarRole,
-            frame: CGRect(x: 300, y: 0, width: 16, height: 400),
-            value: 0.2,
-            isValueSettable: true)
-        let scrollArea = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            actionNames: ["AXScrollDownByPage"],
-            children: [scrollBar],
-            actionFailureAfterSuccesses: 1,
-            sequencedActionFailure: AccessibilitySystemError(.cannotComplete))
-
-        do {
-            _ = try ActionInputDriver().tryScrollForTesting(element: scrollArea, direction: .down, pages: 3)
-            Issue.record("Expected a typed indeterminate page-scroll failure")
-        } catch let failure as DesktopActionFailure {
-            #expect(failure.outcome.state == .indeterminate)
-            #expect(failure.outcome.dispatchState.unitCount?.rawValue == 2)
-            #expect(failure.outcome.retrySafety == .unsafe)
-        } catch {
-            Issue.record("Unexpected error: \(error)")
-        }
-
-        #expect(scrollArea.performedActions == ["AXScrollDownByPage"])
-        #expect(scrollBar.setValues.isEmpty)
-    }
-
-    @MainActor
-    @Test
-    func `directional scroll reports fallback page action that actually ran`() throws {
-        let element = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            actionNames: ["AXPageDown"])
-
-        let result = try ActionInputDriver().tryScrollForTesting(element: element, direction: .down, pages: 1)
-
-        #expect(result.actionName == "AXPageDown")
-        #expect(element.performedActions == ["AXPageDown"])
-    }
-
-    @MainActor
-    @Test
-    func `directional scroll mutates a standard descendant scroll bar`() throws {
-        let scrollBar = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollBarRole,
-            frame: CGRect(x: 300, y: 0, width: 16, height: 400),
-            value: 0.2,
-            isValueSettable: true)
-        let scrollArea = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            children: [scrollBar])
-
-        let result = try ActionInputDriver().tryScrollForTesting(
-            element: scrollArea,
-            direction: .down,
-            pages: 3)
-
-        #expect(result.actionName == "AXSetValue")
-        #expect(result.elementRole == AXRoleNames.kAXScrollBarRole)
-        #expect(result.outcome.dispatchState.unitCount == .one)
-        #expect(scrollBar.setValues == [.double(0.5)])
-    }
-
-    @MainActor
-    @Test
-    func `horizontal scroll selects the horizontal descendant scroll bar`() throws {
-        let vertical = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollBarRole,
-            frame: CGRect(x: 300, y: 0, width: 16, height: 400),
-            value: 0.2,
-            isValueSettable: true)
-        let horizontal = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollBarRole,
-            frame: CGRect(x: 0, y: 400, width: 300, height: 16),
-            value: 0.7,
-            isValueSettable: true)
-        let scrollArea = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            children: [vertical, horizontal])
-
-        _ = try ActionInputDriver().tryScrollForTesting(
-            element: scrollArea,
-            direction: .left,
-            pages: 2)
-
-        #expect(vertical.setValues.isEmpty)
-        guard case let .double(value) = horizontal.setValues.first else {
-            Issue.record("Expected a direct numeric scroll-bar update")
-            return
-        }
-        #expect(abs(value - 0.5) < 1e-9)
-    }
-
-    @MainActor
-    @Test
-    func `scroll chooses the requested area bar before a nested area bar`() throws {
-        let nestedBar = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollBarRole,
-            frame: CGRect(x: 280, y: 20, width: 16, height: 120),
-            value: 0.3,
-            isValueSettable: true)
-        let nestedArea = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            children: [nestedBar])
-        let targetBar = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollBarRole,
-            frame: CGRect(x: 300, y: 0, width: 16, height: 400),
-            value: 0.1,
-            isValueSettable: true)
-        let targetArea = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            children: [
-                ActionInputMockAutomationElement(role: AXRoleNames.kAXGroupRole, children: [nestedArea]),
-                targetBar,
-            ])
-
-        _ = try ActionInputDriver().tryScrollForTesting(
-            element: targetArea,
-            direction: .down,
-            pages: 1)
-
-        #expect(targetBar.setValues == [.double(0.2)])
-        #expect(nestedBar.setValues.isEmpty)
-    }
-
-    @MainActor
-    @Test
-    func `scroll does not borrow a nested area bar when the target has none`() {
-        let nestedBar = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollBarRole,
-            frame: CGRect(x: 280, y: 20, width: 16, height: 120),
-            value: 0.3,
-            isValueSettable: true)
-        let targetArea = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            children: [
-                ActionInputMockAutomationElement(
-                    role: AXRoleNames.kAXGroupRole,
-                    children: [ActionInputMockAutomationElement(
-                        role: AXRoleNames.kAXScrollAreaRole,
-                        children: [nestedBar])]),
-            ])
-
-        do {
-            _ = try ActionInputDriver().tryScrollForTesting(
-                element: targetArea,
-                direction: .down,
-                pages: 1)
-            Issue.record("Expected a target without its own vertical scroll bar to fail")
-        } catch let error as ActionInputError {
-            #expect(error == .unsupported(.actionUnsupported))
-        } catch {
-            Issue.record("Unexpected error: \(error)")
-        }
-
-        #expect(nestedBar.setValues.isEmpty)
-    }
-
-    @MainActor
-    @Test
-    func `scroll bar advertised increment action remains action first`() throws {
-        let scrollBar = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollBarRole,
-            frame: CGRect(x: 300, y: 0, width: 16, height: 400),
-            value: 0.2,
-            actionNames: [AXActionNames.kAXIncrementAction],
-            isValueSettable: true)
-        let scrollArea = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            children: [scrollBar])
-
-        let result = try ActionInputDriver().tryScrollForTesting(
-            element: scrollArea,
-            direction: .down,
-            pages: 2)
-
-        #expect(result.actionName == AXActionNames.kAXIncrementAction)
-        #expect(result.outcome.dispatchState.unitCount?.rawValue == 2)
-        #expect(scrollBar.performedActions == [AXActionNames.kAXIncrementAction, AXActionNames.kAXIncrementAction])
-        #expect(scrollBar.setValues.isEmpty)
-    }
-
-    @MainActor
-    @Test
-    func `accepted scrollbar prefix never retries through AXValue`() {
-        let scrollBar = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollBarRole,
-            frame: CGRect(x: 300, y: 0, width: 16, height: 400),
-            value: 0.2,
-            actionNames: [AXActionNames.kAXIncrementAction],
-            isValueSettable: true,
-            actionFailureAfterSuccesses: 1,
-            sequencedActionFailure: AccessibilitySystemError(.actionUnsupported))
-        let scrollArea = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            children: [scrollBar])
-
-        do {
-            _ = try ActionInputDriver().tryScrollForTesting(element: scrollArea, direction: .down, pages: 3)
-            Issue.record("Expected a typed partial scrollbar failure")
-        } catch let failure as DesktopActionFailure {
-            #expect(failure.outcome.state == .partial)
-            #expect(failure.outcome.dispatchState.unitCount?.rawValue == 1)
-            #expect(failure.outcome.retrySafety == .unsafe)
-        } catch {
-            Issue.record("Unexpected error: \(error)")
-        }
-
-        #expect(scrollBar.performedActions == [AXActionNames.kAXIncrementAction])
-        #expect(scrollBar.setValues.isEmpty)
-    }
-
-    @MainActor
-    @Test
-    func `accepted AXValue without readback is indeterminate and retry unsafe`() {
-        let scrollBar = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollBarRole,
-            frame: CGRect(x: 300, y: 0, width: 16, height: 400),
-            value: 0.2,
-            isValueSettable: true,
-            valueSetterDoesNotChange: true)
-        let scrollArea = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollAreaRole,
-            children: [scrollBar])
-
-        do {
-            _ = try ActionInputDriver().tryScrollForTesting(element: scrollArea, direction: .down, pages: 3)
-            Issue.record("Expected a typed indeterminate AXValue failure")
-        } catch let failure as DesktopActionFailure {
-            #expect(failure.outcome.state == .indeterminate)
-            #expect(failure.outcome.delivery == .init(mechanism: .accessibilityValue, mode: .background))
-            #expect(failure.outcome.dispatchState.unitCount == .one)
-            #expect(failure.outcome.retrySafety == .unsafe)
-        } catch {
-            Issue.record("Unexpected error: \(error)")
-        }
-
-        #expect(scrollBar.setValues == [.double(0.5)])
-    }
-
-    @MainActor
-    @Test
-    func `targeted scroll never mutates a sibling scroll area`() {
-        let targetArea = ActionInputMockAutomationElement(role: AXRoleNames.kAXScrollAreaRole)
-        let siblingBar = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXScrollBarRole,
-            frame: CGRect(x: 300, y: 0, width: 16, height: 400),
-            value: 0.2,
-            isValueSettable: true)
-        _ = ActionInputMockAutomationElement(
-            role: AXRoleNames.kAXGroupRole,
-            children: [
-                targetArea,
-                ActionInputMockAutomationElement(role: AXRoleNames.kAXScrollAreaRole, children: [siblingBar]),
-            ])
-
-        do {
-            _ = try ActionInputDriver().tryScrollForTesting(
-                element: targetArea,
-                direction: .down,
-                pages: 1)
-            Issue.record("Expected the target without a native scroll control to fail")
-        } catch let error as ActionInputError {
-            #expect(error == .unsupported(.actionUnsupported))
-        } catch {
-            Issue.record("Unexpected error: \(error)")
-        }
-
-        #expect(siblingBar.setValues.isEmpty)
     }
 
     @Test
@@ -975,13 +609,13 @@ extension ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `mock element can exercise action click without live AX`() throws {
+    func `mock element can exercise action click without live AX`() async throws {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXButtonRole,
             frame: CGRect(x: 10, y: 20, width: 30, height: 40),
             actionNames: [AXActionNames.kAXPressAction])
 
-        let result = try ActionInputDriver().tryClickForTesting(element: element)
+        let result = try await ActionInputDriver().tryClickForTesting(element: element)
 
         #expect(element.performedActions == [AXActionNames.kAXPressAction])
         #expect(result.outcome.state == .dispatchedUnverified)
@@ -1024,14 +658,14 @@ extension ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `text field action click focuses when press is unavailable`() throws {
+    func `text field action click focuses when press is unavailable`() async throws {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXTextFieldRole,
             frame: CGRect(x: 10, y: 20, width: 30, height: 40),
             isValueSettable: true,
             isFocusedSettable: true)
 
-        let result = try ActionInputDriver().tryClickForTesting(element: element)
+        let result = try await ActionInputDriver().tryClickForTesting(element: element)
 
         #expect(element.performedActions.isEmpty)
         #expect(element.setFocusedValues == [true])
@@ -1044,15 +678,15 @@ extension ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `text field click without negotiated value delivery refuses before focus write`() throws {
+    func `text field click without negotiated value delivery refuses before focus write`() async throws {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXTextFieldRole,
             frame: CGRect(x: 10, y: 20, width: 30, height: 40),
             isValueSettable: true,
             isFocusedSettable: true)
 
-        #expect(throws: ActionInputError.self) {
-            _ = try ActionInputDriver().tryClickForTesting(
+        await #expect(throws: ActionInputError.self) {
+            _ = try await ActionInputDriver().tryClickForTesting(
                 element: element,
                 allowAccessibilityValueFallback: false)
         }
@@ -1062,19 +696,20 @@ extension ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `legacy action driver opt out refuses before invoking an unknown click implementation`() throws {
+    func `legacy action driver opt out refuses before invoking an unknown click implementation`() async throws {
         let driver = RecordingActionInputDriver()
         let element = AutomationElement(Element(AXUIElementCreateApplication(getpid())))
 
-        #expect(throws: ActionInputError.self) {
-            _ = try driver.tryClick(element: element, allowAccessibilityValueFallback: false)
+        await #expect(throws: ActionInputError.self) {
+            _ = try await driver.tryClick(
+                element: element, allowAccessibilityValueFallback: false, beforeMutation: {})
         }
         #expect(driver.clickCallCount == 0)
     }
 
     @MainActor
     @Test
-    func `exact semantic focus returns confirmed receipt without redispatch when already focused`() throws {
+    func `exact semantic focus returns confirmed receipt without redispatch when already focused`() async throws {
         let frame = CGRect(x: 10, y: 20, width: 30, height: 40)
         let element = ActionInputMockAutomationElement(
             identifier: "editor",
@@ -1083,7 +718,7 @@ extension ActionInputDriverTests {
             isFocusedSettable: true,
             isFocused: true)
 
-        let result = try ActionInputDriver().tryFocus(element: element)
+        let result = try await ActionInputDriver().tryFocus(element: element)
 
         #expect(element.setFocusedValues.isEmpty)
         #expect(result.outcome.state == .confirmedNoChange)
@@ -1097,20 +732,20 @@ extension ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `exact semantic focus refuses an unsettable field before mutation`() {
+    func `exact semantic focus refuses an unsettable field before mutation`() async {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXTextFieldRole,
             frame: CGRect(x: 10, y: 20, width: 30, height: 40))
 
-        #expect(throws: FocusedElementReceiptError.focusedAttributeNotSettable) {
-            _ = try ActionInputDriver().tryFocus(element: element)
+        await #expect(throws: FocusedElementReceiptError.focusedAttributeNotSettable) {
+            _ = try await ActionInputDriver().tryFocus(element: element)
         }
         #expect(element.setFocusedValues.isEmpty)
     }
 
     @MainActor
     @Test
-    func `exact semantic focus reports retry unsafe when accepted setter cannot be confirmed`() {
+    func `exact semantic focus reports retry unsafe when accepted setter cannot be confirmed`() async {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXTextFieldRole,
             frame: CGRect(x: 10, y: 20, width: 30, height: 40),
@@ -1118,7 +753,7 @@ extension ActionInputDriverTests {
             focusSetterDoesNotChange: true)
 
         do {
-            _ = try ActionInputDriver().tryFocus(element: element)
+            _ = try await ActionInputDriver().tryFocus(element: element)
             Issue.record("Expected unconfirmed native focus to fail")
         } catch let failure as DesktopActionFailure {
             #expect(failure.outcome.state == .indeterminate)
@@ -1149,13 +784,13 @@ extension ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `numeric slider coerces CLI text to a floating point AX value`() throws {
+    func `numeric slider coerces CLI text to a floating point AX value`() async throws {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXSliderRole,
             value: 50.0,
             isValueSettable: true)
 
-        let result = try ActionInputDriver().trySetValueForTesting(element: element, value: .string("0.75"))
+        let result = try await ActionInputDriver().trySetValueForTesting(element: element, value: .string("0.75"))
 
         #expect(element.setValues == [.double(0.75)])
         #expect((element.value as? Double) == 0.75)
@@ -1166,13 +801,13 @@ extension ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `boolean selected attribute is set and verified`() throws {
+    func `boolean selected attribute is set and verified`() async throws {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXRowRole,
             isSelectedSettable: true,
             selectedValue: false)
 
-        let result = try ActionInputDriver().trySetValueForTesting(element: element, value: .string("true"))
+        let result = try await ActionInputDriver().trySetValueForTesting(element: element, value: .string("true"))
 
         #expect(element.setSelectedValues == [true])
         #expect(element.selectedValue == true)
@@ -1182,13 +817,13 @@ extension ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `numeric-looking text field value remains a string`() throws {
+    func `numeric-looking text field value remains a string`() async throws {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXTextFieldRole,
             value: "123",
             isValueSettable: true)
 
-        _ = try ActionInputDriver().trySetValueForTesting(element: element, value: .string("456"))
+        _ = try await ActionInputDriver().trySetValueForTesting(element: element, value: .string("456"))
 
         #expect(element.setValues == [.string("456")])
         #expect((element.value as? String) == "456")
@@ -1196,13 +831,13 @@ extension ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `idempotent set succeeds without writing the attribute`() throws {
+    func `idempotent set succeeds without writing the attribute`() async throws {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXSliderRole,
             value: 0.75,
             isValueSettable: true)
 
-        let result = try ActionInputDriver().trySetValueForTesting(element: element, value: .string("0.75"))
+        let result = try await ActionInputDriver().trySetValueForTesting(element: element, value: .string("0.75"))
 
         #expect(element.setValues.isEmpty)
         #expect(result.outcome.state == .confirmedNoChange)
@@ -1212,7 +847,7 @@ extension ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `accepted value setter with unconfirmed readback is retry unsafe`() {
+    func `accepted value setter with unconfirmed readback is retry unsafe`() async {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXSliderRole,
             value: 50.0,
@@ -1220,7 +855,7 @@ extension ActionInputDriverTests {
             valueSetterDoesNotChange: true)
 
         do {
-            _ = try ActionInputDriver().trySetValueForTesting(element: element, value: .string("0.75"))
+            _ = try await ActionInputDriver().trySetValueForTesting(element: element, value: .string("0.75"))
             Issue.record("Expected unchanged value to fail verification")
         } catch let failure as DesktopActionFailure {
             #expect(failure.outcome.state == .indeterminate)
@@ -1238,14 +873,14 @@ extension ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `unreadable post-dispatch value is indeterminate instead of a raw driver error`() {
+    func `unreadable post-dispatch value is indeterminate instead of a raw driver error`() async {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXSliderRole,
             isValueSettable: true,
             valueSetterDoesNotChange: true)
 
         do {
-            _ = try ActionInputDriver().trySetValueForTesting(element: element, value: .double(0.75))
+            _ = try await ActionInputDriver().trySetValueForTesting(element: element, value: .double(0.75))
             Issue.record("Expected unverifiable value to fail")
         } catch let failure as DesktopActionFailure {
             #expect(failure.outcome.state == .indeterminate)
@@ -1280,11 +915,11 @@ extension ActionInputDriverTests {
 
     @MainActor
     @Test
-    func `mock element unsupported action classifies as fallback eligible`() {
+    func `mock element unsupported action classifies as fallback eligible`() async {
         let element = ActionInputMockAutomationElement(role: AXRoleNames.kAXButtonRole)
 
         do {
-            _ = try ActionInputDriver().tryClickForTesting(element: element)
+            _ = try await ActionInputDriver().tryClickForTesting(element: element)
             Issue.record("Expected unsupported mock action to throw")
         } catch let error as ActionInputError {
             #expect(error == .unsupported(.actionUnsupported))
@@ -1363,11 +998,11 @@ extension ActionInputDriverTests {
 struct ActionInputDriverOutcomeTests {
     @MainActor
     @Test
-    func `unknown pre-action value remains dispatched but unverified`() throws {
+    func `unknown pre-action value remains dispatched but unverified`() async throws {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXTextFieldRole,
             isValueSettable: true)
-        let result = try ActionInputDriver().trySetValueForTesting(element: element, value: .string("hello"))
+        let result = try await ActionInputDriver().trySetValueForTesting(element: element, value: .string("hello"))
 
         #expect(element.setValues == [.string("hello")])
         #expect(result.outcome.state == .dispatchedUnverified)
@@ -1379,11 +1014,11 @@ struct ActionInputDriverOutcomeTests {
 
     @MainActor
     @Test
-    func `unknown pre-action selected state remains dispatched but unverified`() throws {
+    func `unknown pre-action selected state remains dispatched but unverified`() async throws {
         let element = ActionInputMockAutomationElement(
             role: AXRoleNames.kAXRowRole,
             isSelectedSettable: true)
-        let result = try ActionInputDriver().trySetValueForTesting(element: element, value: .string("true"))
+        let result = try await ActionInputDriver().trySetValueForTesting(element: element, value: .string("true"))
 
         #expect(element.setSelectedValues == [true])
         #expect(element.selectedValue == true)

@@ -43,7 +43,7 @@ Peekaboo resolves settings in this order (highest → lowest):
 | Auto daemon idle timeout | - | `PEEKABOO_DAEMON_IDLE_TIMEOUT_SECONDS` | Seconds before an auto-started daemon exits while idle (default 300). |
 | Tool allow-list | `tools.allow` | `PEEKABOO_ALLOW_TOOLS` | CSV or space list. If set, only these tools are exposed (env replaces config). |
 | Tool deny-list | `tools.deny` | `PEEKABOO_DISABLE_TOOLS` | CSV or space list. Always removed; env list is additive with config. |
-| UI input strategy | `input.*` | `PEEKABOO_INPUT_STRATEGY` and per-verb variants | Choose action invocation versus synthetic input. Built-in policy uses `actionFirst` for click/scroll and `synthFirst` for type/hotkey. |
+| UI input strategy | `input.*` | `PEEKABOO_INPUT_STRATEGY` and per-verb variants | Choose action invocation versus synthetic input. Built-in policy prefers actions for click/scroll/background typing and focused background Cmd+A; ordinary hotkeys and legacy SDK typing remain `synthFirst`. |
 | Element detection boxes | `visualizer.elementDetectionEnabled` | `PEEKABOO_VISUAL_ELEMENT_BOXES` | Draw a bounding box per accessibility element during `peekaboo see`. Default `false` (visually noisy); env var overrides config. The Peekaboo.app settings toggle writes the same config key. |
 
 ## GameBridge manifest budget
@@ -126,8 +126,17 @@ models.
 ## UI Input Strategy
 
 Input strategy controls whether UI interactions use accessibility action invocation or synthetic input. The built-in
-policy keeps the global default at `synthFirst`, flips click and scroll to `actionFirst`, keeps type and hotkey at
-`synthFirst`, and exposes `setValue`/`performAction` as action-only operations.
+policy keeps the global default, legacy SDK typing, and ordinary hotkeys at `synthFirst`, selects `actionFirst` for click,
+scroll, background typing, and focused background Cmd+A,
+and exposes `setValue`/`performAction` as action-only operations. An explicit global strategy overrides the built-in
+click/scroll/type/select-all preferences unless a more specific configured override wins.
+
+The Cmd+A built-in preference is limited to focused text selection: unsupported selection falls directly back to
+targeted events, never to a new process-menu action. Explicit global, hotkey, and per-app selections remain authoritative;
+synthetic choices skip AX selection entirely. The resolved policy records this separately as `backgroundSelectAllDefault`,
+not in the typing preference or generic hotkey override. Concrete SDK policies and older resolved JSON without the new
+preference retain their declared strategy. Action-based selection and menus do not implement key holding; choose a
+synthetic strategy when a physical hold is required.
 
 Precedence is `--input-strategy` CLI flag, then environment, then config file, then built-in default. The CLI flag forces local execution because the current bridge protocol does not forward per-call strategy overrides.
 
@@ -138,6 +147,31 @@ Valid values:
 - `actionOnly`: use action invocation only.
 - `synthOnly`: use synthetic input only.
 
+For background typing, `actionOnly` forbids keyboard events and both synthetic strategies skip AX value/selection
+edits. `actionFirst` falls back per unsupported unit, never after an accepted or uncertain write. Local native text
+edits can work with Accessibility alone; local Event Synthesizing permission is checked only before needed events.
+Bridge-hosted targeted typing still requires Post Event permission at admission, including native edits.
+
+The legacy SDK `type(text:target:clearExisting:typingDelay:snapshotId:)` keeps its shipped `synthFirst` default,
+including named-target focus and per-character keyboard delivery. Default calls do not probe AX replacement
+eligibility. Explicit global, type, and per-app strategies retain their existing precedence on both SDK and
+background paths. Direct AX replacement under an explicitly selected action strategy requires
+`clearExisting: true`, zero `typingDelay`, and a fresh check proving the named target is the current keyboard
+receiver; cached focus or a frontmost app/window alone is insufficient.
+A requested positive delay or a successfully read focus mismatch makes the action route unsupported:
+`actionFirst` uses the existing synthetic focus/clear/type path, while `actionOnly` refuses without dispatch.
+An unreadable or uncertain focus check instead stops before input under either action strategy, without fallback.
+Permission failures, `cannotComplete`, missing or malformed focus values, and timeouts are errors, not evidence
+that the target is unfocused. Explicit `synthFirst` and `synthOnly` retain their existing synthetic behavior.
+These SDK eligibility checks do not change the global/per-app strategy precedence or the CLI foreground
+action-array path.
+
+Zero-delay SDK replacement also requires bounded, same-process ancestry proving a native rather than web
+receiver. Known `AXWebArea` descendants take the existing keyboard route under `actionFirst` and refuse under
+`actionOnly`, before any AX value write; unprovable ancestry instead stops without input or fallback.
+This avoids treating AX value readback as proof of page input-event behavior and leaves explicit `set-value`
+semantics unchanged.
+
 Config example:
 
 ```json
@@ -146,7 +180,7 @@ Config example:
     "defaultStrategy": "synthFirst",
     "click": "actionFirst",
     "scroll": "actionFirst",
-    "type": "synthFirst",
+    "type": "actionFirst",
     "hotkey": "synthFirst",
     "setValue": "actionOnly",
     "performAction": "actionOnly",
@@ -174,6 +208,13 @@ CLI override:
 ```bash
 peekaboo click --on "$ELEMENT_ID" --input-strategy actionFirst
 ```
+
+When an input-policy override selects caller-local execution, combining that policy with `--bridge-socket`
+or `PEEKABOO_BRIDGE_SOCKET` fails with `BRIDGE_UNAVAILABLE`
+before constructing local services or sending input; Peekaboo does not silently ignore the selected host.
+Remove the CLI, environment, and config input-policy overrides to use that host, or pass `--no-remote`
+to deliberately run locally. Without an explicit socket, policy-local routing remains available. Concrete
+snapshot references still resolve their unique producer first; `--no-remote` restricts that check to the caller.
 
 ## Logging & Troubleshooting
 

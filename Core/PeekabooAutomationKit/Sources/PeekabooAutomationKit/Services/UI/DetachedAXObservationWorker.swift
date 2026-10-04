@@ -65,6 +65,7 @@ struct DetachedAXObservationResult: Sendable {
     let truncationInfo: DetectionTruncationInfo?
     var isApplicationScopedFallback = false
     var applicationScopedFallbackOrigin: ApplicationScopedAccessibilityFallbackOrigin?
+    var corroboratedFocusedElementID: String?
 }
 
 enum DetachedAXMultiAttributeReadDisposition: Equatable {
@@ -239,6 +240,13 @@ enum DetachedAXObservationWorker {
         validateIdentity: (_ request: DetachedAXObservationRequest) throws -> Void) throws
         -> DetachedAXObservationResult
     {
+        let diagnosticStart = AXObservationReadDiagnostics.start()
+        defer {
+            AXObservationReadDiagnostics.recordObservation(
+                startedAt: diagnosticStart,
+                processIdentifier: request.processIdentifier,
+                windowID: request.windowID)
+        }
         try validateIdentity(request)
         let deadline = ContinuousClock.now.advanced(by: .seconds(request.timing.cooperativeDeadlineSeconds))
         let application = AXUIElementCreateApplication(request.processIdentifier)
@@ -278,6 +286,17 @@ enum DetachedAXObservationWorker {
         let subrole = self.stringAttribute(kAXSubroleAttribute, of: window) ?? ""
         let identifier = self.stringAttribute(kAXIdentifierAttribute, of: window) ?? ""
         let isModal = self.boolAttribute(kAXModalAttribute, of: window)
+        let initialFocus: AXUIElement? = if !isApplicationScopedFallback,
+                                            request.windowID != nil,
+                                            request.windowMutationIdentity != nil,
+                                            request.expectedWindowBounds != nil
+        {
+            self.initialFocusedReference(deadline: deadline) {
+                self.focusedReference(application: application, timeout: $0)
+            }
+        } else {
+            nil
+        }
         var state = TraversalState()
         self.process(
             window,
@@ -288,8 +307,11 @@ enum DetachedAXObservationWorker {
                 source: nil),
             state: &state)
 
-        if request.includeMenuBarElements, request.appIsActive, ContinuousClock.now < deadline,
-           let menuBar = self.elementAttribute(kAXMenuBarAttribute, of: application)
+        if request.includeMenuBarElements, request.appIsActive,
+           let menuBar = self.readApplicationReference(
+               deadline: deadline,
+               applyTimeout: { AXUIElementSetMessagingTimeout(application, $0) == .success },
+               read: { self.elementAttribute(kAXMenuBarAttribute, of: application) })
         {
             self.process(
                 menuBar,
@@ -301,6 +323,26 @@ enum DetachedAXObservationWorker {
                 state: &state)
         }
 
+        let corroboratedFocus = self.corroboratedFocusElementID(
+            observation: (
+                initialReference: initialFocus,
+                candidates: state.focusedReferences,
+                isComplete: !isApplicationScopedFallback && state.truncationInfo?.isTruncated != true),
+            canRead: { self.remainingMessagingTimeout(until: deadline) != nil },
+            readCurrentReference: { self.focusedReference(application: application, deadline: deadline) },
+            referencesEqual: { CFEqual($0, $1) },
+            belongsToWindow: {
+                self.focusedElement(
+                    $0, belongsTo: window, processIdentifier: request.processIdentifier, deadline: deadline)
+            })
+        state.elements = self.attachingFocusedTextSelection(
+            observation: (
+                elements: state.elements,
+                references: state.focusedReferences,
+                corroboratedElementID: corroboratedFocus,
+                isComplete: !isApplicationScopedFallback && state.truncationInfo?.isTruncated != true),
+            request: request,
+            deadline: deadline)
         let partialFallback = isApplicationScopedFallback
             ? DetectionTruncationInfo(incompleteAccessibilityRead: true)
             : nil
@@ -331,7 +373,8 @@ enum DetachedAXObservationWorker {
                 isModal: isModal)),
             truncationInfo: DetectionTruncationInfo.merge(state.truncationInfo, partialFallback),
             isApplicationScopedFallback: isApplicationScopedFallback,
-            applicationScopedFallbackOrigin: applicationScopedFallbackOrigin)
+            applicationScopedFallbackOrigin: applicationScopedFallbackOrigin,
+            corroboratedFocusedElementID: corroboratedFocus)
         try validateIdentity(request)
         return result
     }
@@ -490,7 +533,7 @@ enum DetachedAXObservationWorker {
         state.visited.append(element)
 
         self.prepare(element, deadline: request.deadline)
-        let descriptorRead = self.descriptor(of: element)
+        let descriptorRead = self.descriptor(of: element, node: state.visited.count)
         switch self.nodeTraversalDisposition(
             descriptorAvailable: descriptorRead.descriptor != nil,
             readIncomplete: descriptorRead.isIncomplete)
@@ -526,11 +569,13 @@ enum DetachedAXObservationWorker {
             baseType: baseType,
             resolvedType: elementType)
         let exposesAction = self.actionableRoles.contains(normalizedRole) ||
-            (self.actionLookupRoles.contains(normalizedRole) && self.actions(of: element).contains(kAXPressAction))
+            (self.actionLookupRoles.contains(normalizedRole) &&
+                self.actions(of: element, node: state.visited.count).contains(kAXPressAction))
         let isValueSettable = self.valueSettable(
             of: element,
             role: descriptor.role,
             recoveredType: elementType,
+            node: state.visited.count,
             deadline: request.deadline)
         let isActionable = exposesAction || isValueSettable == true
         let elementID = request.source == nil ?
@@ -580,6 +625,10 @@ enum DetachedAXObservationWorker {
             isSelected: descriptor.isSelected,
             attributes: attributes))
 
+        if descriptor.isFocused == true, request.source != DetectedElementRootPolicy.applicationMenuBarSource {
+            state.focusedReferences[elementID] = element
+        }
+
         self.processChildren(of: element, request: request, state: &state)
     }
 
@@ -588,7 +637,7 @@ enum DetachedAXObservationWorker {
         request: TraversalRequest,
         state: inout TraversalState)
     {
-        let childrenRead = self.children(of: element)
+        let childrenRead = self.children(of: element, node: state.visited.count)
         state.incompleteAccessibilityRead = state.incompleteAccessibilityRead || childrenRead.isIncomplete
         let children = childrenRead.elements
         if children.count > request.budget.maxChildrenPerNode {
@@ -621,18 +670,29 @@ enum DetachedAXObservationWorker {
             }
         }
     }
+}
 
-    private static func descriptor(of element: AXUIElement) -> DescriptorReadResult {
+extension DetachedAXObservationWorker {
+    private static func descriptor(of element: AXUIElement, node: Int) -> DescriptorReadResult {
         var rawValues: CFArray?
+        let startedAt = AXObservationReadDiagnostics.start()
         let error = AXUIElementCopyMultipleAttributeValues(
             element,
             self.descriptorAttributeNames as CFArray,
             [],
             &rawValues)
         let values = rawValues as? [Any]
-        switch self.descriptorReadDisposition(error: error, values: values) {
+        let disposition = self.descriptorReadDisposition(error: error, values: values)
+        AXObservationReadDiagnostics.record(
+            .descriptorBatch,
+            startedAt: startedAt,
+            node: node,
+            error: error,
+            attributes: (self.descriptorAttributeNames, values),
+            disposition: disposition)
+        switch disposition {
         case .fallback:
-            return self.descriptorWithSingleReads(of: element)
+            return self.descriptorWithSingleReads(of: element, node: node)
         case .incomplete:
             return .incomplete
         case .values:
@@ -665,10 +725,10 @@ enum DetachedAXObservationWorker {
             keyboardShortcut: self.stringValue(byName["AXKeyboardShortcut"])))
     }
 
-    private static func descriptorWithSingleReads(of element: AXUIElement) -> DescriptorReadResult {
+    private static func descriptorWithSingleReads(of element: AXUIElement, node: Int) -> DescriptorReadResult {
         var valuesByName: [String: Any] = [:]
         for name in self.descriptorAttributeNames {
-            let read = self.rawAttributeRead(name, of: element)
+            let read = self.rawAttributeRead(name, of: element, node: node)
             if read.invalidatesNode(attribute: name) {
                 return .incomplete
             }
@@ -701,19 +761,28 @@ enum DetachedAXObservationWorker {
             keyboardShortcut: self.stringValue(valuesByName["AXKeyboardShortcut"])))
     }
 
-    private static func children(of element: AXUIElement) -> ChildrenReadResult {
+    private static func children(of element: AXUIElement, node: Int) -> ChildrenReadResult {
         var rawValues: CFArray?
+        let startedAt = AXObservationReadDiagnostics.start()
         let error = AXUIElementCopyMultipleAttributeValues(
             element,
             self.childAttributeNames as CFArray,
             [],
             &rawValues)
         let values = rawValues as? [Any]
-        switch self.childrenReadDisposition(error: error, values: values) {
+        let disposition = self.childrenReadDisposition(error: error, values: values)
+        AXObservationReadDiagnostics.record(
+            .childrenBatch,
+            startedAt: startedAt,
+            node: node,
+            error: error,
+            attributes: (self.childAttributeNames, values),
+            disposition: disposition)
+        switch disposition {
         case .fallback:
-            return self.fallbackChildren(of: element, alreadyIncomplete: false)
+            return self.fallbackChildren(of: element, node: node, alreadyIncomplete: false)
         case .incomplete:
-            return self.fallbackChildren(of: element, alreadyIncomplete: true)
+            return self.fallbackChildren(of: element, node: node, alreadyIncomplete: true)
         case .values:
             break
         }
@@ -731,17 +800,21 @@ enum DetachedAXObservationWorker {
 
     private static func fallbackChildren(
         of element: AXUIElement,
+        node: Int,
         alreadyIncomplete: Bool) -> ChildrenReadResult
     {
-        let read = self.rawAttributeRead(kAXChildrenAttribute, of: element)
+        let read = self.rawAttributeRead(kAXChildrenAttribute, of: element, node: node)
         return ChildrenReadResult(
             elements: read.value as? [AXUIElement] ?? [],
             isIncomplete: alreadyIncomplete || read.isIncomplete)
     }
 
-    private static func actions(of element: AXUIElement) -> [String] {
+    private static func actions(of element: AXUIElement, node: Int) -> [String] {
         var names: CFArray?
-        guard AXUIElementCopyActionNames(element, &names) == .success else { return [] }
+        let startedAt = AXObservationReadDiagnostics.start()
+        let error = AXUIElementCopyActionNames(element, &names)
+        AXObservationReadDiagnostics.record(.actions, startedAt: startedAt, node: node, error: error)
+        guard error == .success else { return [] }
         return names as? [String] ?? []
     }
 
@@ -749,16 +822,19 @@ enum DetachedAXObservationWorker {
         of element: AXUIElement,
         role: String,
         recoveredType: ElementType,
+        node: Int,
         deadline: ContinuousClock.Instant) -> Bool?
     {
         guard recoveredType == .textField || ElementClassifier.supportsValueMetadata(for: role) else { return nil }
         guard let timeout = self.remainingMessagingTimeout(until: deadline) else { return nil }
         AXUIElementSetMessagingTimeout(element, timeout)
         var isSettable = DarwinBoolean(false)
+        let startedAt = AXObservationReadDiagnostics.start()
         let error = AXUIElementIsAttributeSettable(
             element,
             kAXValueAttribute as CFString,
             &isSettable)
+        AXObservationReadDiagnostics.record(.valueSettable, startedAt: startedAt, node: node, error: error)
         return self.valueSettableMetadata(error: error, isSettable: isSettable.boolValue)
     }
 
@@ -767,8 +843,11 @@ enum DetachedAXObservationWorker {
         AXUIElementSetMessagingTimeout(element, timeout)
     }
 
-    private static func remainingMessagingTimeout(until deadline: ContinuousClock.Instant) -> Float? {
-        let duration = ContinuousClock.now.duration(to: deadline)
+    private static func remainingMessagingTimeout(
+        until deadline: ContinuousClock.Instant,
+        now: ContinuousClock.Instant = .now) -> Float?
+    {
+        let duration = now.duration(to: deadline)
         let components = duration.components
         let remaining = Double(components.seconds) +
             Double(components.attoseconds) / 1_000_000_000_000_000_000
@@ -781,9 +860,20 @@ enum DetachedAXObservationWorker {
         self.rawAttributeRead(name, of: element).value
     }
 
-    private static func rawAttributeRead(_ name: String, of element: AXUIElement) -> AXAttributeReadResult {
+    private static func rawAttributeRead(
+        _ name: String,
+        of element: AXUIElement,
+        node: Int = 0) -> AXAttributeReadResult
+    {
         var value: CFTypeRef?
+        let startedAt = AXObservationReadDiagnostics.start()
         let error = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        AXObservationReadDiagnostics.record(
+            .attribute,
+            startedAt: startedAt,
+            node: node,
+            error: error,
+            attributes: ([name], value.map { [$0] }))
         return AXAttributeReadResult(error: error, value: value)
     }
 
@@ -910,6 +1000,84 @@ enum DetachedAXObservationWorker {
     }
 }
 
+extension DetachedAXObservationWorker {
+    static func readApplicationReference<Reference>(
+        deadline: ContinuousClock.Instant,
+        now: ContinuousClock.Instant = .now,
+        applyTimeout: (Float) -> Bool,
+        read: () -> Reference?) -> Reference?
+    {
+        // The shared application reference may retain the initial focus probe's shorter timeout.
+        guard let timeout = self.remainingMessagingTimeout(until: deadline, now: now),
+              applyTimeout(timeout)
+        else { return nil }
+        return read()
+    }
+
+    static func initialFocusedReference<Reference>(
+        deadline: ContinuousClock.Instant,
+        now: ContinuousClock.Instant = .now,
+        read: (Float) -> Reference?) -> Reference?
+    {
+        guard let remaining = self.remainingMessagingTimeout(until: deadline, now: now) else { return nil }
+        // Optional corroboration must leave the ordinary traversal its original deadline.
+        let timeout = min(0.05, remaining / 4)
+        guard timeout >= 0.001 else { return nil }
+        return read(timeout)
+    }
+
+    static func corroboratedFocusElementID<Reference>(
+        observation: (initialReference: Reference?, candidates: [String: Reference], isComplete: Bool),
+        canRead: () -> Bool,
+        readCurrentReference: () -> Reference?,
+        referencesEqual: (Reference, Reference) -> Bool,
+        belongsToWindow: (Reference) -> Bool) -> String?
+    {
+        guard observation.isComplete, observation.candidates.count > 1,
+              let initialReference = observation.initialReference,
+              canRead(), let current = readCurrentReference(), canRead(),
+              referencesEqual(initialReference, current)
+        else { return nil }
+
+        let matches = observation.candidates.filter { referencesEqual($0.value, current) }
+        guard matches.count == 1, let candidate = matches.first,
+              canRead(), belongsToWindow(candidate.value), canRead()
+        else { return nil }
+        return candidate.key
+    }
+
+    private static func focusedReference(
+        application: AXUIElement,
+        deadline: ContinuousClock.Instant) -> AXUIElement?
+    {
+        self.readApplicationReference(
+            deadline: deadline,
+            applyTimeout: { AXUIElementSetMessagingTimeout(application, $0) == .success },
+            read: { DetachedExactWindowFocusReader.focusedElementReference(of: application) })
+    }
+
+    private static func focusedReference(application: AXUIElement, timeout: Float) -> AXUIElement? {
+        guard AXUIElementSetMessagingTimeout(application, timeout) == .success else { return nil }
+        return DetachedExactWindowFocusReader.focusedElementReference(of: application)
+    }
+
+    private static func focusedElement(
+        _ element: AXUIElement,
+        belongsTo window: AXUIElement,
+        processIdentifier: pid_t,
+        deadline: ContinuousClock.Instant) -> Bool
+    {
+        guard self.remainingMessagingTimeout(until: deadline) != nil else { return false }
+        var owner: pid_t = 0
+        guard AXUIElementGetPid(element, &owner) == .success, owner == processIdentifier,
+              let timeout = self.remainingMessagingTimeout(until: deadline),
+              AXUIElementSetMessagingTimeout(element, timeout) == .success,
+              let owningWindow = self.elementAttribute(kAXWindowAttribute, of: element)
+        else { return false }
+        return CFEqual(owningWindow, window)
+    }
+}
+
 private struct TraversalRequest {
     let depth: Int
     let deadline: ContinuousClock.Instant
@@ -974,6 +1142,7 @@ private struct AXAttributeReadResult {
 private struct TraversalState {
     var elements: [DetectedElement] = []
     var visited: [AXUIElement] = []
+    var focusedReferences: [String: AXUIElement] = [:]
     var maxDepthReached = false
     var maxElementCountReached = false
     var maxChildrenPerNodeReached = false

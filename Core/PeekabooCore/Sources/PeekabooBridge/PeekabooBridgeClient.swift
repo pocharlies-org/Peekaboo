@@ -35,6 +35,8 @@ struct PeekabooBridgeConnectedHostIdentity: Equatable, Sendable {
 
 // swiftlint:disable:next type_body_length
 public actor PeekabooBridgeClient {
+    typealias TransportEnqueue = @Sendable (Date, @escaping @Sendable () -> Void) -> Void
+
     let socketPath: String
     let maxResponseBytes: Int
     let requestTimeoutSec: TimeInterval
@@ -43,6 +45,7 @@ public actor PeekabooBridgeClient {
     let operationReceiptExportDirectory: URL?
     let trustedHostTeamIDs: Set<String>?
     let hostAuthentication: PeekabooBridgeClientHostAuthentication
+    let enqueueTransport: TransportEnqueue
     let logger = Logger(subsystem: "boo.peekaboo.bridge", category: "client")
     let operationClientInstanceID: UUID
     var actionProjectionEnabled = false
@@ -67,6 +70,7 @@ public actor PeekabooBridgeClient {
     var targetedClickAccessibilityValueDeliveryEnabled = false
     var requestPinnedExactWindowScrollReceiptEnabled = false
     var compositeTypeDeliveryEnabled = false
+    var desktopObservationInlinePixelsEnabled = false
     var operationAttestation: PeekabooBridgeListenerAttestation?
     var latestVerifiedOperationReceipt: PeekabooBridgeOperationReceipt?
     var latestVerifiedOperationReceiptBundle: PeekabooBridgeOperationReceiptBundle?
@@ -108,6 +112,7 @@ public actor PeekabooBridgeClient {
             explicit: trustedHostTeamIDs,
             socketPath: socketPath)
         self.hostAuthentication = .live
+        self.enqueueTransport = { _, operation in PeekabooBridgeBlockingIO.enqueue(operation) }
         let environmentDirectory = ProcessInfo.processInfo.environment["PEEKABOO_OPERATION_RECEIPT_DIRECTORY"]
             .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
         self.operationReceiptExportDirectory = operationReceiptExportDirectory ?? environmentDirectory
@@ -151,7 +156,10 @@ public actor PeekabooBridgeClient {
         operationReceiptExportDirectory: URL? = nil,
         operationClientInstanceID: UUID = UUID(),
         trustedHostTeamIDs: Set<String>?,
-        hostAuthentication: PeekabooBridgeClientHostAuthentication)
+        hostAuthentication: PeekabooBridgeClientHostAuthentication,
+        enqueueTransport: @escaping TransportEnqueue = { _, operation in
+            PeekabooBridgeBlockingIO.enqueue(operation)
+        })
     {
         self.socketPath = socketPath
         self.maxResponseBytes = maxResponseBytes
@@ -163,6 +171,7 @@ public actor PeekabooBridgeClient {
             explicit: trustedHostTeamIDs,
             socketPath: socketPath)
         self.hostAuthentication = hostAuthentication
+        self.enqueueTransport = enqueueTransport
         let environmentDirectory = ProcessInfo.processInfo.environment["PEEKABOO_OPERATION_RECEIPT_DIRECTORY"]
             .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
         self.operationReceiptExportDirectory = operationReceiptExportDirectory ?? environmentDirectory
@@ -472,6 +481,7 @@ public actor PeekabooBridgeClient {
         self.targetedClickAccessibilityValueDeliveryEnabled = false
         self.requestPinnedExactWindowScrollReceiptEnabled = false
         self.compositeTypeDeliveryEnabled = false
+        self.desktopObservationInlinePixelsEnabled = false
     }
 
     /// Creates or joins one successor-session handshake using the most recent successful public inputs.
@@ -720,6 +730,9 @@ public actor PeekabooBridgeClient {
             capabilities.append(PeekabooBridgeClientCapability.producerBoundSnapshotReferences)
             capabilities.append(PeekabooBridgeClientCapability.targetedClickAccessibilityValueDelivery)
         }
+        if protocolVersion >= PeekabooBridgeConstants.processGenerationBoundElementMutationsVersion {
+            capabilities.append(PeekabooBridgeClientCapability.setValueVerification)
+        }
         if protocolVersion >= PeekabooBridgeConstants.browserConnectionHandoffVersion {
             capabilities.append(PeekabooBridgeClientCapability.browserConnectionHandoff)
         }
@@ -868,6 +881,9 @@ public actor PeekabooBridgeClient {
             requestPinnedExactWindowScrollReceiptEnabled:
             Self.supportsRequestPinnedExactWindowScrollReceipt(handshake),
             compositeTypeDeliveryEnabled: Self.supportsCompositeTypeDelivery(handshake),
+            desktopObservationInlinePixelsEnabled: handshake.supportedOperations.contains(.desktopObservation) &&
+                handshake.hostCapabilities?
+                .contains(PeekabooBridgeHostCapability.desktopObservationInlinePixels) == true,
             listenerAttestation: authentication.listenerAttestation,
             listenerLiveIdentity: authentication.listenerLiveIdentity,
             sessionAttestation: authentication.sessionAttestation,
@@ -1185,6 +1201,7 @@ public actor PeekabooBridgeClient {
         self.requestPinnedExactWindowScrollReceiptEnabled =
             candidate.requestPinnedExactWindowScrollReceiptEnabled
         self.compositeTypeDeliveryEnabled = candidate.compositeTypeDeliveryEnabled
+        self.desktopObservationInlinePixelsEnabled = candidate.desktopObservationInlinePixelsEnabled
         self.operationAttestation = candidate.listenerAttestation
         self.installReceiptlessAuthenticatedHost(candidate.receiptlessAuthenticatedHost)
         if let listenerAttestation = candidate.listenerAttestation,
@@ -1490,6 +1507,7 @@ private struct PeekabooBridgeClientHandshakeCandidate: Sendable {
     let targetedClickAccessibilityValueDeliveryEnabled: Bool
     let requestPinnedExactWindowScrollReceiptEnabled: Bool
     let compositeTypeDeliveryEnabled: Bool
+    let desktopObservationInlinePixelsEnabled: Bool
     let listenerAttestation: PeekabooBridgeListenerAttestation?
     let listenerLiveIdentity: PeekabooBridgeLivePeerIdentity?
     let sessionAttestation: PeekabooBridgeOperationSessionAttestation?

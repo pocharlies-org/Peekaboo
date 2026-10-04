@@ -9,7 +9,7 @@ struct VerifyCommand: ErrorHandlingCommand, OutputFormattable, RuntimeBackedComm
     @OptionGroup var target: InteractionTargetOptions
     @Flag(help: "Require the target window to exist") var windowExists = false
     @Option(help: "Expected window bounds x,y,width,height[,tolerance]") var windowBounds: String?
-    @Option(help: "Element ID or role:label query") var on: String?
+    @Option(help: "Exact AXIdentifier or role:label selector") var on: String?
     @Flag(help: "Require the selected element to exist") var exists = false
     @Option(help: "Expected selected-element value") var valueEquals: String?
     @Flag(help: "Require the selected element to be enabled") var enabled = false
@@ -27,10 +27,13 @@ struct VerifyCommand: ErrorHandlingCommand, OutputFormattable, RuntimeBackedComm
         discussion: """
         Poll fresh native state until every predicate is stable. This replaces sleep-based polling.
         Results are satisfied, unsatisfied, or unknown; unknown never implies success.
+        --on matches an app's AXIdentifier or role:label, not a snapshot-local element ID.
+        From see --json, use data.ui_elements[].identifier rather than data.ui_elements[].id.
 
         Examples:
           peekaboo verify --app Safari --window-exists
           peekaboo verify --app Safari --on button:Reload --exists --enabled --json
+          peekaboo verify --app Playground --on basic-text-field --value-equals Ready --json
         """
     )
 
@@ -39,10 +42,13 @@ struct VerifyCommand: ErrorHandlingCommand, OutputFormattable, RuntimeBackedComm
         self.logger.setJsonOutputMode(self.jsonOutput)
 
         do {
+            try runtime.requireCompatibleHost()
             let arguments = try await self.makeArguments()
             let context = Self.makeToolContext(using: runtime)
             let tool = VerifyStateTool(context: context)
-            let response = try await context.execute(tool: tool, arguments: ToolArguments(raw: arguments))
+            let response = try await self.withScreenshotCaptureEngine(using: runtime) {
+                try await context.execute(tool: tool, arguments: ToolArguments(raw: arguments))
+            }
             guard !response.isError else {
                 try MCPToolCommandOutput.output(
                     tool: tool.name,
@@ -91,6 +97,29 @@ struct VerifyCommand: ErrorHandlingCommand, OutputFormattable, RuntimeBackedComm
             snapshotMutationCoordinator: runtime.toolSnapshotMutationCoordinator,
             capturePreflightRefusal: runtime.toolCapturePreflightRefusal
         )
+    }
+
+    func withScreenshotCaptureEngine<T: Sendable>(
+        using runtime: CommandRuntime,
+        operation: @MainActor () async throws -> T
+    ) async throws -> T {
+        guard self.screenshot != nil,
+              runtime.configuration.captureEnginePreference != nil || runtime.captureEngineSafetyOverride != nil
+        else { return try await operation() }
+        let capture = runtime.services.screenCapture
+        guard let engineAware = capture as? any EngineAwareScreenCaptureServiceProtocol else {
+            throw ValidationError("The selected capture service cannot honor a capture-engine override.")
+        }
+        let preference = try CaptureCommandOptionParser.enginePreference(
+            cliValue: nil,
+            configuredValue: runtime.configuration.captureEnginePreference,
+            kind: .window,
+            gateOwner: capture.captureTransactionGateOwner,
+            supportsEngineScope: true
+        )
+        return try await engineAware.withCaptureEngine(runtime.captureEngineSafetyOverride ?? preference ?? .auto) {
+            try await operation()
+        }
     }
 
     private func makeArguments() async throws -> [String: Any] {

@@ -55,7 +55,7 @@ extension DialogService {
     }
 
     public func enterText(_ request: DialogLegacyInputExecutionRequest) async throws -> DialogActionResult {
-        try await self.operationLaneCoordinator.run(scope: .global, access: .write) {
+        try await self.runDialogOperation(scope: .global, access: .write) {
             let plan = try await self.prepareForegroundDialogPlan(
                 windowTitle: request.windowTitle,
                 appName: request.appName)
@@ -73,7 +73,7 @@ extension DialogService {
     }
 
     public func enterText(_ request: DialogInputExecutionRequest) async throws -> DialogActionResult {
-        try await self.operationLaneCoordinator.run(scope: .global, access: .write) {
+        try await self.runDialogOperation(scope: .global, access: .write) {
             let candidates = try await self.targetedDialogCandidates(
                 target: request.target,
                 membership: .structuralMutation)
@@ -102,7 +102,7 @@ extension DialogService {
     public func enterTextForegroundCompatible(
         _ request: DialogInputExecutionRequest) async throws -> DialogActionResult
     {
-        try await self.operationLaneCoordinator.run(scope: .global, access: .write) {
+        try await self.runDialogOperation(scope: .global, access: .write) {
             let candidates = try await self.targetedDialogCandidates(
                 target: request.target,
                 membership: .structuralMutation)
@@ -433,13 +433,9 @@ extension DialogService {
     }
 
     static func dialogSelectedTextRange(_ field: Element) -> CFRange? {
-        guard let rawValue = field.rawAttributeValue(named: AXAttributeNames.kAXSelectedTextRangeAttribute),
-              CFGetTypeID(rawValue as CFTypeRef) == AXValueGetTypeID()
+        guard let value = field.rawAttributeValue(named: AXAttributeNames.kAXSelectedTextRangeAttribute)
         else { return nil }
-        let value = unsafeDowncast(rawValue as CFTypeRef, to: AXValue.self)
-        guard AXValueGetType(value) == .cfRange else { return nil }
-        var range = CFRange(location: 0, length: 0)
-        return AXValueGetValue(value, .cfRange, &range) ? range : nil
+        return TextSelectionRange(nativeValue: value as CFTypeRef)?.nativeRange
     }
 
     static func sameDialogTextRange(_ lhs: CFRange?, _ rhs: CFRange?) -> Bool {
@@ -685,7 +681,7 @@ extension DialogService {
     }
 
     func forceDismissDialog(windowTitle: String?, appName: String?) async throws -> DialogActionResult {
-        try await self.operationLaneCoordinator.run(scope: Self.forcedDismissMutationScope, access: .write) {
+        try await self.runDialogOperation(scope: Self.forcedDismissMutationScope, access: .write) {
             let plan = try await self.prepareForegroundDialogPlan(windowTitle: windowTitle, appName: appName)
             return try await self.executeForcedDialogDismiss(
                 plan: plan,
@@ -694,7 +690,7 @@ extension DialogService {
     }
 
     public func forceDismissDialog(_ request: DialogForcedDismissExecutionRequest) async throws -> DialogActionResult {
-        try await self.operationLaneCoordinator.run(scope: Self.forcedDismissMutationScope, access: .write) {
+        try await self.runDialogOperation(scope: Self.forcedDismissMutationScope, access: .write) {
             let candidates = try await self.targetedDialogCandidates(
                 target: request.target,
                 membership: .structuralMutation)

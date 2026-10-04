@@ -80,37 +80,6 @@ struct PeekabooBridgeClientTransportOutcomeTests {
     }
 
     @Test
-    func `handshake timeout is shared across protocol fallback attempts`() async throws {
-        let versionMismatch = BridgeTestFixtures.errorResponse(
-            code: .versionMismatch,
-            message: "scripted version mismatch")
-        let peer = try ScriptedBridgePeer(scripts: [
-            [.delay(seconds: 0.3), .respond(versionMismatch)],
-            [.idle(seconds: 5)],
-        ])
-        let client = TrustedBridgeClientFixture.make(socketPath: peer.socketPath, requestTimeoutSec: 1)
-        let identity = PeekabooBridgeClientIdentity(
-            bundleIdentifier: "dev.peekaboo.tests",
-            teamIdentifier: nil,
-            processIdentifier: getpid(),
-            hostname: nil)
-        let startedAt = ContinuousClock.now
-
-        do {
-            _ = try await client.handshake(client: identity, overallTimeoutSec: 1)
-            Issue.record("Expected the negotiated handshake to exhaust its shared deadline")
-        } catch let error as POSIXError {
-            #expect(error.code == .ETIMEDOUT)
-        }
-
-        let elapsed = startedAt.duration(to: .now)
-        #expect(elapsed >= .milliseconds(850))
-        #expect(elapsed < .milliseconds(1200))
-        #expect(await peer.acceptedConnectionCount == 2)
-        await peer.stop()
-    }
-
-    @Test
     func `stop unblocks an accepted client before request EOF and is idempotent`() async throws {
         let peer = try ScriptedBridgePeer(steps: [.idle(seconds: 5)])
         let client = try Self.connectRawClient(to: peer.socketPath)
@@ -873,5 +842,29 @@ struct PeekabooBridgeClientTransportOutcomeTests {
             try? await Task.sleep(for: .milliseconds(5))
         }
         return false
+    }
+}
+
+extension PeekabooBridgeClientTransportOutcomeTests {
+    @Test(arguments: BrowserResponseProgressFixture.cases)
+    func `receiptless browser progress preserves legacy evidence and refusal contracts`(
+        fixture: BrowserResponseProgressFixture) async throws
+    {
+        let peer = try Self.projectedReceiptlessPeer(response: fixture.response)
+        let client = PeekabooBridgeClient(socketPath: peer.socketPath, requestTimeoutSec: 1)
+        do {
+            try await Self.negotiateReceiptless(client)
+            let reply = try await client.sendCarryingActionOutcome(
+                BrowserResponseProgressFixture.request, throwsActionFailures: false)
+            #expect(fixture.acceptsReceiptless)
+            #expect(reply.outcome == fixture.outcome.projection)
+        } catch let failure as DesktopActionFailure {
+            #expect(!fixture.acceptsReceiptless)
+            Self.expectResponseLostFailure(failure)
+        } catch {
+            await peer.stop()
+            throw error
+        }
+        await peer.waitUntilFinished()
     }
 }

@@ -295,6 +295,7 @@ extension AgentCommand {
                 dryRun: self.dryRun,
                 queueMode: request.queueMode,
                 eventDelegate: streamingDelegate,
+                enhancementOptions: self.enhancementOptions,
                 requestedToolExecutionPolicy: request.requestedToolExecutionPolicy
             )
             self.displayResult(result, delegate: outputDelegate)
@@ -306,12 +307,12 @@ extension AgentCommand {
                 )
             }
             if outputDelegate?.hasReceivedError != true {
-                self.printAgentExecutionError("Failed to resume session: \(error.localizedDescription)")
+                self.printAgentExecutionError("Failed to resume session: \(error.localizedDescription)", error: error)
             }
             throw ExitCode.failure
         } catch {
             if outputDelegate?.hasReceivedError != true {
-                self.printAgentExecutionError("Failed to resume session: \(error.localizedDescription)")
+                self.printAgentExecutionError("Failed to resume session: \(error.localizedDescription)", error: error)
             }
             throw ExitCode.failure
         }
