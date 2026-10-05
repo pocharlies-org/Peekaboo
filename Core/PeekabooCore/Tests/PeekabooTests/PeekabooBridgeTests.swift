@@ -2493,6 +2493,31 @@ class StubAutomationService: TargetedHotkeyServiceProtocol, TargetedTypeServiceP
     ElementActionAutomationServiceProtocol, TargetedFocusedElementServiceProtocol,
     ExactWindowTargetedKeyboardServiceProtocol
 {
+    var supportsTextSelection = false
+    var textSelectionCalls = 0
+    var textSelectionOverride: TextSelectionResult?
+
+    func selectText(
+        target: String,
+        request: TextSelectionRequest,
+        snapshotId: String?) async throws -> UIAutomationActionResult<ElementActionResult>
+    {
+        self.textSelectionCalls += 1
+        if let elementActionError {
+            throw elementActionError
+        }
+        return try UIAutomationActionResult(
+            payload: .init(
+                target: target,
+                actionName: "AXSelectedTextRange",
+                anchorPoint: nil,
+                textSelection: self.textSelectionOverride ?? request.resolve(in: request.text)),
+            outcome: .confirmedChange(
+                delivery: .init(mechanism: .accessibilityValue, mode: .background),
+                unitCount: .one),
+            targetIdentity: self.uiAutomationOutcomeTargetIdentity)
+    }
+
     var supportsSetValueResultTargetBinding = true
     var supportsProcessGenerationBoundElementMutations = true
     var dragError: (any Error)?
@@ -2500,7 +2525,7 @@ class StubAutomationService: TargetedHotkeyServiceProtocol, TargetedTypeServiceP
     let supportsProcessGenerationPinnedTypeActions = true
     let supportsProcessGenerationPinnedClicks = true
     let supportsStatelessClickVariants = true
-    let supportsExactWindowTargetedKeyboard = true
+    var supportsExactWindowTargetedKeyboard = true
     var supportsExactWindowCompositeTypeDelivery: Bool {
         true
     }
@@ -2569,6 +2594,8 @@ class StubAutomationService: TargetedHotkeyServiceProtocol, TargetedTypeServiceP
         defaultResponse: .outcome(StubAutomationService.defaultActionOutcome))
     var uiAutomationOutcomeTargetIdentity: DesktopTargetIdentity?
     var supportsRequestPinnedExactWindowScrollReceipt = true
+    var supportsBackgroundCoordinateScroll = false
+    var scrollRequests: [ScrollRequest] = []
     var allowsContradictoryOutcomeTargetIdentityForTesting = false
     var actionOutcome = StubAutomationService.defaultActionOutcome {
         didSet {
@@ -2819,7 +2846,7 @@ class StubAutomationService: TargetedHotkeyServiceProtocol, TargetedTypeServiceP
     }
 
     func scroll(_ request: ScrollRequest) async throws {
-        _ = request
+        self.scrollRequests.append(request)
     }
 
     func hotkey(keys _: String, holdDuration _: Int) async throws {}

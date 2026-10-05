@@ -184,9 +184,7 @@ struct PeekabooBridgeTypedResultReceiptBindingTests {
             capturedBounds: fixture.windowIdentity.capturedBounds)
         let contradictorySelectors = [
             WindowContext(applicationName: "Other", windowID: fixture.windowIdentity.windowID),
-            WindowContext(
-                applicationName: "/Applications/Other.app",
-                windowID: fixture.windowIdentity.windowID),
+            WindowContext(applicationName: "/Applications/Other.app", windowID: fixture.windowIdentity.windowID),
             WindowContext(
                 applicationName: "/Applications/Fixture.app/Contents/MacOS/other",
                 windowID: fixture.windowIdentity.windowID),
@@ -195,6 +193,7 @@ struct PeekabooBridgeTypedResultReceiptBindingTests {
                 applicationProcessId: fixture.windowIdentity.ownerProcessIdentifier + 1,
                 windowID: fixture.windowIdentity.windowID),
             WindowContext(windowTitle: "Other", windowID: fixture.windowIdentity.windowID),
+            WindowContext(windowTitle: "", windowID: fixture.windowIdentity.windowID),
             WindowContext(windowID: fixture.windowIdentity.windowID + 1),
             WindowContext(
                 windowID: fixture.windowIdentity.windowID,
@@ -612,6 +611,37 @@ struct PeekabooBridgeTypedResultReceiptBindingTests {
 }
 
 extension PeekabooBridgeTypedResultReceiptBindingTests {
+    @Test
+    func `accessibility prefix units stay separate from requested key counts`() throws {
+        typealias Mechanism = DesktopActionOutcome.Delivery.Mechanism
+        for prefixUnits in 0...1 {
+            let rule = PeekabooBridgeOperationResultSemantics.TypeActionResultRule(
+                actions: [.key(.return)],
+                additionalAccessibilityUnits: prefixUnits)
+            #expect(rule.dispatchUnits == .exact(1 + prefixUnits))
+            for units in 1...3 {
+                for mechanism in [Mechanism.windowTargetedEvents, .accessibilityValue, .composite] {
+                    let outcome = try DesktopActionOutcome.dispatchedUnverified(
+                        delivery: .init(mechanism: mechanism, mode: .background),
+                        evidence: .deliveryAccepted,
+                        unitCount: #require(DesktopActionOutcome.DispatchUnitCount(units)))
+                    let expectedMechanism: Mechanism = prefixUnits == 0 ? .windowTargetedEvents : .composite
+                    let expected = units == 1 + prefixUnits && mechanism == expectedMechanism
+                    for specialKeyPresses: Int? in [nil, 1] {
+                        #expect(rule.accepts(
+                            keyPresses: 1,
+                            specialKeyPresses: specialKeyPresses,
+                            outcome: outcome) == expected)
+                        #expect(!rule.accepts(
+                            keyPresses: 2,
+                            specialKeyPresses: specialKeyPresses,
+                            outcome: outcome))
+                    }
+                }
+            }
+        }
+    }
+
     @Test
     func `bounded dispatch ranges preserve enumerated count semantics`() {
         typealias Units = PeekabooBridgeOperationResultSemantics.UnitPolicy

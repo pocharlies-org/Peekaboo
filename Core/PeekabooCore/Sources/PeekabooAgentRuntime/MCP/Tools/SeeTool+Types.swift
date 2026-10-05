@@ -13,6 +13,7 @@ struct SeeRequest {
     let annotate: Bool
     let ocr: Bool
     let webFocus: Bool
+    let fresh: Bool
     let traversalBudget: AXTraversalBudget
     let roi: CaptureRegionOfInterest?
     let includeElements: Bool
@@ -26,6 +27,14 @@ struct SeeRequest {
         self.annotate = arguments.getBool("annotate") ?? false
         self.ocr = arguments.getBool("ocr") ?? false
         self.webFocus = arguments.getBool("web_focus") ?? false
+        switch arguments.getValue(for: "fresh") {
+        case nil:
+            self.fresh = false
+        case let .bool(value)?:
+            self.fresh = value
+        default:
+            throw PeekabooError.invalidInput("fresh must be a boolean")
+        }
         self.includeElements = arguments.getBool(ObservedElementTableMetadata.argumentName) ?? false
         if let rawROI = arguments.getString("roi")?.trimmingCharacters(in: .whitespacesAndNewlines),
            !rawROI.isEmpty
@@ -152,9 +161,9 @@ struct SeeSummaryBuilder {
         lines.append(contentsOf: self.selectionSummaries)
         lines.append(contentsOf: self.truncationWarningLines())
         lines.append("")
-        lines.append(contentsOf: self.elementSection())
+        lines.append(contentsOf: SeeElementTextFormatter.section(self.elements))
         lines.append("")
-        lines.append("Use opaque element IDs for interaction only when the element is marked actionable.")
+        lines.append(SeeElementTextFormatter.interactionHint)
         return lines.joined(separator: "\n")
     }
 
@@ -177,28 +186,8 @@ struct SeeSummaryBuilder {
         return lines
     }
 
-    private func elementSection() -> [String] {
-        let elementsByRole = Dictionary(grouping: self.elements, by: { $0.role })
-        var lines = ["UI Elements:"]
-        for (role, roleElements) in elementsByRole.sorted(by: { $0.key < $1.key }) {
-            lines.append("")
-            lines.append(self.roleHeader(role: role, elements: roleElements))
-            lines.append(contentsOf: roleElements.map(self.describeElement))
-        }
-        return lines
-    }
-
-    private func roleHeader(role: String, elements: [UIElement]) -> String {
-        let actionableCount = elements.count(where: { $0.isActionable })
-        return "\(role) (\(elements.count) found, \(actionableCount) actionable):"
-    }
-
     private func truncationWarningLines() -> [String] {
         guard let truncationInfo, truncationInfo.isTruncated else { return [] }
         return ["", truncationInfo.automationToolRemediationMessage(budget: self.traversalBudget)]
-    }
-
-    private func describeElement(_ element: UIElement) -> String {
-        SeeElementTextFormatter.describe(element)
     }
 }

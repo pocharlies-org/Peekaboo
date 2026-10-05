@@ -75,6 +75,26 @@ test('primary app automation examples stay exact-window and background-only', ()
   assert.match(automation, /^peekaboo type .*--app Safari --window-id 12345$/m);
 });
 
+test('Playground examples use fresh snapshots and owned v4 targets', () => {
+  const guide = read('docs/playground-testing.md');
+  const commands = [...guide.matchAll(/```bash\n([\s\S]*?)```/g)]
+    .map((match) => match[1].replace(/\\\n\s*/g, ' '))
+    .join('\n');
+
+  assert.match(commands, /window list --pid "\$PLAYGROUND_PID" --json/);
+  assert.doesNotMatch(commands, /"\$PEEKABOO_BIN" list\b/);
+  assert.match(commands, /click --on "\$BUTTON_ID" --snapshot "\$SNAPSHOT_ID" --json/);
+  assert.doesNotMatch(commands, /"\$PEEKABOO_BIN" window focus\b/);
+  assert.match(commands, /app quit --pid "\$PLAYGROUND_PID"\s+--expected-process-start-identity/);
+  assert.match(guide, /type "Hello World" --snapshot "\$FOCUSED_SNAPSHOT_ID" --json/);
+  assert.match(guide, /may already have changed the receiver, even if the command exits nonzero/);
+  assert.match(guide, /filters by subsystem\/category, not an exact process/);
+
+  const playground = read('Apps/Playground/README.md');
+  assert.match(playground, /After signing and verifying the intended artifact/);
+  assert.match(playground, /^open -g -n .*Playground\.app$/m);
+});
+
 test('bundled skill never advertises app/PID-only background press', () => {
   const skill = read('skills/peekaboo/SKILL.md');
   const targetedPressExamples = skill
@@ -216,7 +236,8 @@ test('generated guidance sources retain CLI and policy distinctions', () => {
 
   assert.match(learn, /fresh exact non-dialog snapshot form/);
   assert.match(learn, /dialog input.*background AXValue/);
-  assert.match(learn, /Foreground-only CLI pointer.*move and drag require explicit `--foreground` consent/);
+  assert.match(learn, /Foreground-only CLI pointer.*move and cross-window drag require explicit `--foreground` consent/);
+  assert.match(learn, /Background drag.*one fresh explicit snapshot window/);
   assert.doesNotMatch(learn, /\*\*UI Automation\*\*:.*\bdrag\b/);
   assert.doesNotMatch(learn, /\*\*System\*\*:\s*shell/);
   assert.doesNotMatch(learn, /type --app/);
@@ -226,6 +247,25 @@ test('generated guidance sources retain CLI and policy distinctions', () => {
   assert.match(typeTool, /explicit fresh exact non-dialog snapshot receipt/);
   assert.match(pressMetadata, /Agent\/MCP background-only policy/);
   assert.match(pressMetadata, /never infers latest/);
+});
+
+test('drag guidance exposes bounded background delivery without implying effect verification', () => {
+  for (const path of [
+    'skills/peekaboo/SKILL.md',
+    'docs/quickstart.md',
+    'docs/focus.md',
+    'docs/security.md',
+    'docs/commands/tools.md',
+  ]) {
+    const source = read(path);
+    assert.match(source, /(?:Background `drag`|[Bb]ounded linear|`drag`: bounded linear)/, path);
+    assert.match(source, /unverified.*retry-unsafe/s, path);
+    assert.doesNotMatch(source, /all move\/drag operations require explicit foreground mode/, path);
+    assert.doesNotMatch(source, /such as `move` and `drag`, are omitted/, path);
+  }
+  const drag = read('docs/commands/drag.md');
+  assert.match(drag, /Background element IDs resolve immediately/);
+  assert.match(drag, /Only foreground mode may omit `--snapshot`/);
 });
 
 test('security and local-test guidance retain exact background exceptions', () => {

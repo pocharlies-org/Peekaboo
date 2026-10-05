@@ -82,7 +82,8 @@ final class RecordingActionInputDriver: ActionInputDriving {
     func tryScroll(
         element _: AutomationElement,
         direction _: PeekabooFoundation.ScrollDirection,
-        pages _: Int) throws -> UIInputExecutionResult.Action
+        pages _: Int,
+        scrollBarScope _: ScrollBarSearchScope) throws -> UIInputExecutionResult.Action
     {
         Issue.record("Action driver should not be called")
         return UIInputExecutionResult.Action(outcome: .confirmedNoChange())
@@ -307,9 +308,25 @@ final class ActionInputMockAutomationElement: AutomationElementRepresenting, @un
     var setValues: [UIElementValue] = []
     var setFocusedValues: [Bool] = []
     var setSelectedValues: [Bool] = []
+    var isTextSelectionSettable = false
+    var textSelectionRange: TextSelectionRange?
+    var selectionWrites: [TextSelectionRange] = []
+    var selectionWrite: ((TextSelectionRange) throws -> Bool)?
+    var automationOwnedScrollBars: [any AutomationElementRepresenting] = []
+    private(set) var childrenReadCount = 0
+
+    func setAutomationTextSelection(_ range: TextSelectionRange) throws -> Bool {
+        self.selectionWrites.append(range)
+        if let selectionWrite {
+            return try selectionWrite(range)
+        }
+        self.textSelectionRange = range
+        return true
+    }
 
     var automationChildren: [any AutomationElementRepresenting] {
-        self.children
+        self.childrenReadCount += 1
+        return self.children
     }
 
     init(

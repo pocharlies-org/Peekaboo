@@ -113,6 +113,18 @@ final class StubScreenCaptureService: ScreenCaptureServiceProtocol {
 @MainActor
 class StubAutomationService: TargetedHotkeyServiceProtocol, TargetedTypeServiceProtocol,
 ExactWindowTargetedClickServiceProtocol, ElementActionAutomationServiceProtocol {
+    var supportsTextSelection: Bool {
+        false
+    }
+
+    func selectText(
+        target: String,
+        request: TextSelectionRequest,
+        snapshotId: String?
+    ) async throws -> UIAutomationActionResult<ElementActionResult> {
+        throw DesktopActionFailure.preDispatchRefusal(reason: .runtimeIncompatible, message: "Selection unsupported")
+    }
+
     var supportsSetValueResultTargetBinding: Bool {
         false
     }
@@ -595,8 +607,11 @@ ExactWindowTargetedClickServiceProtocol, ElementActionAutomationServiceProtocol 
         )
     }
 
+    var currentMouseLocationCalls = 0
+
     func currentMouseLocation() -> CGPoint? {
-        self.stubCurrentMouseLocation
+        self.currentMouseLocationCalls += 1
+        return self.stubCurrentMouseLocation
     }
 
     func getFocusedElement() -> UIFocusInfo? {
@@ -1376,7 +1391,7 @@ final class StubSpaceService: SpaceCommandSpaceService {
     let spaces: [SpaceInfo]
     let windowSpaces: [Int: [SpaceInfo]]
     var switchCalls: [CGSSpaceID] = []
-    var switchOutcome: DesktopActionOutcome = .dispatchedUnverified(
+    var switchOutcome: DesktopActionOutcome? = .dispatchedUnverified(
         delivery: .init(mechanism: .nativeFramework, mode: .foreground),
         evidence: .deliveryAccepted,
         unitCount: .one

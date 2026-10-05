@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import PeekabooAgentRuntimeTestSupport
 import PeekabooFoundation
 import PeekabooFoundationTestSupport
 import Tachikoma
@@ -10,6 +11,10 @@ import Testing
 
 @MainActor
 struct AgentToolMCPFailureSemanticsTests {
+    init() throws {
+        try AuthorityTestSupport.prepare()
+    }
+
     @Test
     func `Canonical outcomes drive custom tool trace classification without reconstruction`() throws {
         for (index, outcome) in DesktopActionOutcomeFixtures.canonicalOutcomes.enumerated() {
@@ -493,7 +498,7 @@ struct AgentToolMCPFailureSemanticsTests {
                     "reason": AnyAgentToolValue(string: oversizedWhitespace),
                 ]),
             ]))
-        let service = try PeekabooAgentService(services: PeekabooServices())
+        let service = try AuthorityTestSupport.agent(services: AuthorityTestSupport.services())
         #expect(AgentToolResultSemantics.normalizedClaims(from: boundaryResult.result).turnBoundary == .invalid)
         #expect(AgentToolResultSemantics.isFailure(boundaryResult))
         #expect(service.turnBoundarySignal(from: boundaryResult) == .stopAgent(
@@ -604,17 +609,18 @@ struct AgentToolMCPFailureSemanticsTests {
     func `Nonconfirmed MCP success cannot become a successful terminal observation`() async throws {
         let outcome = DesktopActionOutcome.refused(reason: .permissionDenied)
         let response = try ToolResponse.text("incorrect success", meta: Value(outcome.projection))
-        let service = try PeekabooAgentService(services: PeekabooServices())
-        let tool = PeekabooAgentService.$toolConstructionExecutionPolicy.withValue(.unrestricted) {
-            service.makeAgentTool(from: AgentFailureProbeTool(name: "see", response: response))
-        }
+        let service = try AuthorityTestSupport.agent(services: AuthorityTestSupport.services())
+        let tool = PeekabooAgentService.$toolConstructionExecutionAuthority
+            .withValue(.init(basePolicy: .unrestricted)) {
+                service.makeAgentTool(from: AgentFailureProbeTool(name: "see", response: response))
+            }
         let call = AgentToolCall(id: "nonconfirmed-see", name: "see", arguments: [:])
         let context = PeekabooAgentService.ToolHandlingContext(
             model: .anthropic(.sonnet45),
             tools: [tool],
             eventHandler: nil,
             sessionId: "nonconfirmed-success",
-            executionPolicy: .unrestricted)
+            executionAuthority: .init(basePolicy: .unrestricted))
         var messages: [ModelMessage] = []
 
         let step = try await service.handleToolCalls(
@@ -707,17 +713,18 @@ struct AgentToolMCPFailureSemanticsTests {
                 "blob": .data(mimeType: "application/octet-stream", Data([9, 8, 7])),
                 "details": .string(oversized),
             ]))
-        let service = try PeekabooAgentService(services: PeekabooServices())
-        let tool = PeekabooAgentService.$toolConstructionExecutionPolicy.withValue(.unrestricted) {
-            service.makeAgentTool(from: AgentFailureProbeTool(response: response))
-        }
+        let service = try AuthorityTestSupport.agent(services: AuthorityTestSupport.services())
+        let tool = PeekabooAgentService.$toolConstructionExecutionAuthority
+            .withValue(.init(basePolicy: .unrestricted)) {
+                service.makeAgentTool(from: AgentFailureProbeTool(response: response))
+            }
         let call = AgentToolCall(id: "typed-refusal", name: "click", arguments: [:])
         let context = PeekabooAgentService.ToolHandlingContext(
             model: .anthropic(.sonnet45),
             tools: [tool],
             eventHandler: nil,
             sessionId: "typed-failure-session",
-            executionPolicy: .unrestricted)
+            executionAuthority: .init(basePolicy: .unrestricted))
         var messages: [ModelMessage] = []
 
         let step = try await service.handleToolCalls(
@@ -798,7 +805,7 @@ struct AgentToolMCPFailureSemanticsTests {
 
     @Test
     func `Agent policy refusal is typed and traced as skipped before dispatch`() async throws {
-        let service = try PeekabooAgentService(services: PeekabooServices())
+        let service = try AuthorityTestSupport.agent(services: AuthorityTestSupport.services())
         let call = AgentToolCall(
             id: "policy-refusal",
             name: "press",
@@ -808,7 +815,7 @@ struct AgentToolMCPFailureSemanticsTests {
             tools: [],
             eventHandler: nil,
             sessionId: "policy-refusal-session",
-            executionPolicy: .backgroundOnly)
+            executionAuthority: .backgroundOnly)
         var messages: [ModelMessage] = []
 
         let step = try await service.handleToolCalls(
@@ -856,6 +863,40 @@ struct AgentToolMCPFailureSemanticsTests {
     private static func value(_ projection: DesktopActionOutcome.Projection) throws -> AnyAgentToolValue {
         let data = try JSONEncoder().encode(projection)
         return try AnyAgentToolValue.fromJSON(JSONSerialization.jsonObject(with: data))
+    }
+}
+
+extension AgentToolMCPFailureSemanticsTests {
+    @Test
+    func `Reusing normalized claims preserves failure classification`() throws {
+        let confirmed = try Self.value(DesktopActionOutcome.confirmedChange(delivery: .init(
+            mechanism: .accessibilityAction, mode: .background)).projection)
+        let refused = try Self.value(DesktopActionOutcome.refused(reason: .permissionDenied).projection)
+        var malformed = try #require(confirmed.objectValue)
+        malformed["effect"] = AnyAgentToolValue(string: "refused")
+        var conflicting = try #require(confirmed.objectValue)
+        conflicting["metadata"] = refused
+        var values = try DesktopActionOutcomeFixtures.canonicalOutcomes.map { try Self.value($0.projection) }
+        values += [
+            AnyAgentToolValue(string: "ordinary result"),
+            AnyAgentToolValue(string: "Error: legacy failure"),
+            AnyAgentToolValue(object: ["success": AnyAgentToolValue(bool: false)]),
+            AnyAgentToolValue(object: ["success": AnyAgentToolValue(string: "false")]),
+            AnyAgentToolValue(object: malformed),
+            AnyAgentToolValue(object: conflicting),
+        ]
+        for value in values {
+            let claims = AgentToolResultSemantics.normalizedClaims(from: value)
+            for isError in [false, true] {
+                let result = AgentToolResult(toolCallId: "claims", result: value, isError: isError)
+                #expect(AgentToolResultSemantics.isFailure(result, claims: claims) ==
+                    AgentToolResultSemantics.isFailure(result))
+            }
+        }
+        let typed = AgentToolResult(toolCallId: "typed", failure: AgentToolExecutionFailure(
+            message: "typed execution failure", metadata: confirmed))
+        #expect(AgentToolResultSemantics.isFailure(
+            typed, claims: AgentToolResultSemantics.normalizedClaims(from: typed.result)))
     }
 }
 

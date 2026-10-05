@@ -22,6 +22,7 @@ read_when:
 | `--no-cache` | Run ephemerally without saving a resumable session. Cannot be combined with resume/list flags. |
 | `--no-desktop-context` | Skip new automatic desktop-context collection for this run, chat, or resume invocation. Saved conversation history, tool access, and UI authority are unchanged. |
 | `--allow-foreground` | Human opt-in for this invocation to use foreground/global UI routes. New sessions persist it as an immutable maximum; each later resume must opt in again. It never exposes the Shell tool. |
+| `--allow-temporary-clipboard` | Human opt-in for bounded temporary base64 paste to a fresh exact snapshot, without granting foreground UI. New sessions store a maximum; every resume needs the flag again. |
 | `--quiet` / `--simple` / `--no-color` / `--debug-terminal` | Control output mode; the command auto-detects terminal capabilities when you don’t override it. |
 | `--audio` / `--audio-file <path>` | Use microphone input or pipe audio from disk. |
 
@@ -78,7 +79,23 @@ read_when:
 - Background-only Agent typing requires an explicit fresh exact non-dialog snapshot; an optional element ID must come
   from that snapshot. Snapshot typing cannot include competing app/PID/window selectors. Direct-text paste
   remains available through a generation-pinned app/PID/window authorization with a canonical background result.
-  Targetless, foreground, current-clipboard, and binary paste remain refused.
+  Targetless, foreground, current-clipboard, and binary paste remain refused by default.
+- `--allow-temporary-clipboard` independently admits `paste` with `dataBase64` + `uti`, a fresh exact non-dialog,
+  non-system-UI `snapshot`, and optional `alsoText` and `restore_delay_ms` (`0...10000`, default `150`). The data and
+  text companion together are limited to 10 MB. This form rejects app/PID/window selectors, file/image paths,
+  `allowLarge`, ambient current-clipboard paste, persistent clipboard writes, and foreground UI. Direct-text paste
+  keeps its existing app/PID/window route and does not use the clipboard. A remote rich-paste host must negotiate
+  protocol 1.41 and prepared clipboard-guarded delivery; there is no fallback to a weaker route.
+- Temporary clipboard permission briefly changes the General clipboard and requires silent read permission and a
+  complete prior snapshot. Cleanup restores only while Peekaboo still owns the write generation and preserves a
+  newer copy. Prepared input remains unverified and retry-unsafe, even after cleanup; observe the exact receiver
+  before continuing and never blindly replay it. A failure after claiming the clipboard may truthfully retain a
+  global/foreground-mode `clipboard_transaction` outcome without any input target or count. The UI authority remains
+  background-only; the grant never permits accepted foreground input.
+- Saved clipboard maxima are optional additive session data (missing means false), not signed permission. A normal
+  resume grants nothing regardless of stored prompts, metadata, or edited JSON. A fresh flag cannot exceed the saved
+  maximum. Legacy foreground maxima already include clipboard capability. Nested Agent and protocol-1.31 managed
+  Agent launches continue to use background-only authority without this grant.
 - Foreground permission never exposes the Shell tool. Normal Agent toolsets omit `shell`, and the execution boundary
   still refuses it after `--allow-foreground`. Foreground UI authority is not a process sandbox: a trusted prompt can
   operate terminal or scripting apps through their UI, so grant `--allow-foreground` only to trusted prompts. Use
@@ -134,6 +151,10 @@ read_when:
   [Ollama guide](../providers/ollama.md).
 - Native tool observations appear once in Agent context, with action safety metadata and verification receipts
   preserved separately. Existing saved sessions remain readable; this does not compact or discard observation history.
+- For `see` and `inspect_ui`, provider requests use `meta.ui_elements` as the canonical element listing only when
+  re-rendering that table exactly reproduces the complete human listing. Headers, warnings, interaction guidance, and
+  all other metadata remain intact. Ambiguous, incomplete, mismatched, and error results pass through unchanged.
+  This request-only projection does not alter raw MCP/CLI output, execution traces, saved history, or observation frequency.
 
 ### JSON execution trace
 
@@ -155,6 +176,9 @@ derived from the same bounded, privacy-safe argument projection as the execution
 descriptions or runtime addresses. Calls beyond the trace limit and any call/trace mismatch use
 `{"redacted":true}` rather than raw provider arguments.
 
+Live tool-start and tool-update argument previews also redact `dataBase64` payloads, including incomplete streamed
+values, before display. This changes presentation only; the authorized tool still receives the supplied payload.
+
 `executionTrace.entries[].arguments` is a JSON object rather than the legacy string preview. Trace arguments are
 bounded and allowlist only audit-relevant targeting, delivery modes, action enums, timeouts, predicate kinds, and safe
 boolean controls. Content-bearing and unknown values are represented by typed redaction summaries, including typed or
@@ -175,6 +199,11 @@ Tool results blocked by pending snapshot cleanup retain `snapshot_invalidation.t
 an earlier mutation; inspect current state and distinguish cleanup retries from newly dispatched input.
 Browser-provider metadata is filtered and namespaced before projection, including results from legacy read-only
 clients, so provider-authored cleanup or action claims cannot become Peekaboo-owned receipts.
+
+Authorized paste errors retain the content-free `clipboard_cleanup_status` in model-facing tool-error results and
+structured failure metadata: `restored`, `preserved_newer_contents`, or `not_needed`. The final JSON execution trace
+keeps its smaller status-summary allowlist and does not include this field. Cleanup status does not confirm paste input
+or change its retry safety, and prior clipboard contents are not included.
 
 Mutating trace entries expose `mutationDispatch` as `dispatched`, `not_dispatched`, or `possibly_dispatched`.
 `mutation_dispatched` is retained in the bounded result summary only when the tool explicitly reported the legacy
