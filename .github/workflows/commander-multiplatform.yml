@@ -16,6 +16,7 @@ permissions:
 
 jobs:
   macos-host:
+    # 2026-10-05 devops · fuera de pool: no existe hardware de esa plataforma en el clúster (skill ci-runners-arc, INFRA-548)
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -29,6 +30,7 @@ jobs:
         run: swift test
 
   apple-simulators:
+    # 2026-10-05 devops · fuera de pool: no existe hardware de esa plataforma en el clúster (skill ci-runners-arc, INFRA-548)
     runs-on: macos-26
     needs: macos-host
     strategy:
@@ -60,7 +62,7 @@ jobs:
             --sdk "$SDK_PATH"
 
   linux:
-    runs-on: ubuntu-24.04
+    runs-on: arc-k8s
     needs: macos-host
     steps:
       - uses: actions/checkout@v7

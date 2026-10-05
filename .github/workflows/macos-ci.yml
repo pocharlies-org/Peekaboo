@@ -16,6 +16,7 @@ concurrency:
 jobs:
   peekaboo-core:
     name: PeekabooCore build & tests
+    # 2026-10-05 devops · fuera de pool: no existe hardware de esa plataforma en el clúster (skill ci-runners-arc, INFRA-548)
     runs-on: macos-26
     env:
       PEEKABOO_INCLUDE_AUTOMATION_TESTS: "false"
@@ -381,6 +382,7 @@ jobs:
 
   peekaboo-cli:
     name: Peekaboo CLI build & tests
+    # 2026-10-05 devops · fuera de pool: no existe hardware de esa plataforma en el clúster (skill ci-runners-arc, INFRA-548)
     runs-on: macos-26
     env:
       PEEKABOO_INCLUDE_AUTOMATION_TESTS: "false"
@@ -592,6 +594,7 @@ jobs:
 
   tachikoma:
     name: Tachikoma build & tests
+    # 2026-10-05 devops · fuera de pool: no existe hardware de esa plataforma en el clúster (skill ci-runners-arc, INFRA-548)
     runs-on: macos-26
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -695,6 +698,7 @@ jobs:
 
   mac-apps:
     name: Build macOS apps (Peekaboo + Inspector)
+    # 2026-10-05 devops · fuera de pool: no existe hardware de esa plataforma en el clúster (skill ci-runners-arc, INFRA-548)
     runs-on: macos-26
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -782,6 +786,7 @@ jobs:
 
   lint:
     name: SwiftLint (core + CLI)
+    # 2026-10-05 devops · fuera de pool: no existe hardware de esa plataforma en el clúster (skill ci-runners-arc, INFRA-548)
     runs-on: macos-26
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -8,6 +8,7 @@ permissions:
 
 jobs:
   extracted-artifact-smoke:
+    # 2026-10-05 devops · fuera de pool: no existe hardware de esa plataforma en el clúster (skill ci-runners-arc, INFRA-548)
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
