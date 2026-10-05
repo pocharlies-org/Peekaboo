@@ -68,6 +68,7 @@ public enum PeekabooBridgeOperation: String, Codable, Sendable, CaseIterable, Ha
     case exactWindowPixelFocusType
     case foregroundModifierClick
     case setValue
+    case selectText
     case performAction
     case scroll
     case targetedScroll
@@ -76,6 +77,7 @@ public enum PeekabooBridgeOperation: String, Codable, Sendable, CaseIterable, Ha
     case exactWindowTargetedHotkey
     case createExactWindowHeldPointerOwner
     case beginExactWindowHeldPointer
+    case exactWindowDrag
     case releaseExactWindowHeldPointer
     case revokeExactWindowHeldPointer
     case disconnectExactWindowHeldPointerOwner
@@ -170,6 +172,9 @@ public enum PeekabooBridgeOperation: String, Codable, Sendable, CaseIterable, Ha
         with version: PeekabooBridgeProtocolVersion) -> Set<Self>
     {
         var compatible = operations
+        if version < PeekabooBridgeConstants.textSelectionVersion {
+            compatible.remove(.selectText)
+        }
         if version < PeekabooBridgeProtocolVersion(major: 1, minor: 1) {
             compatible.remove(.targetedHotkey)
         }
@@ -265,6 +270,9 @@ public enum PeekabooBridgeOperation: String, Codable, Sendable, CaseIterable, Ha
                 .revokeExactWindowHeldPointer,
                 .disconnectExactWindowHeldPointerOwner,
             ])
+        }
+        if version < PeekabooBridgeConstants.exactWindowDragVersion {
+            compatible.remove(.exactWindowDrag)
         }
         if version < PeekabooBridgeConstants.agentExecutionTraceVersion {
             compatible.remove(.agentExecutionTrace)
@@ -378,6 +386,7 @@ public enum PeekabooBridgeHostCapability {
     public static let backgroundBridgeHost = "backgroundBridgeHost"
     public static let desktopObservationOCR = "desktopObservationOCR"
     public static let desktopObservationCaptureEngine = "desktopObservationCaptureEngine"
+    public static let desktopObservationFreshAccessibilityTree = "desktopObservationFreshAccessibilityTree"
     public static let desktopObservationInlinePixels = "desktopObservationInlinePixels"
     // Old clients require successful preparation as well as implemented ownership support.
     public static let screenCaptureKitProcessOwnership = "screenCaptureKitProcessOwnership"
@@ -402,14 +411,19 @@ public enum PeekabooBridgeHostCapability {
     public static let attestedOperationReceipts = "attestedOperationReceipts"
     public static let plannerInventoryTransport = "plannerInventoryTransport"
     public static let exactWindowHeldPointerLifecycle = "exactWindowHeldPointerLifecycle"
+    public static let exactWindowDrag = "exactWindowDrag"
     public static let statelessClickVariants = "statelessClickVariants"
     public static let agentExecutionTrace = "agentExecutionTrace"
     public static let processGenerationObservation = "processGenerationObservation"
     public static let certificationProducerAttestation = "certificationProducerAttestation"
     public static let setValueResultTargetBinding = "setValueResultTargetBinding"
+    public static let textSelection = "textSelection"
     public static let foregroundModifierClickSnapshotLease = "foregroundModifierClickSnapshotLease"
     public static let requestPinnedExactWindowScrollReceipt = "requestPinnedExactWindowScrollReceipt"
+    public static let backgroundCoordinateScroll = "backgroundCoordinateScroll"
     public static let compositeTypeDelivery = "compositeTypeDelivery"
+    public static let clipboardGuardedExactWindowHotkeys = "clipboardGuardedExactWindowHotkeys"
+    public static let preparedClipboardGuardedExactWindowHotkeys = "preparedClipboardGuardedExactWindowHotkeys"
 }
 
 /// Stable raw capabilities a client may offer during handshake. Raw strings keep additions
@@ -443,6 +457,58 @@ public struct PeekabooBridgeHandshakeResponse: Codable, Sendable {
     public let operationAttestation: PeekabooBridgeListenerAttestation?
     /// Listener-signed, peer-bound replay session for protocol 1.29 requests.
     public let operationSessionAttestation: PeekabooBridgeOperationSessionAttestation?
+
+    /// Feature support only; existing request-scoped operation and permission gates still apply.
+    public var supportsDesktopObservationFreshAccessibilityTree: Bool {
+        self.hostCapabilities?
+            .contains(PeekabooBridgeHostCapability.desktopObservationFreshAccessibilityTree) == true &&
+            self.supportedOperations.contains(.desktopObservation)
+    }
+
+    public var supportsTargetedScroll: Bool {
+        self.negotiatedVersion >= PeekabooBridgeProtocolVersion(major: 1, minor: 11) &&
+            self.supportedOperations.contains(.targetedScroll) &&
+            (self.enabledOperations ?? self.supportedOperations).contains(.targetedScroll)
+    }
+
+    public var supportsRequestPinnedExactWindowScrollReceipt: Bool {
+        self.negotiatedVersion >= PeekabooBridgeConstants.requestPinnedExactWindowScrollReceiptVersion &&
+            self.hostCapabilities?.contains(PeekabooBridgeHostCapability.attestedOperationReceipts) == true &&
+            self.hostCapabilities?
+            .contains(PeekabooBridgeHostCapability.requestPinnedExactWindowScrollReceipt) == true &&
+            self.supportsTargetedScroll
+    }
+
+    /// Negotiated feature support; authentication and live request admission remain transport/server-owned.
+    public var supportsBackgroundCoordinateScroll: Bool {
+        self.supportsRequestPinnedExactWindowScrollReceipt &&
+            self.negotiatedVersion >= PeekabooBridgeConstants.backgroundCoordinateScrollVersion &&
+            self.hostCapabilities?.contains(PeekabooBridgeHostCapability.backgroundCoordinateScroll) == true
+    }
+
+    /// Negotiated drag support; authentication and live request admission remain transport/server-owned.
+    public var supportsExactWindowDrag: Bool {
+        self.negotiatedVersion >= PeekabooBridgeConstants.exactWindowDragVersion &&
+            self.hostCapabilities?.contains(PeekabooBridgeHostCapability.exactWindowDrag) == true &&
+            self.hostCapabilities?.contains(PeekabooBridgeHostCapability.attestedOperationReceipts) == true &&
+            self.supportedOperations.contains(.exactWindowDrag) &&
+            (self.enabledOperations ?? self.supportedOperations).contains(.exactWindowDrag)
+    }
+
+    public var supportsClipboardGuardedExactWindowHotkeys: Bool {
+        self.negotiatedVersion >= PeekabooBridgeConstants.clipboardGuardedExactWindowHotkeyVersion &&
+            self.hostCapabilities?.contains(PeekabooBridgeHostCapability.clipboardGuardedExactWindowHotkeys) == true &&
+            self.hostCapabilities?.contains(PeekabooBridgeHostCapability.attestedOperationReceipts) == true &&
+            self.supportedOperations.contains(.exactWindowTargetedHotkey) &&
+            (self.enabledOperations ?? self.supportedOperations).contains(.exactWindowTargetedHotkey)
+    }
+
+    public var supportsPreparedClipboardGuardedExactWindowHotkeys: Bool {
+        self.supportsClipboardGuardedExactWindowHotkeys &&
+            self.negotiatedVersion >= PeekabooBridgeConstants.preparedClipboardGuardedExactWindowHotkeyVersion &&
+            self.hostCapabilities?
+            .contains(PeekabooBridgeHostCapability.preparedClipboardGuardedExactWindowHotkeys) == true
+    }
 
     public init(
         negotiatedVersion: PeekabooBridgeProtocolVersion,

@@ -1,4 +1,5 @@
 import Commander
+import PeekabooFoundation
 import Testing
 @testable import PeekabooCLI
 
@@ -31,11 +32,40 @@ struct CommandHelpRendererTests {
     }
 
     @Test
+    func `press help explains macOS key names without promising xdotool compatibility`() {
+        let expected = KeyboardChord.syntaxHelp
+        let explicit = PressCommand.commanderSignature()
+        let reflected = CommandSignature.describe(PressCommand()).flattened()
+        let help = PressCommand.helpMessage().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+
+        #expect(explicit.arguments.first?.help == expected)
+        #expect(reflected.arguments.first?.help == expected)
+        #expect(help.contains("delete (also Delete, backspace or del) erases backward"))
+        #expect(help.contains("forwarddelete/forward_delete erase forward"))
+        #expect(help.contains("Use cmd/command for Command, not super"))
+        #expect(!help.contains("matches xdotool"))
+    }
+
+    @Test
     func `root app help distinguishes a background readiness probe from foreground launch`() {
         let help = AppCommand.helpMessage()
 
         #expect(help.contains("Verify an already-running application without dispatching a launch"))
         #expect(help.contains("Launch or open an application with explicit foreground consent"))
+    }
+
+    @Test
+    func `deprecated no focus help does not promise a background launch`() {
+        let expected = "Deprecated no-op compatibility flag; default only verifies an already-running app"
+        let help = AppCommand.LaunchSubcommand.helpMessage()
+        let explicit = AppCommand.LaunchSubcommand.commanderSignature()
+        let reflected = CommandSignature.describe(AppCommand.LaunchSubcommand()).flattened()
+
+        #expect(help.contains("--no-focus"))
+        #expect(help.contains(expected))
+        #expect(!help.contains("background launch is now the default"))
+        #expect(explicit.flags.first { $0.label == "noFocus" }?.help == expected)
+        #expect(reflected.flags.first { $0.label == "noFocus" }?.help == expected)
     }
 
     @Test

@@ -47,10 +47,50 @@ enum MCPDesktopActionSnapshotInvalidator {
 }
 
 enum MCPElementActionSnapshotAuthority {
-    static func expectedTargetIdentity(_ snapshot: UISnapshot) throws -> DesktopTargetIdentity {
+    @MainActor
+    static func withConfirmedMutation(
+        snapshot: UISnapshot,
+        expectedTarget: DesktopTargetIdentity,
+        context: MCPToolContext,
+        operation: String,
+        mutate: () async throws -> UIAutomationActionResult<ElementActionResult>,
+        validateResult: (UIAutomationActionResult<ElementActionResult>) throws -> Void = { _ in }) async throws
+        -> (result: UIAutomationActionResult<ElementActionResult>, invalidatedSnapshotID: String?)
+    {
+        let result = try await context.snapshots.withSnapshotMutation(
+            snapshotId: snapshot.id,
+            targetIdentity: expectedTarget,
+            operation: {
+                let result = try await mutate()
+                _ = try UIAutomationActionResultSemantics.requireAcceptedOutcome(
+                    result,
+                    policy: .confirmed(requiring: .background),
+                    targetRequirement: .compatible(expectedTarget),
+                    operation: operation)
+                try validateResult(result)
+                return result
+            },
+            outcome: { $0.outcome })
+        let invalidatedSnapshotID = await MCPDesktopActionSnapshotInvalidator.invalidate(
+            uiSnapshots: context.uiSnapshots,
+            snapshotID: snapshot.id,
+            outcome: result.outcome)
+        return (result, invalidatedSnapshotID)
+    }
+
+    static func expectedTargetIdentity(
+        _ snapshot: UISnapshot,
+        requireExactWindow: Bool = false) throws -> DesktopTargetIdentity
+    {
+        let receipt: SnapshotTargetReceipt
         do {
-            let identity = try snapshot.targetReceipt().requireIdentity()
-            return try DesktopTargetIdentity(processIdentity: identity.processIdentity)
+            receipt = try snapshot.targetReceipt()
+            if !requireExactWindow {
+                return try DesktopTargetIdentity(processIdentity: receipt.requireIdentity().processIdentity)
+            }
+            if case .invalidated = receipt.targetEvidence {
+                _ = try receipt.requireIdentity()
+            }
         } catch {
             throw DesktopActionFailure.preDispatchRefusal(
                 reason: .targetUnavailable,
@@ -59,5 +99,13 @@ enum MCPElementActionSnapshotAuthority {
                 causeDescription: error.localizedDescription,
                 standardErrorCode: .snapshotStale)
         }
+        guard let exactWindow = receipt.identity?.exactWindow else {
+            throw DesktopActionFailure.preDispatchRefusal(
+                reason: .invalidRequest,
+                message: "Text selection requires a fresh exact-window snapshot.",
+                hint: "Run 'see' or 'inspect_ui' with window_id, then retry with that fresh exact-window snapshot.",
+                standardErrorCode: .invalidInput)
+        }
+        return DesktopTargetIdentity(exactWindow: exactWindow)
     }
 }

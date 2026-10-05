@@ -147,6 +147,7 @@ struct ElementActionCommandResult: Codable {
     let actionName: String?
     let oldValue: String?
     let newValue: String?
+    let textSelection: TextSelectionResult?
     let executionTime: TimeInterval
 }
 
@@ -157,6 +158,7 @@ struct ElementActionCommandContext {
     let deliveryMechanism: DesktopActionOutcome.Delivery.Mechanism
     let target: InteractionTargetOptions
     let focusOptions: FocusCommandOptions
+    var requireExactWindow = false
 }
 
 @MainActor
@@ -220,7 +222,8 @@ enum ElementActionCommandExecutor {
             )
             let expectedActionTarget = try await self.requireActionTargetIdentity(
                 snapshotID: actionSnapshotId,
-                snapshots: services.snapshots
+                snapshots: services.snapshots,
+                requireExactWindow: context.requireExactWindow
             )
             let startTime = Date()
             runtime.beginInteractionMutation()
@@ -285,6 +288,7 @@ enum ElementActionCommandExecutor {
                 actionName: compositeResult.payload.actionName,
                 oldValue: compositeResult.payload.oldValue,
                 newValue: compositeResult.payload.newValue,
+                textSelection: compositeResult.payload.textSelection,
                 executionTime: Date().timeIntervalSince(startTime)
             )
             render(
@@ -358,13 +362,23 @@ enum ElementActionCommandExecutor {
 
     private static func requireActionTargetIdentity(
         snapshotID: String,
-        snapshots: any SnapshotManagerProtocol
+        snapshots: any SnapshotManagerProtocol,
+        requireExactWindow: Bool
     ) async throws -> DesktopTargetIdentity {
+        let receipt: SnapshotTargetReceipt
         do {
-            return try await SnapshotTargetReceiptPlanner(snapshots: snapshots)
-                .planProcessIdentity(snapshotID: snapshotID)
-                .receipt
-                .requireIdentity()
+            if requireExactWindow {
+                receipt = try await SnapshotTargetReceiptPlanner(snapshots: snapshots)
+                    .plan(snapshotID: snapshotID).receipt
+                if case .invalidated = receipt.targetEvidence {
+                    _ = try receipt.requireIdentity()
+                }
+            } else {
+                return try await SnapshotTargetReceiptPlanner(snapshots: snapshots)
+                    .planProcessIdentity(snapshotID: snapshotID)
+                    .receipt
+                    .requireIdentity()
+            }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -375,5 +389,14 @@ enum ElementActionCommandExecutor {
                 reason: .targetUnavailable
             )
         }
+        guard let identity = receipt.identity, identity.exactWindow != nil else {
+            throw PreDispatchActionError(
+                message: "Text selection requires a fresh exact-window snapshot.",
+                code: .INVALID_INPUT,
+                hint: "Run 'peekaboo see --window-id <id>' and retry with its fresh snapshot.",
+                reason: .invalidRequest
+            )
+        }
+        return identity
     }
 }

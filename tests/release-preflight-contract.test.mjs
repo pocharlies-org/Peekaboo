@@ -741,8 +741,10 @@ assert.equal(process.env.RELEASE_PREFLIGHT_COMPLETED, 'false');
 assert.equal(process.env.RELEASE_PUBLICATION_ELIGIBLE, 'false');
 assert.equal(process.env.PEEKABOO_REQUIRE_UNIVERSAL, '1');
 assert.equal(process.env.MAC_RELEASE_CODESIGN_IDENTITY, 'fixture-release-identity');
-assert.deepEqual(process.argv.slice(2), process.env.FIXTURE_REUSE === 'true'
-  ? ['--no-build', '--bin', join(projectRoot, 'peekaboo')] : []);
+const preflightArgs = process.env.FIXTURE_REUSE === 'true'
+  ? ['--no-build', '--bin', join(projectRoot, 'peekaboo')] : [];
+assert.deepEqual(process.argv.slice(2), process.env.FIXTURE_RELEASE_BRANCH === 'true'
+  ? [...preflightArgs, '--force'] : preflightArgs);
 const original = { ...process.env };
 function spawnSync(command, args, options) {
   assert.deepEqual(args.slice(-2), ['pnpm', 'test']);
@@ -781,7 +783,7 @@ process.exit(passed ? 0 : 37);
   printf 'gate-pre-native-clean=true fixture-node-dispatch=true\\n'
   command /usr/bin/env "\${forwarded[@]}"
 }
-SKIP_CHECKS=false UNIVERSAL=true REUSE_BUILT_CLI="$FIXTURE_REUSE"
+SKIP_CHECKS=false UNIVERSAL=true REUSE_BUILT_CLI="$FIXTURE_REUSE" RELEASE_FROM_BRANCH="\${FIXTURE_RELEASE_BRANCH:-false}"
 PROJECT_ROOT="$PWD" CLI_SIGN_IDENTITY=fixture-release-identity
 CREATE_GITHUB_RELEASE=true PUBLISH_NPM=true
 BLUE='' RED='' GREEN='' NC=''
@@ -789,13 +791,13 @@ ${gate}
 ${eligibility}
 `);
   for (const reuse of ['false', 'true']) {
-    for (const childExit of [0, 37]) {
+    for (const [childExit, releaseBranch] of [[0, 'false'], [37, 'false'], [0, 'true']]) {
       const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-p', 'gate.sh'], {
         cwd: fixture.root, encoding: 'utf8',
         env: { ...fixture.env, FIXTURE_REUSE: reuse, FIXTURE_CHILD_EXIT: String(childExit),
-          FIXTURE_GATE_COMMAND: process.execPath }
+          FIXTURE_RELEASE_BRANCH: releaseBranch, FIXTURE_GATE_COMMAND: process.execPath }
       });
-      t.diagnostic(JSON.stringify({ lane: 'driver-gate', reuse, childExit, status: result.status,
+      t.diagnostic(JSON.stringify({ lane: 'driver-gate', reuse, childExit, releaseBranch, status: result.status,
         stdout: result.stdout, stderr: result.stderr }));
       // The sanitizer preserves 37; the existing driver deliberately maps a
       // failed complete preflight to release exit 1 and never grants eligibility.

@@ -139,6 +139,28 @@ macOS runtime baseline. Release runtime verification rejects that strong import 
 reused binaries and extracted archives. Weak imports remain distinct; this does not weak-link the Swift runtime or
 replace system libraries. Successful execution on the build host alone does not prove older-macOS compatibility.
 
+Runtime verification also audits every strong `libswift*` import per architecture by parsing the
+installed SDK's Swift `.tbd` files at verification time, following re-exports transitively. Weak imports
+and bundled `libswiftCompatibility*` libraries are excluded; undefined symbols without a two-level
+source library fail closed. Swift symbols imported from frameworks such as Foundation and SwiftUI are
+outside this audit. Generated export data is intentionally not checked in.
+
+The audit selects the oldest installed macOS SDK at or above the highest slice's minimum macOS version
+and older than macOS 27. It records the SDK version, build, full path, and export digest with each
+successful audit. Hosts may legitimately select different SDKs: an older eligible SDK is stricter and
+still correct, and the record line makes proofs comparable. The macOS 27 limit is a deliberate code
+constant, `BASELINE_MUST_PREDATE`, protecting against the macOS 27-only symbol behind #831; raise it only
+deliberately, when no older SDK can be provisioned on release hosts.
+
+When no eligible SDK is installed, verification fails closed. Release and signed-build hosts need
+Command Line Tools or Xcode providing such an SDK, for example CLT's `MacOSX26.5.sdk`. A host with only
+macOS 27 SDKs cannot weaken this gate.
+
+A 26.x SDK proves compatibility with that runtime, not every release down to the macOS 15.0 deployment
+target. Symbols introduced between 15.0 and the selected SDK remain guarded by compiler availability
+checking. A host with a macOS 15 SDK, for example from Xcode 16, automatically audits more strictly
+because the oldest eligible SDK wins.
+
 ## Tachikoma integration
 
 The internal CLI and Mac app consume the committed Tachikoma submodule revision. The tracked consumer

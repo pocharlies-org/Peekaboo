@@ -73,6 +73,18 @@ extension PeekabooBridgeServer {
             usesAttestedOperationReceipts: supportsAttestedOperationReceipts)
         var advertisedOps = compatibleOperations.advertised.sorted { $0.rawValue < $1.rawValue }
         var enabledOps = compatibleOperations.enabled
+        if (self.services.automation as? any ExactWindowTargetedKeyboardServiceProtocol)?
+            .supportsExactWindowTargetedKeyboard != true,
+            !supportsAttestedOperationReceipts ||
+            negotiated < PeekabooBridgeConstants.clipboardGuardedExactWindowHotkeyVersion
+        {
+            advertisedOps.removeAll { $0 == .exactWindowTargetedHotkey }
+            enabledOps.remove(.exactWindowTargetedHotkey)
+        }
+        if !supportsAttestedOperationReceipts {
+            advertisedOps.removeAll { $0 == .exactWindowDrag }
+            enabledOps.remove(.exactWindowDrag)
+        }
         let clientCapabilities = Set(payload.clientCapabilities ?? [])
         let browserHandoffOperations: Set<PeekabooBridgeOperation> = [
             .browserStatus,
@@ -217,6 +229,13 @@ extension PeekabooBridgeServer {
             advertisedCapabilities.remove(PeekabooBridgeHostCapability.exactWindowHeldPointerLifecycle)
         }
         if !supportsAttestedOperationReceipts ||
+            negotiated < PeekabooBridgeConstants.exactWindowDragVersion ||
+            !advertisedOps.contains(.exactWindowDrag) ||
+            (self.services.automation as? any ExactWindowDragServiceProtocol)?.supportsExactWindowDrag != true
+        {
+            advertisedCapabilities.remove(PeekabooBridgeHostCapability.exactWindowDrag)
+        }
+        if !supportsAttestedOperationReceipts ||
             negotiated < PeekabooBridgeConstants.agentExecutionTraceVersion ||
             !advertisedOps.contains(.agentExecutionTrace) ||
             !enabledOps.contains(.agentExecutionTrace)
@@ -245,7 +264,13 @@ extension PeekabooBridgeServer {
         {
             advertisedCapabilities.remove(PeekabooBridgeHostCapability.setValueResultTargetBinding)
         }
-        let elementMutationOperations: Set<PeekabooBridgeOperation> = [.setValue, .performAction]
+        if !supportsAttestedOperationReceipts || negotiated < PeekabooBridgeConstants.textSelectionVersion ||
+            (self.services.automation as? any ElementActionAutomationServiceProtocol)?.supportsTextSelection != true ||
+            !advertisedOps.contains(.selectText)
+        {
+            advertisedCapabilities.remove(PeekabooBridgeHostCapability.textSelection)
+        }
+        let elementMutationOperations: Set<PeekabooBridgeOperation> = [.setValue, .selectText, .performAction]
         if !supportsAttestedOperationReceipts ||
             negotiated < PeekabooBridgeConstants.processGenerationBoundElementMutationsVersion ||
             !(self.services.automation is any UIAutomationActionOutcomeProviding) ||
@@ -283,8 +308,24 @@ extension PeekabooBridgeServer {
         {
             advertisedCapabilities.remove(PeekabooBridgeHostCapability.compositeTypeDelivery)
         }
+        if !supportsAttestedOperationReceipts ||
+            negotiated < PeekabooBridgeConstants.clipboardGuardedExactWindowHotkeyVersion ||
+            (self.services.automation as? any ClipboardGuardedExactWindowHotkeyServiceProtocol)?
+            .supportsClipboardGuardedExactWindowHotkeys != true ||
+            !advertisedOps.contains(.exactWindowTargetedHotkey) ||
+            !enabledOps.contains(.exactWindowTargetedHotkey)
+        {
+            advertisedCapabilities.remove(PeekabooBridgeHostCapability.clipboardGuardedExactWindowHotkeys)
+        }
         if supportsAttestedOperationReceipts {
             advertisedCapabilities.insert(PeekabooBridgeHostCapability.attestedOperationReceipts)
+        }
+        if !advertisedCapabilities.contains(PeekabooBridgeHostCapability.clipboardGuardedExactWindowHotkeys) ||
+            negotiated < PeekabooBridgeConstants.preparedClipboardGuardedExactWindowHotkeyVersion ||
+            (self.services.automation as? any PreparedClipboardGuardedExactWindowHotkeyServiceProtocol)?
+            .supportsPreparedClipboardGuardedExactWindowHotkeys != true
+        {
+            advertisedCapabilities.remove(PeekabooBridgeHostCapability.preparedClipboardGuardedExactWindowHotkeys)
         }
         let operationSessionAttestation: PeekabooBridgeOperationSessionAttestation?
         if supportsAttestedOperationReceipts {
@@ -305,6 +346,7 @@ extension PeekabooBridgeServer {
                             PeekabooBridgeHostCapability.statelessClickVariants),
                         exactWindowHeldPointerLifecycle: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.exactWindowHeldPointerLifecycle),
+                        exactWindowDrag: advertisedCapabilities.contains(PeekabooBridgeHostCapability.exactWindowDrag),
                         nativeBrowserConnectionBinding: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.nativeBrowserConnectionBinding),
                         browserConnectionHandoff: advertisedCapabilities.contains(
@@ -315,8 +357,14 @@ extension PeekabooBridgeServer {
                             PeekabooBridgeHostCapability.targetedClickAccessibilityValueDelivery),
                         requestPinnedExactWindowScrollReceipt: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.requestPinnedExactWindowScrollReceipt),
+                        backgroundCoordinateScroll: advertisedCapabilities.contains(
+                            PeekabooBridgeHostCapability.backgroundCoordinateScroll),
                         compositeTypeDelivery: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.compositeTypeDelivery),
+                        clipboardGuardedExactWindowHotkeys: advertisedCapabilities.contains(
+                            PeekabooBridgeHostCapability.clipboardGuardedExactWindowHotkeys),
+                        preparedClipboardGuardedExactWindowHotkeys: advertisedCapabilities.contains(
+                            PeekabooBridgeHostCapability.preparedClipboardGuardedExactWindowHotkeys),
                         processGenerationBoundElementMutations: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.processGenerationBoundElementMutations),
                         setValueVerification: PeekabooBridgeNegotiatedSessionCapabilities.offersSetValueVerification(
@@ -401,7 +449,25 @@ extension PeekabooBridgeServer {
                   enabledOperations.contains(.targetedScroll)
         else {
             advertisedCapabilities.remove(PeekabooBridgeHostCapability.requestPinnedExactWindowScrollReceipt)
+            advertisedCapabilities.remove(PeekabooBridgeHostCapability.backgroundCoordinateScroll)
             return
+        }
+        Self.updateBackgroundCoordinateScrollCapability(
+            capabilities: &advertisedCapabilities, version: negotiated, automation: self.services.automation)
+    }
+
+    static func updateBackgroundCoordinateScrollCapability(
+        capabilities: inout Set<String>,
+        version: PeekabooBridgeProtocolVersion,
+        automation: any UIAutomationServiceProtocol)
+    {
+        if version >= PeekabooBridgeConstants.backgroundCoordinateScrollVersion,
+           capabilities.contains(PeekabooBridgeHostCapability.requestPinnedExactWindowScrollReceipt),
+           (automation as? any UIAutomationActionOutcomeProviding)?.supportsBackgroundCoordinateScroll == true
+        {
+            capabilities.insert(PeekabooBridgeHostCapability.backgroundCoordinateScroll)
+        } else {
+            capabilities.remove(PeekabooBridgeHostCapability.backgroundCoordinateScroll)
         }
     }
 
@@ -434,6 +500,7 @@ extension PeekabooBridgeServer {
             negotiated < PeekabooBridgeConstants.processGenerationBoundElementMutationsVersion
         {
             compatible.remove(.setValue)
+            compatible.remove(.selectText)
             compatible.remove(.performAction)
         }
         if !usesAttestedOperationReceipts {
@@ -480,14 +547,18 @@ extension PeekabooBridgeServer {
                 !Self.supportsProcessGenerationBoundElementMutationProvider(self.services.automation))
         {
             operations.remove(.setValue)
+            operations.remove(.selectText)
             operations.remove(.performAction)
         }
         operations = Set(operations.filter {
-            $0 != .setValue ||
-                self.supportedVersions.upperBound <
-                PeekabooBridgeConstants.processGenerationBoundElementMutationsVersion ||
+            ($0 != .selectText ||
                 (self.services.automation as? any ElementActionAutomationServiceProtocol)?
-                .supportsSetValueResultTargetBinding == true
+                .supportsTextSelection == true) &&
+                ($0 != .setValue ||
+                    self.supportedVersions.upperBound <
+                    PeekabooBridgeConstants.processGenerationBoundElementMutationsVersion ||
+                    (self.services.automation as? any ElementActionAutomationServiceProtocol)?
+                    .supportsSetValueResultTargetBinding == true)
         })
         if self.services.automation as? any TargetedFocusedElementServiceProtocol == nil {
             operations.remove(.getFocusedElement)
@@ -496,7 +567,11 @@ extension PeekabooBridgeServer {
             .supportsExactWindowTargetedKeyboard != true
         {
             operations.remove(.exactWindowTargetedTypeActions)
-            operations.remove(.exactWindowTargetedHotkey)
+            if (self.services.automation as? any ClipboardGuardedExactWindowHotkeyServiceProtocol)?
+                .supportsClipboardGuardedExactWindowHotkeys != true
+            {
+                operations.remove(.exactWindowTargetedHotkey)
+            }
         }
         if (self.services.automation as? any ExactWindowPixelFocusTypingServiceProtocol)?
             .supportsExactWindowPixelFocusTyping != true
@@ -521,6 +596,9 @@ extension PeekabooBridgeServer {
                 .revokeExactWindowHeldPointer,
                 .disconnectExactWindowHeldPointerOwner,
             ])
+        }
+        if (self.services.automation as? any ExactWindowDragServiceProtocol)?.supportsExactWindowDrag != true {
+            operations.remove(.exactWindowDrag)
         }
         if !self.services.snapshots.supportsImplicitLatestSnapshotInvalidation {
             operations.remove(.invalidateImplicitLatestSnapshot)

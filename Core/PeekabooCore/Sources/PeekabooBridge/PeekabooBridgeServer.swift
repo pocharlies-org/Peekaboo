@@ -65,8 +65,7 @@ struct PeekabooBridgeReceiptlessNegotiation {
 @MainActor
 // swiftlint:disable:next type_body_length
 public final class PeekabooBridgeServer {
-    /// The Bridge owns the outer publication wait. Its one-second reserve prevents the bounded
-    /// process scan and publication wait from racing at the same deadline.
+    /// Preserve the Bridge startup envelope, now owned by one publication wait rather than nested waits.
     public static let defaultScreenCaptureKitOwnershipPreparationTimeoutSeconds =
         ScreenCaptureKitOwnerLease.defaultProcessCapabilityPreparationTimeoutSeconds + 1
 
@@ -137,6 +136,7 @@ public final class PeekabooBridgeServer {
     private let screenCaptureKitOwnershipPreparationTimeoutSeconds: TimeInterval
     private var screenCaptureKitOwnershipPreparationTask:
         Task<ScreenCaptureKitOwnershipPreparationOutcome, Never>?
+    private var completedScreenCaptureKitOwnershipPreparation: ScreenCaptureKitOwnershipPreparationOutcome?
     let automationActivityObserver: (@Sendable (pid_t) -> Void)?
     let encoder: JSONEncoder
     let decoder: JSONDecoder
@@ -167,7 +167,7 @@ public final class PeekabooBridgeServer {
             try ScreenCaptureKitOwnerLease.registerCurrentProcessCapability()
         },
         screenCaptureKitOwnershipPreparer: @escaping @Sendable () async throws -> Void = {
-            try await ScreenCaptureKitOwnerLease.prepareCurrentProcessCapability()
+            try await ScreenCaptureKitOwnerLease.awaitCurrentProcessCapabilityPreparation()
         },
         screenCaptureKitOwnerClaimProvider: @escaping @Sendable () throws
             -> ScreenCaptureKitOwnerLease.OwnerReceipt = {
@@ -298,6 +298,10 @@ public final class PeekabooBridgeServer {
         } else {
             resolvedHostCapabilities.remove(PeekabooBridgeHostCapability.requestPinnedExactWindowScrollReceipt)
         }
+        Self.updateBackgroundCoordinateScrollCapability(
+            capabilities: &resolvedHostCapabilities,
+            version: supportedVersions.upperBound,
+            automation: services.automation)
         Self.updateInputAndLifecycleCapabilities(
             to: &resolvedHostCapabilities,
             services: services,
@@ -353,13 +357,17 @@ public final class PeekabooBridgeServer {
             task = existing
         } else {
             let prepare = self.screenCaptureKitOwnershipPreparer
-            let created = Task<ScreenCaptureKitOwnershipPreparationOutcome, Never> {
+            let created = Task<ScreenCaptureKitOwnershipPreparationOutcome, Never> { [weak self] in
+                let outcome: ScreenCaptureKitOwnershipPreparationOutcome
                 do {
                     try await prepare()
-                    return .init(state: .ready)
+                    outcome = .init(state: .ready)
                 } catch {
-                    return .failed(error, stage: .preparation)
+                    outcome = .failed(error, stage: .preparation)
                 }
+                self?.completedScreenCaptureKitOwnershipPreparation = outcome
+                self?.publishScreenCaptureKitOwnershipPreparation(outcome)
+                return outcome
             }
             self.screenCaptureKitOwnershipPreparationTask = created
             task = created
@@ -375,8 +383,17 @@ public final class PeekabooBridgeServer {
             outcome = .failed(error, stage: .preparation)
         }
         try Task.checkCancellation()
+        // A timeout continuation must not overwrite completion already published on this actor.
+        self.publishScreenCaptureKitOwnershipPreparation(self.completedScreenCaptureKitOwnershipPreparation ?? outcome)
+    }
+
+    private func publishScreenCaptureKitOwnershipPreparation(_ outcome: ScreenCaptureKitOwnershipPreparationOutcome) {
+        guard self.screenCaptureKitReadiness != outcome else { return }
         self.screenCaptureKitReadiness = outcome
-        if !outcome.permitsAttempt {
+        if outcome.permitsAttempt {
+            // Only a successfully registered host creates the shared preparation task.
+            self.hostCapabilities.insert(PeekabooBridgeHostCapability.screenCaptureKitProcessOwnership)
+        } else {
             self.hostCapabilities.remove(PeekabooBridgeHostCapability.screenCaptureKitProcessOwnership)
             self.logger.warning(
                 """
@@ -394,12 +411,14 @@ public final class PeekabooBridgeServer {
     {
         capabilities.subtract([
             PeekabooBridgeHostCapability.desktopObservationInlinePixels,
+            PeekabooBridgeHostCapability.desktopObservationFreshAccessibilityTree,
             PeekabooBridgeHostCapability.screenCaptureKitProcessOwnership,
             PeekabooBridgeHostCapability.screenCaptureKitOwnershipEnforcement,
             PeekabooBridgeHostCapability.classicCaptureWithoutScreenCaptureKit,
         ])
         if allowedOperations.contains(.desktopObservation) {
             capabilities.insert(PeekabooBridgeHostCapability.desktopObservationInlinePixels)
+            capabilities.insert(PeekabooBridgeHostCapability.desktopObservationFreshAccessibilityTree)
             if services.supportsScreenCaptureKitProcessOwnership {
                 capabilities.insert(PeekabooBridgeHostCapability.screenCaptureKitOwnershipEnforcement)
             }
@@ -1132,20 +1151,21 @@ public final class PeekabooBridgeServer {
                     message: "Certification operations require a signed Bridge operation receipt")
             }
         }
-        if request.requiresRequestPinnedExactWindowScrollReceipt {
-            let session = PeekabooBridgeRequestContext.negotiatedSessionCapabilities
-            let negotiatedVersion = session?.protocolVersion ?? self.receiptlessProtocolVersion(for: peer)
-            guard negotiatedVersion ?? .init(major: 0, minor: 0) >=
-                PeekabooBridgeConstants.requestPinnedExactWindowScrollReceiptVersion,
-                session?.requestPinnedExactWindowScrollReceipt == true
-            else {
-                throw Self.requestPinnedExactWindowScrollRuntimeIncompatibleEnvelope()
-            }
+        if request.requiresRequestPinnedExactWindowScrollReceipt,
+           !Self.isBackgroundScrollRuntimeCompatible(
+               request, capabilities: PeekabooBridgeRequestContext.negotiatedSessionCapabilities)
+        {
+            throw Self.requestPinnedExactWindowScrollRuntimeIncompatibleEnvelope(
+                requiresCoordinates: request.requiresBackgroundCoordinateScroll)
         }
         if let minimumVersion = request.minimumNegotiatedProtocolVersion {
             let session = PeekabooBridgeRequestContext.negotiatedSessionCapabilities
             let negotiatedVersion = session?.protocolVersion ?? self.receiptlessProtocolVersion(for: peer)
             guard (negotiatedVersion ?? .init(major: 0, minor: 0)) >= minimumVersion,
+                  !request.requiresPreparedClipboardGuardedExactWindowHotkey ||
+                  session?.preparedClipboardGuardedExactWindowHotkeys == true,
+                  !request.requiresClipboardGuardedExactWindowHotkey ||
+                  session?.clipboardGuardedExactWindowHotkeys == true,
                   !request.requiresNativeBrowserConnectionBinding ||
                   session?.nativeBrowserConnectionBinding == true,
                   !request.requiresProducerBoundSnapshotReferences ||
@@ -1154,8 +1174,20 @@ public final class PeekabooBridgeServer {
                   session?.targetedClickAccessibilityValueDelivery == true,
                   !request.requiresBackgroundStatelessClickVariantSupport || session?.statelessClickVariants == true,
                   !request.requiresExactWindowHeldPointerLifecycleSupport ||
-                  session?.exactWindowHeldPointerLifecycle == true
+                  session?.exactWindowHeldPointerLifecycle == true,
+                  op != .exactWindowDrag || session?.exactWindowDrag == true
             else {
+                if request.requiresClipboardGuardedExactWindowHotkey ||
+                    request.requiresPreparedClipboardGuardedExactWindowHotkey
+                {
+                    throw PeekabooBridgeErrorEnvelope(
+                        code: .operationNotSupported,
+                        actionFailure: .preDispatchRefusal(
+                            route: .bridge,
+                            reason: .runtimeIncompatible,
+                            message: "This Bridge session did not negotiate clipboard-guarded exact-window paste.",
+                            hint: "Update and relaunch the selected Peekaboo host before writing a temporary payload."))
+                }
                 throw PeekabooBridgeErrorEnvelope(
                     code: .operationNotSupported,
                     message:
@@ -1182,24 +1214,17 @@ public final class PeekabooBridgeServer {
         if case let .targetedClick(payload) = request {
             try Self.validateTargetedClickAccess(payload, permissions: permissions)
         }
-        switch request {
-        case let .scroll(payload):
-            guard payload.request.foreground else {
-                throw PeekabooBridgeErrorEnvelope(
-                    code: .invalidRequest,
-                    message: "The scroll operation requires foreground=true; " +
-                        "use targetedScroll for background AX input")
-            }
-        case let .targetedScroll(payload):
-            guard !payload.request.foreground else {
-                throw PeekabooBridgeErrorEnvelope(
-                    code: .invalidRequest,
-                    message: "The targetedScroll operation requires foreground=false")
-            }
-        default:
-            break
-        }
+        try request.validateScrollDeliveryMode()
 
+        try self.validateOperationPermissions(for: request, permissions: permissions, effectiveOps: effectiveOps)
+    }
+
+    private func validateOperationPermissions(
+        for request: PeekabooBridgeRequest,
+        permissions: PermissionsStatus,
+        effectiveOps: Set<PeekabooBridgeOperation>) throws
+    {
+        let op = request.operation
         let defersClassicScreenRecordingPermission = Self.defersClassicScreenRecordingPermission(
             for: request,
             hostCapabilities: self.hostCapabilities,
@@ -1286,6 +1311,14 @@ public final class PeekabooBridgeServer {
         peer _: PeekabooBridgePeer?) throws
     {
         guard request.requiresProcessGenerationBoundElementMutations else { return }
+        if request.operation == .selectText,
+           (self.services.automation as? any ElementActionAutomationServiceProtocol)?.supportsTextSelection != true ||
+           (PeekabooBridgeRequestContext.negotiatedSessionCapabilities?.protocolVersion ??
+               PeekabooBridgeProtocolVersion(major: 0, minor: 0)) < PeekabooBridgeConstants.textSelectionVersion
+        {
+            throw PeekabooBridgeErrorEnvelope(
+                code: .operationNotSupported, message: "Text selection requires a capable protocol 1.42 host")
+        }
         guard self.supportedVersions.upperBound >=
             PeekabooBridgeConstants.processGenerationBoundElementMutationsVersion
         else { return }
@@ -1339,6 +1372,9 @@ private func protocolHostCapabilities(
     if supportedVersions.upperBound >= PeekabooBridgeConstants.exactWindowHeldPointerLifecycleVersion {
         capabilities.insert(PeekabooBridgeHostCapability.exactWindowHeldPointerLifecycle)
     }
+    if supportedVersions.upperBound >= PeekabooBridgeConstants.exactWindowDragVersion {
+        capabilities.insert(PeekabooBridgeHostCapability.exactWindowDrag)
+    }
     if supportedVersions.upperBound >= PeekabooBridgeConstants.statelessClickVariantVersion {
         capabilities.insert(PeekabooBridgeHostCapability.statelessClickVariants)
     }
@@ -1353,6 +1389,10 @@ private func protocolHostCapabilities(
     }
     if supportedVersions.upperBound >= PeekabooBridgeConstants.compositeTypeDeliveryVersion {
         capabilities.insert(PeekabooBridgeHostCapability.compositeTypeDelivery)
+    }
+    if supportedVersions.upperBound >= PeekabooBridgeConstants.clipboardGuardedExactWindowHotkeyVersion {
+        capabilities.insert(PeekabooBridgeHostCapability.clipboardGuardedExactWindowHotkeys)
+        capabilities.insert(PeekabooBridgeHostCapability.preparedClipboardGuardedExactWindowHotkeys)
     }
     if supportedVersions.upperBound >= PeekabooBridgeConstants.browserConnectionHandoffVersion {
         capabilities.insert(PeekabooBridgeHostCapability.browserConnectionHandoff)
@@ -1437,7 +1477,15 @@ extension PeekabooBridgeServer {
         } else {
             resolvedHostCapabilities.remove(PeekabooBridgeHostCapability.setValueResultTargetBinding)
         }
-        let elementMutationOperations: Set<PeekabooBridgeOperation> = [.setValue, .performAction]
+        if supportedVersions.upperBound >= PeekabooBridgeConstants.textSelectionVersion,
+           (services.automation as? any ElementActionAutomationServiceProtocol)?.supportsTextSelection == true,
+           allowedOperations.contains(.selectText)
+        {
+            resolvedHostCapabilities.insert(PeekabooBridgeHostCapability.textSelection)
+        } else {
+            resolvedHostCapabilities.remove(PeekabooBridgeHostCapability.textSelection)
+        }
+        let elementMutationOperations: Set<PeekabooBridgeOperation> = [.setValue, .selectText, .performAction]
         if supportedVersions.upperBound >=
             PeekabooBridgeConstants.processGenerationBoundElementMutationsVersion,
             Self.supportsProcessGenerationBoundElementMutationProvider(services.automation),
@@ -1457,6 +1505,24 @@ extension PeekabooBridgeServer {
         supportedVersions: ClosedRange<PeekabooBridgeProtocolVersion>,
         allowedOperations: Set<PeekabooBridgeOperation>)
     {
+        if supportedVersions.upperBound >= PeekabooBridgeConstants.clipboardGuardedExactWindowHotkeyVersion,
+           allowedOperations.contains(.exactWindowTargetedHotkey),
+           (services.automation as? any ClipboardGuardedExactWindowHotkeyServiceProtocol)?
+               .supportsClipboardGuardedExactWindowHotkeys == true
+        {
+            resolvedHostCapabilities.insert(PeekabooBridgeHostCapability.clipboardGuardedExactWindowHotkeys)
+        } else {
+            resolvedHostCapabilities.remove(PeekabooBridgeHostCapability.clipboardGuardedExactWindowHotkeys)
+        }
+        if resolvedHostCapabilities.contains(PeekabooBridgeHostCapability.clipboardGuardedExactWindowHotkeys),
+           supportedVersions.upperBound >= PeekabooBridgeConstants.preparedClipboardGuardedExactWindowHotkeyVersion,
+           (services.automation as? any PreparedClipboardGuardedExactWindowHotkeyServiceProtocol)?
+               .supportsPreparedClipboardGuardedExactWindowHotkeys == true
+        {
+            resolvedHostCapabilities.insert(PeekabooBridgeHostCapability.preparedClipboardGuardedExactWindowHotkeys)
+        } else {
+            resolvedHostCapabilities.remove(PeekabooBridgeHostCapability.preparedClipboardGuardedExactWindowHotkeys)
+        }
         let compositeTypeOperations: Set<PeekabooBridgeOperation> = [
             .targetedTypeActions,
             .exactWindowTargetedTypeActions,

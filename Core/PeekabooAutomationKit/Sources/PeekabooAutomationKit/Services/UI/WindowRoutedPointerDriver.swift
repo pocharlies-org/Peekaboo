@@ -154,7 +154,8 @@ struct WindowRoutedPointerDriver {
         targetWindowID: CGWindowID,
         expectedWindowIdentity: WindowMutationIdentity? = nil,
         expectedWindowBounds: CGRect? = nil,
-        allowedWindowLayers: Set<Int> = [Int(CGWindowLevelForKey(.normalWindow))]) async throws
+        allowedWindowLayers: Set<Int> = [Int(CGWindowLevelForKey(.normalWindow))],
+        beforeButtonDown: (@MainActor () async throws -> Void)? = nil) async throws
         -> DesktopActionOutcome
     {
         guard button == .left || button == .right || button == .middle else {
@@ -199,6 +200,16 @@ struct WindowRoutedPointerDriver {
 
         for pairIndex in 0..<count {
             try Self.checkCancellation(afterPosting: postedEventCount)
+            do {
+                try await beforeButtonDown?()
+                try Self.checkCancellation(afterPosting: postedEventCount)
+            } catch {
+                throw InputDeliveryIndeterminateError(
+                    operation: .click,
+                    emittedUnitCount: postedEventCount,
+                    causeDescription: error.localizedDescription,
+                    delivery: .init(mechanism: .windowTargetedEvents, mode: .background))
+            }
             let clickState = Int64(pairIndex + 1)
             let eventKinds = Self.eventKinds(for: button)
             let down = EventSpecification(
@@ -285,6 +296,7 @@ struct WindowRoutedPointerDriver {
             point)
         guard receipt.identity == target.identity,
               receipt.bounds == target.bounds,
+              receipt.screenPoint == point,
               receipt.windowLayer == Int(CGWindowLevelForKey(.normalWindow)),
               receipt.bounds.contains(point)
         else {
@@ -353,6 +365,40 @@ struct WindowRoutedPointerDriver {
         return postedEventCount
     }
 
+    /// Advances a held route only after this one drag sample has been accepted. Cleanup retains
+    /// the original generation and the last accepted point if a later sample fails.
+    func postHeldMove(_ dispatch: HeldPointerDispatch, to point: CGPoint) throws -> HeldPointerDispatch {
+        guard point.x.isFinite, point.y.isFinite, dispatch.receipt.bounds.contains(point) else {
+            throw PeekabooError.operationError(message: "Drag sample must be finite and inside the exact window")
+        }
+        guard self.hasPostEventAccess() else { throw PeekabooError.permissionDeniedEventSynthesizing }
+        guard self.processGenerationIsCurrent(dispatch.receipt) else {
+            throw PeekabooError.snapshotStale("Original held-pointer process generation changed")
+        }
+        let receipt = RouteReceipt(
+            identity: dispatch.receipt.identity,
+            bounds: dispatch.receipt.bounds,
+            screenPoint: point,
+            windowLayer: dispatch.receipt.windowLayer)
+        var count = 0
+        try self.post(
+            EventSpecification(
+                type: dispatch.down.button == .right ? .rightMouseDragged : .leftMouseDragged,
+                button: dispatch.down.button,
+                clickState: 1,
+                buttonNumber: dispatch.down.buttonNumber),
+            receipt: receipt,
+            clickGroup: dispatch.clickGroup,
+            transport: dispatch.transport,
+            postedEventCount: &count)
+        return HeldPointerDispatch(
+            receipt: receipt,
+            clickGroup: dispatch.clickGroup,
+            transport: dispatch.transport,
+            down: dispatch.down,
+            up: dispatch.up)
+    }
+
     func heldPointerRouteState(_ dispatch: HeldPointerDispatch) -> HeldPointerRouteState {
         guard self.processGenerationIsCurrent(dispatch.receipt) else {
             return .processGenerationChanged
@@ -390,6 +436,39 @@ struct WindowRoutedPointerDriver {
         expectedWindowIdentity: WindowMutationIdentity,
         expectedWindowBounds: CGRect) async throws -> DesktopActionOutcome
     {
+        var postedEventCount = 0
+        do {
+            return try await self.scrollTrackingDispatch(
+                at: point,
+                direction: direction,
+                ticks: ticks,
+                targetProcessIdentifier: targetProcessIdentifier,
+                targetWindowID: targetWindowID,
+                expectedWindowIdentity: expectedWindowIdentity,
+                expectedWindowBounds: expectedWindowBounds,
+                postedEventCount: &postedEventCount)
+        } catch let error as PeekabooError where postedEventCount == 0 {
+            // Only the delivery owner knows these raw failures occurred before any wheel event.
+            // Already-typed failures keep their original, potentially retry-unsafe evidence.
+            throw Self.scrollPreDispatchFailure(error)
+        } catch is CancellationError where postedEventCount == 0 {
+            throw DesktopActionFailure.preDispatchRefusal(
+                reason: .requestCancelled,
+                message: "Window-routed scroll was cancelled before any wheel event was dispatched",
+                standardErrorCode: .cancelled)
+        }
+    }
+
+    private func scrollTrackingDispatch(
+        at point: CGPoint,
+        direction: PeekabooFoundation.ScrollDirection,
+        ticks: Int,
+        targetProcessIdentifier: pid_t,
+        targetWindowID: CGWindowID,
+        expectedWindowIdentity: WindowMutationIdentity,
+        expectedWindowBounds: CGRect,
+        postedEventCount: inout Int) async throws -> DesktopActionOutcome
+    {
         guard ticks > 0 else {
             throw PeekabooError.invalidInput("Window-routed scroll requires at least one tick")
         }
@@ -410,7 +489,6 @@ struct WindowRoutedPointerDriver {
         }
 
         let transport = self.resolveTransport(targetProcessIdentifier)
-        var postedEventCount = 0
         for tick in 0..<ticks {
             if Task.isCancelled {
                 if postedEventCount == 0 {
@@ -576,6 +654,8 @@ struct WindowRoutedPointerDriver {
         }
 
         Self.stampRoutingFields(on: event, receipt: receipt, clickGroup: clickGroup)
+        // Background pointer input never borrows a user's physically held modifiers.
+        event.flags = []
         Self.setIntegerField(1, clickState: specification.clickState, on: event)
         Self.setIntegerField(3, clickState: specification.buttonNumber, on: event)
         Self.setIntegerField(7, clickState: 3, on: event)
@@ -811,6 +891,29 @@ struct WindowRoutedPointerDriver {
             return false
         }
         return true
+    }
+}
+
+extension WindowRoutedPointerDriver {
+    fileprivate static func scrollPreDispatchFailure(_ error: PeekabooError) -> DesktopActionFailure {
+        let (reason, code): (DesktopActionOutcome.RefusalReason, StandardErrorCode) = switch error {
+        case .invalidInput, .invalidCoordinates:
+            (.invalidRequest, error.code)
+        case .permissionDeniedEventSynthesizing, .permissionDeniedAccessibility,
+             .permissionDeniedScreenRecording, .permissionDenied:
+            (.permissionDenied, error.code)
+        case .snapshotStale:
+            (.targetUnavailable, .snapshotStale)
+        case .snapshotNotFound, .windowNotFound, .appNotFound:
+            (.targetUnavailable, error.code)
+        default:
+            (.runtimeIncompatible, error.code)
+        }
+        return .preDispatchRefusal(
+            reason: reason,
+            message: error.localizedDescription,
+            hint: error.suggestedAction,
+            standardErrorCode: code)
     }
 }
 

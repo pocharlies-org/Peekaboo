@@ -26,9 +26,10 @@ public struct PressTool: MCPTool {
             """
         }
         return """
-        Presses one or more raw keyboard chords. Use `keys` for an xdotool-style chord sequence such as
+        Presses one or more raw keyboard chords. Use `keys` for a Peekaboo chord sequence such as
         ["cmd+c", "Return"], or use `key` plus `modifiers` for a single chord. The two input shapes are
         mutually exclusive. \(targeting)
+        \(KeyboardChord.syntaxHelp)
         Raw chords cannot prove semantic intent or effect; observe the exact target after unverified delivery.
         \(PeekabooMCPVersion.banner) using openai/gpt-5.6, anthropic/claude-opus-5
         """
@@ -39,7 +40,7 @@ public struct PressTool: MCPTool {
         var properties: [String: Value] = [
             "keys": SchemaBuilder.array(
                 items: SchemaBuilder.string(),
-                description: "Optional chord sequence using xdotool key syntax, e.g. ['cmd+c', 'Return'].",
+                description: "Optional chord sequence, e.g. ['cmd+c', 'Return']. \(KeyboardChord.syntaxHelp)",
                 minItems: 1),
             "key": SchemaBuilder.string(
                 description: "Optional single primary key, used with modifiers instead of keys."),
@@ -341,7 +342,7 @@ public struct PressTool: MCPTool {
             let outcomeAutomation = try ExactWindowKeyboardRuntime.requireOutcomeProvider(
                 automation: self.context.automation,
                 operation: "Background hotkeys")
-            guard let focusedElement = exactWindow.focusedElement else {
+            guard let keyboardTarget = exactWindow.keyboardTarget else {
                 throw PressToolValidationError(
                     message: "Exact-window background hotkeys require a focused-element receipt.")
             }
@@ -349,10 +350,7 @@ public struct PressTool: MCPTool {
                 outcomeAutomation.hotkeyWithOutcome(
                     keys: chord.serviceKeys,
                     holdDuration: hold,
-                    target: ExactWindowKeyboardTarget(
-                        windowIdentity: exactWindow.identity,
-                        windowBounds: exactWindow.bounds,
-                        focusedElement: focusedElement)),
+                    target: keyboardTarget),
                 keys: chord.serviceKeys,
                 operation: "Background hotkeys")
         }

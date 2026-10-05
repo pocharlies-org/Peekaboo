@@ -1,6 +1,5 @@
 import Foundation
 import PeekabooFoundation
-import Tachikoma
 import TachikomaMCP
 
 /// Immutable execution authority applied before an MCP tool can dispatch.
@@ -17,7 +16,7 @@ public enum MCPToolExecutionPolicy: String, Codable, Sendable {
     static let refusalErrorCode = "AGENT_EXECUTION_POLICY_REFUSAL"
 
     private static let nonUnrestrictedCatalogExclusions: Set<String> = ["shell"]
-    private static let backgroundOnlyCatalogExclusions: Set<String> = ["drag", "move"]
+    private static let backgroundOnlyCatalogExclusions: Set<String> = ["move"]
 
     func exposesToolInCatalog(named toolName: String) -> Bool {
         switch self {
@@ -31,12 +30,19 @@ public enum MCPToolExecutionPolicy: String, Codable, Sendable {
         }
     }
 
-    func rejection(toolName: String, arguments: ToolArguments) -> ToolResponse? {
+    func rejection(
+        toolName: String,
+        arguments: ToolArguments,
+        temporaryClipboardPasteGranted: Bool = false) -> ToolResponse?
+    {
         let refusal: (message: String, reason: DesktopActionOutcome.RefusalReason)? = switch self {
         case .unrestricted:
             nil
         case .backgroundOnly:
-            BackgroundOnlyToolPolicy.violation(toolName: toolName, arguments: arguments).map {
+            BackgroundOnlyToolPolicy.violation(
+                toolName: toolName,
+                arguments: arguments,
+                temporaryClipboardPasteGranted: temporaryClipboardPasteGranted).map {
                 ($0.message, $0.refusalReason)
             }
         case .foregroundAllowed:
@@ -130,12 +136,6 @@ public enum MCPToolExecutionPolicy: String, Codable, Sendable {
         "systemuiserver",
     ]
 
-    func rejection(toolName: String, agentArguments: [String: AnyAgentToolValue]) -> ToolResponse? {
-        self.rejection(
-            toolName: toolName,
-            arguments: ToolArguments(from: AgentToolArguments(agentArguments)))
-    }
-
     static func browserRequiresForegroundAuthority(_ arguments: ToolArguments) -> Bool {
         BackgroundOnlyToolPolicy.browserRequiresForegroundAuthority(arguments)
     }
@@ -170,13 +170,17 @@ private enum BackgroundOnlyToolPolicy {
         }
     }
 
-    static func violation(toolName: String, arguments: ToolArguments) -> Violation? {
+    static func violation(
+        toolName: String,
+        arguments: ToolArguments,
+        temporaryClipboardPasteGranted: Bool = false) -> Violation?
+    {
         switch toolName {
         case "see", "inspect_ui":
             arguments.getBool("web_focus") == true
                 ? .activation("web_focus=true can focus embedded foreground UI")
                 : nil
-        case "verify_state", "analyze", "sleep", "set_value", "done", "need_info":
+        case "verify_state", "analyze", "sleep", "set_value", "select_text", "done", "need_info":
             nil
         case "permissions":
             self.normalized(arguments.getString("action")) == "request"
@@ -194,6 +198,8 @@ private enum BackgroundOnlyToolPolicy {
             self.rawPressViolation(arguments)
         case "action":
             self.actionViolation(arguments)
+        case "paste":
+            self.pasteViolation(arguments, temporaryClipboardPasteGranted: temporaryClipboardPasteGranted)
         default:
             self.extendedViolation(toolName: toolName, arguments: arguments)
         }
@@ -217,9 +223,9 @@ private enum BackgroundOnlyToolPolicy {
             self.spaceViolation(arguments)
         case "browser":
             self.browserViolation(arguments)
-        case "paste":
-            self.pasteViolation(arguments)
-        case "drag", "move":
+        case "drag":
+            self.explicitForeground(arguments)
+        case "move":
             self.sharedInputViolation(toolName: toolName)
         case "shell":
             .sharedDesktop("shell execution can bypass the Agent's background-only tool boundary")
@@ -234,9 +240,28 @@ private enum BackgroundOnlyToolPolicy {
         .sharedDesktop("it uses the shared physical pointer")
     }
 
-    private static func pasteViolation(_ arguments: ToolArguments) -> Violation? {
+    private static func pasteViolation(
+        _ arguments: ToolArguments,
+        temporaryClipboardPasteGranted: Bool) -> Violation?
+    {
         if let foreground = self.explicitForeground(arguments) {
             return foreground
+        }
+        if temporaryClipboardPasteGranted, arguments.getValue(for: "dataBase64") != nil {
+            let disallowedKeys = [
+                "text", "filePath", "imagePath", "allowLarge", "app", "pid", "window_id", "window_title",
+                "window_index",
+            ]
+            guard !disallowedKeys.contains(where: { arguments.getValue(for: $0) != nil }),
+                  arguments.getString("dataBase64") != nil,
+                  self.normalized(arguments.getString("uti"))?.isEmpty == false,
+                  self.normalized(arguments.getString("snapshot"))?.isEmpty == false
+            else {
+                return .invalidRequest(
+                    "temporary clipboard permission requires dataBase64+uti and one exact snapshot, without " +
+                        "text, file/image paths, allowLarge, or competing app/PID/window selectors")
+            }
+            return nil
         }
         guard arguments.getValue(for: "text") != nil else {
             return .sharedDesktop(
@@ -520,7 +545,7 @@ private enum ForegroundAllowedAgentToolPolicy {
     private static let allowedToolNames: Set<String> = [
         "action", "analyze", "app", "browser", "capture", "click", "clipboard", "dialog", "dock", "done", "drag",
         "image", "inspect_ui", "menu", "move", "need_info", "paste", "permissions", "press", "scroll", "see",
-        "set_value", "sleep", "space", "type", "verify_state", "window",
+        "set_value", "select_text", "sleep", "space", "type", "verify_state", "window",
     ]
 
     static func refusalMessage(toolName: String) -> String? {
