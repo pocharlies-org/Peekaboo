@@ -62,7 +62,11 @@ jobs:
             --sdk "$SDK_PATH"
 
   linux:
-    runs-on: arc-k8s
+    # 2026-10-05 devops · fuera de pool: SwiftyLab/setup-swift no refresca claves GPG
+    # en arc-k8s («Failed to refresh keys from any server in the pool», run
+    # 37246682126); pasaba en ubuntu-24.04. Volver a arc-k8s cuando el action
+    # funcione en el runner (skill ci-runners-arc, INFRA-548).
+    runs-on: ubuntu-24.04
     needs: macos-host
     steps:
       - uses: actions/checkout@v7
