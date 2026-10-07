@@ -71,24 +71,9 @@ enum RuntimeHostResolver {
             configurationInput: configurationInput
         )
         else {
-            let localServices = dependencies.makeLocalServices(options)
-            if let concreteSnapshotID {
-                let resolvedHandshakeCache = dependencies.makeRemoteHandshakeCache()
-                let owner = try await self.resolveSnapshotAffinityOwner(
-                    snapshotID: concreteSnapshotID,
-                    localServices: localServices,
-                    candidates: [],
-                    identity: resolvedHandshakeCache.identity,
-                    handshakeCache: resolvedHandshakeCache
-                )
-                guard owner == .local else {
-                    preconditionFailure("Local-only snapshot affinity selected a remote owner")
-                }
-            }
-            return self.localResolution(
-                services: localServices,
-                hostDescription: "local (in-process)",
-                snapshotInvalidationRemoteSocketPaths: [],
+            return try await self.resolveLocalOnlyServices(
+                options: options,
+                dependencies: dependencies,
                 captureSafety: captureSafety
             )
         }
@@ -201,6 +186,33 @@ enum RuntimeHostResolver {
         return resolution
     }
 
+    private static func resolveLocalOnlyServices(
+        options: CommandRuntimeOptions,
+        dependencies: Dependencies,
+        captureSafety: CaptureSafetyResolution
+    ) async throws -> Resolution {
+        let localServices = dependencies.makeLocalServices(options)
+        if let snapshotID = options.explicitSnapshotID {
+            let handshakeCache = dependencies.makeRemoteHandshakeCache()
+            let owner = try await self.resolveSnapshotAffinityOwner(
+                snapshotID: snapshotID,
+                localServices: localServices,
+                candidates: [],
+                identity: handshakeCache.identity,
+                handshakeCache: handshakeCache
+            )
+            guard owner == .local else {
+                preconditionFailure("Local-only snapshot affinity selected a remote owner")
+            }
+        }
+        return self.localResolution(
+            services: localServices,
+            hostDescription: "local (in-process)",
+            snapshotInvalidationRemoteSocketPaths: [],
+            captureSafety: captureSafety
+        )
+    }
+
     private static func localResolution(
         services: any PeekabooServiceProviding,
         hostDescription: String,
@@ -299,9 +311,7 @@ enum RuntimeHostResolver {
         let candidatePlan = context.candidatePlan
         let explicitSocket = candidatePlan.explicitSocket
         let daemonSocketPath = candidatePlan.daemonSocketPath
-        let runtimeBuildIdentity = candidatePlan.runtimeBuildIdentity
         let buildScopedDaemonSocketPath = candidatePlan.buildScopedDaemonSocketPath
-        let snapshotInvalidationRemoteSocketPaths = context.snapshotInvalidationRemoteSocketPaths
 
         // Stateful implicit commands share in-memory snapshots across invocations. Establish
         // the exact daemon generation for this executable before considering compatible older
@@ -312,6 +322,8 @@ enum RuntimeHostResolver {
             buildScopedDaemonSocketPath: buildScopedDaemonSocketPath
         )
         var permissionRejections: [String] = []
+        var candidateRejections: [RemoteCandidateEvaluation] = []
+        let recordRejection: (RemoteCandidateEvaluation) -> Void = { candidateRejections.append($0) }
         let ownerAwareCandidates = explicitSocket == nil
             ? self.screenCaptureKitOwnerCandidates(from: candidatePlan.candidates)
             : candidatePlan.candidates
@@ -378,7 +390,8 @@ enum RuntimeHostResolver {
             if let resolved = try await context.resolveRemoteServices(
                 candidates: [exactCandidate],
                 requiredProtocolVersion: PeekabooBridgeConstants.protocolVersion,
-                permissionRejections: &permissionRejections
+                permissionRejections: &permissionRejections,
+                recordRejection: recordRejection
             ) {
                 return resolved
             }
@@ -399,7 +412,8 @@ enum RuntimeHostResolver {
                        requiresValidatedHistoricalDaemon: false
                    )],
                    requiredProtocolVersion: PeekabooBridgeConstants.protocolVersion,
-                   permissionRejections: &permissionRejections
+                   permissionRejections: &permissionRejections,
+                   recordRejection: recordRejection
                ) {
                 return resolved
             }
@@ -407,7 +421,8 @@ enum RuntimeHostResolver {
 
         if let resolved = try await context.resolveRemoteServices(
             candidates: candidatePlan.candidates,
-            permissionRejections: &permissionRejections
+            permissionRejections: &permissionRejections,
+            recordRejection: recordRejection
         ) {
             return resolved
         }
@@ -430,7 +445,7 @@ enum RuntimeHostResolver {
             let autoStartSocketPath = DaemonLaunchPolicy.autoStartSocketPath(
                 daemonSocketPath: daemonSocketPath,
                 defaultSocketWasOccupiedAndRejected: rejectedDefaultSocketOccupant,
-                runtimeBuildIdentity: runtimeBuildIdentity
+                runtimeBuildIdentity: candidatePlan.runtimeBuildIdentity
             )
             if let resolvedDaemonSocket = try await DaemonLaunchPolicy.startOnDemandDaemon(
                 socketPath: autoStartSocketPath,
@@ -443,7 +458,8 @@ enum RuntimeHostResolver {
                         requiredHostKind: nil,
                         requiresValidatedHistoricalDaemon: false
                     )],
-                    permissionRejections: &permissionRejections
+                    permissionRejections: &permissionRejections,
+                    recordRejection: recordRejection
                 ) {
                 return resolved
             }
@@ -451,36 +467,34 @@ enum RuntimeHostResolver {
 
         try Task.checkCancellation()
         return self.localFallbackResolution(
-            options: options,
-            explicitSocket: explicitSocket,
-            snapshotInvalidationRemoteSocketPaths: snapshotInvalidationRemoteSocketPaths,
+            context: context,
             permissionRejections: permissionRejections,
-            makeLocalServices: context.makeLocalServices
+            candidateRejections: candidateRejections
         )
     }
 
     private static func localFallbackResolution(
-        options: CommandRuntimeOptions,
-        explicitSocket: String?,
-        snapshotInvalidationRemoteSocketPaths: [String],
+        context: RemoteResolutionContext,
         permissionRejections: [String],
-        makeLocalServices: LocalServiceFactory
+        candidateRejections: [RemoteCandidateEvaluation]
     ) -> Resolution {
+        let options = context.options
         // Name the hosts skipped for missing TCC permissions so a fallback is explainable
         // instead of silently selecting a permission-less bridge host.
         let rejectionSummary = permissionRejections.isEmpty
             ? ""
             : "; rejected " + permissionRejections.joined(separator: "; ")
         return Resolution(
-            services: makeLocalServices(options),
+            services: context.makeLocalServices(options),
             hostDescription: "local (in-process fallback\(rejectionSummary))",
             selectedRemoteSocketPath: nil,
             selectedRemoteHostProcessIdentifier: nil,
-            snapshotInvalidationRemoteSocketPaths: snapshotInvalidationRemoteSocketPaths,
+            snapshotInvalidationRemoteSocketPaths: context.snapshotInvalidationRemoteSocketPaths,
             applicationRelaunchAllowed: !options.requiresApplicationRelaunch,
             requiredHostFailure: self.requiredHostFailure(
-                explicitSocket: explicitSocket,
-                options: options
+                explicitSocket: context.candidatePlan.explicitSocket,
+                options: options,
+                rejections: candidateRejections
             )
         )
     }
@@ -489,7 +503,22 @@ enum RuntimeHostResolver {
 // MARK: - Routing policy and remote service construction
 
 extension RuntimeHostResolver {
-    static func requiredHostFailure(explicitSocket: String?, options: CommandRuntimeOptions) -> String? {
+    static func requiredHostFailure(
+        explicitSocket: String?,
+        options: CommandRuntimeOptions,
+        rejections: [RemoteCandidateEvaluation] = []
+    ) -> String? {
+        // This nil/non-nil boundary also selects the existing error envelope and local fallback policy.
+        guard let fallback = self.unresolvedRequiredHostFailure(explicitSocket: explicitSocket, options: options) else {
+            return nil
+        }
+        return self.observedRequiredHostFailure(explicitSocket: explicitSocket, rejections: rejections) ?? fallback
+    }
+
+    private static func unresolvedRequiredHostFailure(
+        explicitSocket: String?,
+        options: CommandRuntimeOptions
+    ) -> String? {
         if options.requiresExactWindowPixelFocusTyping {
             return "No compatible Bridge host advertises atomic exact-window pixel-focus typing. " +
                 "Update and relaunch Peekaboo, then observe the exact target again before retrying."
@@ -505,6 +534,10 @@ extension RuntimeHostResolver {
             }
             return "No compatible Bridge host advertises protocol 1.30 middle/triple-click support. " +
                 "Update and relaunch Peekaboo on the selected host, or pass --no-remote to run locally."
+        }
+        if options.requiresDesktopObservationFreshAccessibilityTree {
+            return "No compatible Bridge host advertises desktopObservationFreshAccessibilityTree. " +
+                "Update and relaunch the selected host, or pass --no-remote to explicitly observe locally."
         }
         if options.requiresDesktopObservationOCR {
             return "No compatible Bridge host advertises desktopObservationOCR. Update and relaunch Peekaboo " +
@@ -794,7 +827,8 @@ extension RuntimeHostResolver {
             RuntimeHostResolver.remoteServices(client: $0, handshake: $1, options: $2)
         },
         handshake: ScreenCaptureKitHandshake? = nil,
-        handshakeCache: RemoteHandshakeCache? = nil
+        handshakeCache: RemoteHandshakeCache? = nil,
+        recordRejection: (RemoteCandidateEvaluation) -> Void = { _ in }
     )
         async throws -> Resolution? {
         for candidate in candidates {
@@ -827,14 +861,15 @@ extension RuntimeHostResolver {
                    let diagnostic = BridgeCapabilityPolicy.screenCaptureKitReadinessRefusal(for: handshakeResponse) {
                     throw self.readinessRefusal(diagnostic, handshake: handshakeResponse, socketPath: socketPath)
                 }
-                let validation = await self.validateRemoteCandidate(
+                let evaluation = await self.evaluateRemoteCandidate(
                     candidate,
                     handshake: handshakeResponse,
                     options: options,
                     requiredProtocolVersion: requiredProtocolVersion
                 )
                 try Task.checkCancellation()
-                guard let validation else {
+                guard let validation = evaluation.validation else {
+                    recordRejection(evaluation)
                     let missingPermissions = BridgeCapabilityPolicy.explicitlyMissingRemotePermissions(
                         for: handshakeResponse,
                         options: options
@@ -945,11 +980,15 @@ extension RuntimeHostResolver {
             supportsPinnedWindowMutations: BridgeCapabilityPolicy.supportsPinnedWindowMutations(for: handshake),
             supportsWindowRestore: BridgeCapabilityPolicy.supportsOperation(.restoreWindow, for: handshake),
             dialogCapabilities: Self.remoteDialogCapabilities(for: handshake),
-            supportsTargetedScroll: BridgeCapabilityPolicy.supportsTargetedScroll(for: handshake),
-            supportsRequestPinnedExactWindowScrollReceipt:
-            BridgeCapabilityPolicy.supportsRequestPinnedExactWindowScrollReceipt(for: handshake),
+            supportsTargetedScroll: handshake.supportsTargetedScroll,
+            supportsRequestPinnedExactWindowScrollReceipt: handshake.supportsRequestPinnedExactWindowScrollReceipt,
+            supportsBackgroundCoordinateScroll: handshake.supportsBackgroundCoordinateScroll,
             supportsInspectAccessibilityTree: BridgeCapabilityPolicy.supportsInspectAccessibilityTree(for: handshake),
             supportsExactWindowTargetedKeyboard: supportsExactKeyboard,
+            supportsClipboardGuardedExactWindowHotkeys:
+            BridgeCapabilityPolicy.supportsClipboardGuardedExactWindowHotkeys(for: handshake),
+            supportsPreparedClipboardGuardedExactWindowHotkeys:
+            handshake.supportsPreparedClipboardGuardedExactWindowHotkeys,
             exactWindowTargetedKeyboardUnavailableReason: supportsExactKeyboard
                 ? nil
                 : "Bridge host lacks atomic exact-window keyboard delivery",
@@ -967,12 +1006,14 @@ extension RuntimeHostResolver {
                 : "Bridge host lacks foreground modifier-click",
             supportsExactWindowHeldPointerLifecycle:
             BridgeCapabilityPolicy.supportsExactWindowHeldPointerLifecycle(for: handshake),
+            supportsExactWindowDrag: handshake.supportsExactWindowDrag,
             supportsPostEventPermissionRequest: BridgeCapabilityPolicy.supportsPostEventPermissionRequest(
                 for: handshake
             ),
             supportsElementActions: BridgeCapabilityPolicy.supportsElementActions(for: handshake),
             supportsSetValueResultTargetBinding:
             BridgeCapabilityPolicy.supportsElementAction(.setValue, for: handshake),
+            supportsTextSelection: BridgeCapabilityPolicy.supportsElementAction(.selectText, for: handshake),
             supportsDesktopObservation: observationCapabilities.desktopObservation,
             supportsDesktopObservationOCR: observationCapabilities.desktopObservationOCR,
             supportsDesktopObservationCaptureEngine: observationCapabilities.desktopObservationCaptureEngine,
@@ -1026,11 +1067,7 @@ private func explicitSnapshotPublicationFailure(
 ) -> String? {
     guard explicitSocket != nil, options.requiresExplicitSnapshotPublication else { return nil }
     if options.requiresProducerBoundSnapshotReferences {
-        let version = PeekabooBridgeConstants.producerBoundSnapshotReferencesVersion
-        return "This command requires authenticated, producer-bound snapshots " +
-            "(Bridge protocol \(version.major).\(version.minor) or newer). Use a current signed Peekaboo host " +
-            "on its standard socket, or remove --bridge-socket for automatic host selection. " +
-            "Custom sockets without a host-signing policy cannot negotiate authenticated snapshots."
+        return producerBoundSnapshotFailure(explicitSocket: explicitSocket)
     }
     return "The explicitly selected Bridge host cannot publish an explicit-reference-only coordinate " +
         "receipt; protocol 1.26 is required. Update and relaunch Peekaboo on that host, or remove " +

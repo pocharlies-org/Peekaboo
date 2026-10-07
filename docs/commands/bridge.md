@@ -58,6 +58,15 @@ read_when:
   Standard Peekaboo, daemon, Claude, and Clawdbot socket paths trust Peekaboo's release signing teams by default.
   A custom `PeekabooBridgeClient` socket must pass `trustedHostTeamIDs`; without explicit host trust the client caps
   negotiation at receiptless protocol 1.28 instead of accepting an arbitrary Developer ID listener.
+  `--bridge-socket` selects an endpoint, not additional trust. Public automation commands and `bridge status`
+  have no host-team override, so custom paths remain limited to protocol 1.28 even with a current host.
+  `--trusted-host-team-id` is a receipt-validation option, not a global automation flag. For capability-dependent
+  automation, use a standard Peekaboo or canonical build-scoped daemon socket; its listener must still satisfy
+  the built-in signing policy. Use the daemon's actual runtime-derived socket, not an invented matching filename
+  or a symlink to an arbitrary custom socket. Fresh-AX support may still be advertised at protocol 1.28;
+  it does not prove authenticated producer-bound snapshot support. When runtime selection fails, command
+  diagnostics report evaluated unmet requirements from contacted hosts without changing status codes or
+  granting additional trust.
 - Every attested request carries a canonical decimal-string session sequence and a deterministic RFC 9562 version-8
   request UUID derived from the complete `(session ID, sequence)` tuple. The tuple, not the UUID alone, is the replay
   key. Unused sequence slots may be claimed out of order so concurrent requests remain valid. Before the bounded

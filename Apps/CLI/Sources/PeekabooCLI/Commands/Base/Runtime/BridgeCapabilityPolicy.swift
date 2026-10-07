@@ -4,6 +4,11 @@ import PeekabooBridge
 import PeekabooFoundation
 
 enum BridgeCapabilityPolicy {
+    enum RemoteRequirementFailure: Equatable {
+        case capability(String)
+        case producerBoundSnapshotReferences
+    }
+
     struct ObservationCapabilities: Equatable {
         let desktopObservation: Bool
         let desktopObservationOCR: Bool
@@ -16,6 +21,13 @@ enum BridgeCapabilityPolicy {
         for handshake: PeekabooBridgeHandshakeResponse,
         options: CommandRuntimeOptions
     ) -> Bool {
+        self.firstUnmetRemoteRequirement(for: handshake, options: options) == nil
+    }
+
+    static func firstUnmetRemoteRequirement(
+        for handshake: PeekabooBridgeHandshakeResponse,
+        options: CommandRuntimeOptions
+    ) -> RemoteRequirementFailure? {
         let defersScreenRecording = self.defersRemoteScreenRecordingPermission(options: options)
         let captureOperation: PeekabooBridgeOperation = options.requiresDesktopObservationInlinePixels
             ? .desktopObservation : .captureScreen
@@ -24,7 +36,7 @@ enum BridgeCapabilityPolicy {
             : self.supportsOperation(captureOperation, for: handshake)
         if options.requiresScreenCapturePermission || options.requiresSilentCapture,
            !supportsCapture {
-            return false
+            return .capability("enabled screen capture")
         }
 
         // Never select a host that explicitly reports it lacks a TCC permission this command
@@ -34,74 +46,74 @@ enum BridgeCapabilityPolicy {
         // not blocked by a missing Screen Recording grant. Hosts that omit the permission report
         // entirely stay eligible for backward compatibility.
         guard self.explicitlyMissingRemotePermissions(for: handshake, options: options).isEmpty else {
-            return false
+            return .capability("required host permissions")
         }
 
         if options.requiresSilentCapture, !self.supportsSilentCapture(for: handshake, operation: captureOperation) {
-            return false
+            return .capability("silent screen capture")
         }
 
-        if !self.supportsObservationRequirements(for: handshake, options: options) {
-            return false
+        if let failure = self.firstUnmetObservationRequirement(for: handshake, options: options) {
+            return failure
         }
 
         if !self.supportsInteractionRequirements(for: handshake, options: options) {
-            return false
+            return .capability("required interaction capabilities, permissions, or enabled operations")
         }
 
         if !options.requiredElementActionOperations.allSatisfy({
             self.supportsElementAction($0, for: handshake)
         }) {
-            return false
+            return .capability("required element-action operations")
         }
 
         if options.requiresInspectAccessibilityTree, !self.supportsInspectAccessibilityTree(for: handshake) {
-            return false
+            return .capability("Accessibility-tree inspection")
         }
 
         if options.requiresBrowserMCP, !self.supportsBrowserMCP(for: handshake) {
-            return false
+            return .capability("browser MCP")
         }
 
         if !self.supportsApplicationLifecycleRequirements(for: handshake, options: options) {
-            return false
+            return .capability("required application-lifecycle capabilities or host kind")
         }
 
         if options.requiresProcessGenerationPinnedHotkeys,
            !self.supportsProcessGenerationPinnedHotkeys(for: handshake) {
-            return false
+            return .capability("process-generation-pinned hotkeys")
         }
 
         if options.requiresProcessGenerationPinnedTypeActions,
            !self.supportsProcessGenerationPinnedTypeActions(for: handshake) {
-            return false
+            return .capability("process-generation-pinned typing")
         }
 
         if options.requiresProcessGenerationPinnedClicks,
            !self.supportsProcessGenerationPinnedClicks(for: handshake) {
-            return false
+            return .capability("process-generation-pinned clicks")
         }
 
         if options.requiresTargetedClickAccessibilityValueDelivery,
            !self.supportsTargetedClickAccessibilityValueDelivery(for: handshake) {
-            return false
+            return .capability("targeted-click Accessibility-value delivery")
         }
 
         if options.requiresHostApplicationInventory, !self.supportsHostApplicationInventory(for: handshake) {
-            return false
+            return .capability("host application inventory")
         }
 
         if options.requiresImplicitSnapshotInvalidation || options.usesPerToolSnapshotInvalidation,
            !self.supportsImplicitSnapshotInvalidation(for: handshake) {
-            return false
+            return .capability("implicit snapshot invalidation")
         }
 
         if options.requiresProducerBoundSnapshotReferences,
-           !self.supportsProducerBoundSnapshotReferences(for: handshake) {
-            return false
+           let failure = self.producerBoundSnapshotRequirementFailure(for: handshake) {
+            return failure
         }
 
-        return true
+        return nil
     }
 
     private static func supportsApplicationLifecycleRequirements(
@@ -143,44 +155,48 @@ enum BridgeCapabilityPolicy {
         return true
     }
 
-    private static func supportsObservationRequirements(
+    private static func firstUnmetObservationRequirement(
         for handshake: PeekabooBridgeHandshakeResponse,
         options: CommandRuntimeOptions
-    ) -> Bool {
+    ) -> RemoteRequirementFailure? {
         let capabilities = self.observationCapabilities(for: handshake, options: options)
         if options.requiresDesktopObservation, !capabilities.desktopObservation {
-            return false
+            return .capability("desktopObservation")
         }
         if options.requiresDesktopObservationOCR, !capabilities.desktopObservationOCR {
-            return false
+            return .capability("desktopObservationOCR")
+        }
+        if options.requiresDesktopObservationFreshAccessibilityTree,
+           !handshake.supportsDesktopObservationFreshAccessibilityTree {
+            return .capability("desktopObservationFreshAccessibilityTree")
         }
         if options.requiresCaptureEnginePreferenceCapability,
            !capabilities.desktopObservationCaptureEngine {
-            return false
+            return .capability("desktopObservationCaptureEngine")
         }
         if options.requiresDesktopObservationInlinePixels, !capabilities.desktopObservationInlinePixels {
-            return false
+            return .capability("desktopObservationInlinePixels")
         }
         if options.requiresScreenCaptureKitOwnerCapability,
            !(self.defersClassicScreenRecordingPermission(options: options)
                ? self.supportsClassicCaptureWithoutScreenCaptureKit(for: handshake)
                : self.supportsScreenCaptureKitProcessOwnership(for: handshake)) {
-            return false
+            return .capability("capture-engine process ownership")
         }
         if options.requiresExactWindowROIObservation, !capabilities.exactWindowROIObservation {
-            return false
+            return .capability("exact-window ROI observation")
         }
         if !options.usesPerToolSnapshotInvalidation,
            options.requiresScreenCaptureKitOwnerCapability,
            !self.defersClassicScreenRecordingPermission(options: options),
            self.screenCaptureKitReadinessRefusal(for: handshake) != nil {
-            return false
+            return .capability("ScreenCaptureKit readiness")
         }
         if options.requiresExplicitSnapshotPublication,
            !self.supportsExplicitSnapshotPublication(for: handshake) {
-            return false
+            return .capability("explicit snapshot publication")
         }
-        return true
+        return nil
     }
 
     static func observationCapabilities(
@@ -218,7 +234,9 @@ enum BridgeCapabilityPolicy {
                 self.supportsOperation(.storeObservationSnapshot, for: handshake)
         )
     }
+}
 
+extension BridgeCapabilityPolicy {
     private static func supportsInteractionRequirements(
         for handshake: PeekabooBridgeHandshakeResponse,
         options: CommandRuntimeOptions
@@ -264,9 +282,7 @@ enum BridgeCapabilityPolicy {
            !self.supportsExactWindowPixelFocusTyping(for: handshake) {
             return false
         }
-        if options.requiresTargetedScroll,
-           !self.supportsTargetedScroll(for: handshake) ||
-           !self.supportsRequestPinnedExactWindowScrollReceipt(for: handshake) {
+        if !self.supportsScrollRequirements(for: handshake, options: options) {
             return false
         }
         if options.requiresPostEventPermission, handshake.permissions?.postEvent != true {
@@ -301,6 +317,18 @@ enum BridgeCapabilityPolicy {
             return false
         }
         return true
+    }
+
+    private static func supportsScrollRequirements(
+        for handshake: PeekabooBridgeHandshakeResponse,
+        options: CommandRuntimeOptions
+    ) -> Bool {
+        if options.requiresTargetedScroll,
+           !handshake.supportsTargetedScroll ||
+           !handshake.supportsRequestPinnedExactWindowScrollReceipt {
+            return false
+        }
+        return !options.requiresBackgroundCoordinateScroll || handshake.supportsBackgroundCoordinateScroll
     }
 
     /// TCC permissions the current command needs from a remote host, derived from the operations
@@ -520,12 +548,22 @@ enum BridgeCapabilityPolicy {
     }
 
     static func supportsProducerBoundSnapshotReferences(for handshake: PeekabooBridgeHandshakeResponse) -> Bool {
-        handshake.negotiatedVersion >= PeekabooBridgeConstants.producerBoundSnapshotReferencesVersion &&
-            handshake.hostCapabilities?.contains(PeekabooBridgeHostCapability.attestedOperationReceipts) == true &&
-            handshake.hostCapabilities?.contains(
-                PeekabooBridgeHostCapability.producerBoundSnapshotReferences
-            ) == true &&
-            self.supportsOperation(.ownsSnapshot, for: handshake)
+        self.producerBoundSnapshotRequirementFailure(for: handshake) == nil
+    }
+
+    private static func producerBoundSnapshotRequirementFailure(
+        for handshake: PeekabooBridgeHandshakeResponse
+    ) -> RemoteRequirementFailure? {
+        guard handshake.negotiatedVersion >= PeekabooBridgeConstants.producerBoundSnapshotReferencesVersion,
+              handshake.hostCapabilities?.contains(PeekabooBridgeHostCapability.attestedOperationReceipts) == true,
+              handshake.hostCapabilities?.contains(
+                  PeekabooBridgeHostCapability.producerBoundSnapshotReferences
+              ) == true
+        else { return .producerBoundSnapshotReferences }
+        guard self.supportsOperation(.ownsSnapshot, for: handshake) else {
+            return .capability("supported and enabled ownsSnapshot")
+        }
+        return nil
     }
 
     static func supportsTargetedClickAccessibilityValueDelivery(
@@ -541,6 +579,7 @@ enum BridgeCapabilityPolicy {
 
     static func supportsElementActions(for handshake: PeekabooBridgeHandshakeResponse) -> Bool {
         self.supportsElementAction(.setValue, for: handshake) ||
+            self.supportsElementAction(.selectText, for: handshake) ||
             self.supportsElementAction(.performAction, for: handshake)
     }
 
@@ -548,7 +587,12 @@ enum BridgeCapabilityPolicy {
         _ operation: PeekabooBridgeOperation,
         for handshake: PeekabooBridgeHandshakeResponse
     ) -> Bool {
-        guard operation == .setValue || operation == .performAction else { return false }
+        guard operation == .setValue || operation == .selectText || operation == .performAction else { return false }
+        if operation == .selectText,
+           handshake.negotiatedVersion < PeekabooBridgeConstants.textSelectionVersion ||
+           handshake.hostCapabilities?.contains(PeekabooBridgeHostCapability.textSelection) != true {
+            return false
+        }
         return handshake.negotiatedVersion >= PeekabooBridgeConstants.processGenerationBoundElementMutationsVersion &&
             handshake.hostCapabilities?.contains(PeekabooBridgeHostCapability.attestedOperationReceipts) == true &&
             handshake.hostCapabilities?.contains(
@@ -643,6 +687,10 @@ enum BridgeCapabilityPolicy {
         handshake.negotiatedVersion >= PeekabooBridgeConstants.compositeTypeDeliveryVersion &&
             handshake.hostCapabilities?.contains(PeekabooBridgeHostCapability.attestedOperationReceipts) == true &&
             handshake.hostCapabilities?.contains(PeekabooBridgeHostCapability.compositeTypeDelivery) == true
+    }
+
+    static func supportsClipboardGuardedExactWindowHotkeys(for handshake: PeekabooBridgeHandshakeResponse) -> Bool {
+        handshake.supportsClipboardGuardedExactWindowHotkeys
     }
 
     static func supportsPinnedWindowMutations(for handshake: PeekabooBridgeHandshakeResponse) -> Bool {
@@ -817,26 +865,6 @@ enum BridgeCapabilityPolicy {
             ) == true &&
             requiredOperations.isSubset(of: Set(handshake.supportedOperations)) &&
             requiredOperations.isSubset(of: Set(handshake.enabledOperations ?? handshake.supportedOperations))
-    }
-
-    static func supportsTargetedScroll(for handshake: PeekabooBridgeHandshakeResponse) -> Bool {
-        guard handshake.negotiatedVersion >= PeekabooBridgeProtocolVersion(major: 1, minor: 11),
-              handshake.supportedOperations.contains(.targetedScroll)
-        else {
-            return false
-        }
-        return (handshake.enabledOperations ?? handshake.supportedOperations).contains(.targetedScroll)
-    }
-
-    static func supportsRequestPinnedExactWindowScrollReceipt(
-        for handshake: PeekabooBridgeHandshakeResponse
-    ) -> Bool {
-        handshake.negotiatedVersion >= PeekabooBridgeConstants.requestPinnedExactWindowScrollReceiptVersion &&
-            handshake.hostCapabilities?.contains(PeekabooBridgeHostCapability.attestedOperationReceipts) == true &&
-            handshake.hostCapabilities?.contains(
-                PeekabooBridgeHostCapability.requestPinnedExactWindowScrollReceipt
-            ) == true &&
-            self.supportsTargetedScroll(for: handshake)
     }
 
     static func targetedTypeAvailability(for handshake: PeekabooBridgeHandshakeResponse)

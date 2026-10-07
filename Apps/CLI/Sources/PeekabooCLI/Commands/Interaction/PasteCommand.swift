@@ -106,7 +106,8 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
                         clipboardMutation: clipboardMutation
                     ) {
                         let deliveryTarget = try await self.preDispatchBackgroundTarget(
-                            expectedPIDIdentity: expectedPIDIdentity
+                            expectedPIDIdentity: expectedPIDIdentity,
+                            requiresClipboardClaim: true
                         )
                         if deliveryTarget == nil {
                             try await self.ensureForegroundFocus(
@@ -166,27 +167,21 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
                 outcome: outputOutcome,
                 targetIdentity: outputOutcome == nil ? nil : actionResult.targetIdentity
             ) {
+                print(ActionOutcomeHumanRenderer.statusLine(for: outputOutcome, operation: "Paste"))
+                print("📋 Payload: \(outcome.setResult.utiIdentifier) (\(outcome.setResult.data.count) bytes)")
+                print("♻️  \(ClipboardTemporaryCleanupStatus.humanDescription(for: outcome.cleanupStatus))")
                 if outcome.restoreErrorDescription != nil {
-                    print("⚠️  Pasted, but clipboard restoration failed. Do not retry the paste; " +
+                    print("⚠️  Clipboard restoration failed. Do not retry the paste; " +
                         "the previous clipboard contents may be unavailable.")
-                } else if outcome.cleanupStatus == .preservedNewerContents {
-                    print(
-                        "Paste input sent; a newer clipboard update was preserved instead of restoring prior contents."
-                    )
-                } else if let outputOutcome {
-                    print(ActionOutcomeHumanRenderer.statusLine(for: outputOutcome, operation: "Paste"))
-                } else {
-                    print("✅ Pasted and restored clipboard")
                 }
-                print("📋 Pasted: \(outcome.setResult.utiIdentifier) (\(outcome.setResult.data.count) bytes)")
                 if let restoreErrorDescription = outcome.restoreErrorDescription {
                     print("♻️  Restore error: \(restoreErrorDescription)")
-                } else if outcome.cleanupStatus == .preservedNewerContents {
-                    print("♻️  Restore skipped: newer clipboard contents preserved")
-                } else if outcome.previousClipboardPresent {
-                    print("♻️  Restored: \(outcome.restoreResult?.utiIdentifier ?? "unknown")")
-                } else {
-                    print("🧹 Restored: cleared (prior clipboard empty)")
+                } else if outcome.cleanupStatus == .restored {
+                    if outcome.previousClipboardPresent {
+                        print("♻️  Restored: \(outcome.restoreResult?.utiIdentifier ?? "unknown")")
+                    } else {
+                        print("🧹 Restored: cleared (prior clipboard empty)")
+                    }
                 }
                 if let targetPID = outcome.targetPID {
                     print("🎯 Mode: background to PID \(targetPID)")
@@ -210,7 +205,7 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
 
     private func requireClipboardPasteRoute(for target: UIAutomationTarget) throws {
         if target.exactWindow != nil {
-            _ = try ExactWindowKeyboardRuntime.requireOutcomeProvider(
+            _ = try ExactWindowKeyboardRuntime.requirePreparedClipboardGuardedPasteProvider(
                 automation: self.services.automation,
                 operation: "Exact-window paste"
             )
@@ -243,6 +238,18 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
         }
         try Task.checkCancellation()
 
+        let claimProvider: (any ClipboardTemporaryWriteClaimProviding)?
+        if target.exactWindow != nil {
+            guard let provider = transaction as? any ClipboardTemporaryWriteClaimProviding else {
+                throw DesktopActionFailure.preDispatchRefusal(
+                    reason: .runtimeIncompatible,
+                    message: "This clipboard transaction cannot retain a General pasteboard write claim."
+                )
+            }
+            claimProvider = provider
+        } else {
+            claimProvider = nil
+        }
         var restorePending = false
         func restoreBeforeDispatchFailure(_ primaryError: any Error) throws -> Never {
             var cleanupErrorDescription: String?
@@ -277,8 +284,16 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
 
         restorePending = true
         let setResult: ClipboardReadResult
+        let clipboardClaim: GeneralPasteboardWriteClaim?
         do {
-            setResult = try transaction.write(request)
+            if let claimProvider {
+                let write = try claimProvider.writeWithClaim(request)
+                setResult = write.result
+                clipboardClaim = write.claim
+            } else {
+                setResult = try transaction.write(request)
+                clipboardClaim = nil
+            }
             clipboardMutation.wasAttempted = transaction.didMutate
             try Task.checkCancellation()
         } catch {
@@ -292,7 +307,8 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
             try await self.dispatchPasteHotkey(
                 target: target,
                 recordingIn: actionSequence,
-                route: actionRoute
+                route: actionRoute,
+                clipboardClaim: clipboardClaim
             )
             dispatchFailure = nil
             dispatchErrorDescription = nil
@@ -585,11 +601,7 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
             outcome: actionResult.outcome,
             targetIdentity: actionResult.targetIdentity
         ) {
-            if let actionOutcome = actionResult.outcome {
-                print(ActionOutcomeHumanRenderer.statusLine(for: actionOutcome, operation: "Paste"))
-            } else {
-                print("✅ Pasted current clipboard")
-            }
+            print(ActionOutcomeHumanRenderer.statusLine(for: actionResult.outcome, operation: "Paste"))
             if let targetPID = outcome.targetPID {
                 print("🎯 Mode: background to PID \(targetPID)")
             } else {
@@ -604,18 +616,25 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
     private func dispatchPasteHotkey(
         target: UIAutomationTarget,
         recordingIn actionSequence: CommandActionSequenceAccumulator?,
-        route: DesktopActionOutcome.Route
+        route: DesktopActionOutcome.Route,
+        clipboardClaim: GeneralPasteboardWriteClaim? = nil
     ) async throws {
         let result = try await AutomationServiceBridge.hotkey(
             automation: self.services.automation,
             keys: "cmd,v",
             holdDuration: 50,
-            target: target
+            target: target,
+            clipboardClaim: clipboardClaim
         )
-        try DesktopActionFailure.requireConfirmedIfReported(
-            result.outcome,
-            operation: "Paste hotkey"
-        )
+        if result.outcome != nil {
+            _ = try UIAutomationActionResultSemantics.requireAcceptedOutcome(
+                result.outcome,
+                policy: .confirmed,
+                operation: "Paste hotkey",
+                targetReceipt: target.processIdentifier == nil ? nil : result.actionTargetReceipt,
+                rejectedOutcomeMessage: "Paste hotkey did not return a confirmed outcome."
+            )
+        }
         if let actionSequence {
             try actionSequence.recordExactTargetLeaf(
                 outcome: result.outcome,
@@ -793,7 +812,8 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
     }
 
     private func verifiedBackgroundTarget(
-        expectedPIDIdentity: UInt64? = nil
+        expectedPIDIdentity: UInt64? = nil,
+        requiresClipboardClaim: Bool = false
     ) async throws -> UIAutomationTarget? {
         if self.focusOptions.foreground {
             try self.validateExplicitPIDIdentity(expectedPIDIdentity)
@@ -817,15 +837,24 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
         }
         if plannedTarget.exactWindow != nil {
             do {
-                _ = try ExactWindowKeyboardRuntime.requireOutcomeProvider(
-                    automation: self.services.automation,
-                    operation: "Exact-window paste"
-                )
+                if requiresClipboardClaim {
+                    _ = try ExactWindowKeyboardRuntime.requirePreparedClipboardGuardedPasteProvider(
+                        automation: self.services.automation,
+                        operation: "Exact-window paste"
+                    )
+                } else {
+                    _ = try ExactWindowKeyboardRuntime.requireOutcomeProvider(
+                        automation: self.services.automation,
+                        operation: "Exact-window paste"
+                    )
+                }
             } catch {
                 throw PreDispatchActionError(
                     message: error.localizedDescription,
                     code: .INTERACTION_FAILED,
-                    hint: "Update the Peekaboo host and retry with a fresh exact-window target.",
+                    hint: "Check the selected runtime's capabilities. For Bridge, inspect the same socket with " +
+                        "`peekaboo bridge status --bridge-socket <path>`; custom-socket trust policy can cap " +
+                        "negotiation at protocol 1.28 even on a current host.",
                     reason: .runtimeIncompatible
                 )
             }
@@ -843,10 +872,14 @@ struct PasteCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormat
     }
 
     private func preDispatchBackgroundTarget(
-        expectedPIDIdentity: UInt64? = nil
+        expectedPIDIdentity: UInt64? = nil,
+        requiresClipboardClaim: Bool = false
     ) async throws -> UIAutomationTarget? {
         do {
-            return try await self.verifiedBackgroundTarget(expectedPIDIdentity: expectedPIDIdentity)
+            return try await self.verifiedBackgroundTarget(
+                expectedPIDIdentity: expectedPIDIdentity,
+                requiresClipboardClaim: requiresClipboardClaim
+            )
         } catch is CancellationError {
             throw CancellationError()
         } catch {

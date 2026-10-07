@@ -217,7 +217,15 @@ export function classifyNpmViewResult({ exitCode, stdout, stderr, expectedVersio
     if (observed !== expectedVersion) fail('npm returned an unexpected published version');
     return 'published';
   }
-  if (/E404|404 Not Found/.test(`${stdout}\n${stderr}`)) return 'absent';
+  const errorCodes = new Set([...stderr.matchAll(/^npm (?:error|ERR!) code ([A-Z][A-Z0-9]+)\s*$/gm)]
+    .map((match) => match[1]));
+  try {
+    const payload = JSON.parse(stdout);
+    if (typeof payload?.error?.code === 'string') errorCodes.add(payload.error.code);
+  } catch {
+    // Older npm clients may report only their stderr error-code line.
+  }
+  if (errorCodes.size === 1 && errorCodes.has('E404')) return 'absent';
   fail(`npm publication state probe failed with exit ${exitCode}`);
 }
 
@@ -272,6 +280,14 @@ export function composeGitHubBody({ notes, proof, plan, checksumsSHA256, npm = n
   return lines.join('\n');
 }
 
+export function githubReleaseAssetsNeedingUpload({ assets, expectedAssets }) {
+  return Object.keys(expectedAssets ?? {}).sort().filter((name) => {
+    const observed = assets.find((asset) => asset?.name === name);
+    const expected = expectedAssets[name];
+    return !observed || observed.size !== expected.size || observed.digest !== `sha256:${expected.sha256}`;
+  });
+}
+
 export function validateGitHubRelease({
   release, version, sourceCommit, tagCommit, expectedAssets, expectedBody, expectDraft,
   allowAssetRepair = false,
@@ -295,7 +311,7 @@ export function validateGitHubRelease({
         observedNames.some((name) => !Object.hasOwn(expectedAssets, name))) {
       fail('GitHub release contains an unexpected asset that cannot be repaired');
     }
-    return;
+    return githubReleaseAssetsNeedingUpload({ assets, expectedAssets });
   }
   if (JSON.stringify(observedNames) !== JSON.stringify(expectedNames)) {
     fail('GitHub release asset inventory differs from the local release');
@@ -353,9 +369,16 @@ if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process
       case 'github-body':
         process.stdout.write(composeGitHubBody(input));
         break;
-      case 'github-release':
-        validateGitHubRelease(input);
+      case 'github-release': {
+        const repairAssets = validateGitHubRelease(input);
+        if (Array.isArray(repairAssets)) {
+          if (repairAssets.some((name) => /[\u0000-\u001f\u007f]/.test(name))) {
+            fail('GitHub release repair asset name contains a control character');
+          }
+          for (const name of repairAssets) process.stdout.write(`${name}\n`);
+        }
         break;
+      }
       default:
         fail('unknown release-driver contract command');
     }

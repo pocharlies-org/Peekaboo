@@ -20,8 +20,8 @@ extension PeekabooAgentService {
         let executionStart: Date
         let metadata: SessionMetadata
         let modelIdentity: PersistedModelIdentity
-        let storedToolExecutionPolicy: MCPToolExecutionPolicy
-        let toolExecutionPolicy: MCPToolExecutionPolicy
+        let storedToolExecutionAuthority: MCPToolExecutionAuthority
+        let toolExecutionAuthority: MCPToolExecutionAuthority
         let provider: (any ModelProvider)?
         let executionGeneration: UUID?
     }
@@ -37,9 +37,9 @@ extension PeekabooAgentService {
         label: String,
         logBehavior: SessionLogBehavior,
         persistSession: Bool = true,
-        toolExecutionPolicy: MCPToolExecutionPolicy = .backgroundOnly) async throws -> SessionContext
+        toolExecutionAuthority: MCPToolExecutionAuthority = .backgroundOnly) async throws -> SessionContext
     {
-        guard toolExecutionPolicy != .unrestricted else {
+        guard toolExecutionAuthority.basePolicy != .unrestricted else {
             throw PeekabooError.invalidInput(
                 "Unrestricted MCP authority cannot be assigned to an Agent session. " +
                     "Use foreground_allowed for explicit foreground UI without shell authority.")
@@ -50,7 +50,7 @@ extension PeekabooAgentService {
         let messages = [
             ModelMessage.system(AgentSystemPrompt.generate(
                 for: model,
-                executionPolicy: toolExecutionPolicy)),
+                executionAuthority: toolExecutionAuthority)),
             ModelMessage.user(task),
         ]
         let configuration = TachikomaConfiguration.resolve(.current)
@@ -73,7 +73,8 @@ extension PeekabooAgentService {
             modelSelection: modelIdentity.selection,
             modelEndpointIdentity: modelIdentity.endpointIdentity,
             modelProviderIdentity: modelIdentity.providerIdentity,
-            toolExecutionPolicy: toolExecutionPolicy,
+            toolExecutionPolicy: toolExecutionAuthority.basePolicy,
+            temporaryClipboardPasteMaximum: toolExecutionAuthority.temporaryClipboardPasteGranted ? true : nil,
             messages: messages,
             metadata: SessionMetadata(),
             createdAt: startTime,
@@ -104,8 +105,8 @@ extension PeekabooAgentService {
             executionStart: startTime,
             metadata: SessionMetadata(),
             modelIdentity: modelIdentity,
-            storedToolExecutionPolicy: toolExecutionPolicy,
-            toolExecutionPolicy: toolExecutionPolicy,
+            storedToolExecutionAuthority: toolExecutionAuthority,
+            toolExecutionAuthority: toolExecutionAuthority,
             provider: provider,
             executionGeneration: executionGeneration)
     }
@@ -160,7 +161,9 @@ extension PeekabooAgentService {
             modelSelection: modelIdentity.selection,
             modelEndpointIdentity: modelIdentity.endpointIdentity,
             modelProviderIdentity: modelIdentity.providerIdentity,
-            toolExecutionPolicy: context.storedToolExecutionPolicy,
+            toolExecutionPolicy: context.storedToolExecutionAuthority.basePolicy,
+            temporaryClipboardPasteMaximum: context.storedToolExecutionAuthority.temporaryClipboardPasteGranted
+                ? true : nil,
             messages: finalMessages.removingConsumedAgentToolImageContext(),
             metadata: updatedMetadata,
             createdAt: context.createdAt,
@@ -217,19 +220,17 @@ extension PeekabooAgentService {
         }
     }
 
-    func makeContinuationContext(
-        from session: AgentSession,
-        userMessage: String?,
-        model: LanguageModel,
-        provider: (any ModelProvider)? = nil,
-        modelIdentity: PersistedModelIdentity? = nil,
-        toolExecutionPolicy: MCPToolExecutionPolicy = .backgroundOnly,
-        executionGeneration: UUID? = nil) -> SessionContext
+    static func updatingSystemPrompt(
+        in messages: [ModelMessage],
+        for model: LanguageModel,
+        executionAuthority: MCPToolExecutionAuthority,
+        availableToolNames: Set<String>? = nil) -> [ModelMessage]
     {
-        var updatedMessages = session.messages
+        var updatedMessages = messages
         let authorityPrompt = AgentSystemPrompt.generate(
             for: model,
-            executionPolicy: toolExecutionPolicy)
+            executionAuthority: executionAuthority,
+            availableToolNames: availableToolNames)
         if let systemIndex = updatedMessages.firstIndex(where: { $0.role == .system }) {
             let existing = updatedMessages[systemIndex]
             updatedMessages[systemIndex] = ModelMessage(
@@ -242,6 +243,22 @@ extension PeekabooAgentService {
         } else {
             updatedMessages.insert(.system(authorityPrompt), at: 0)
         }
+        return updatedMessages
+    }
+
+    func makeContinuationContext(
+        from session: AgentSession,
+        userMessage: String?,
+        model: LanguageModel,
+        provider: (any ModelProvider)? = nil,
+        modelIdentity: PersistedModelIdentity? = nil,
+        toolExecutionAuthority: MCPToolExecutionAuthority = .backgroundOnly,
+        executionGeneration: UUID? = nil) -> SessionContext
+    {
+        var updatedMessages = Self.updatingSystemPrompt(
+            in: session.messages,
+            for: model,
+            executionAuthority: toolExecutionAuthority)
         if let userMessage {
             updatedMessages.append(.user(userMessage))
         }
@@ -256,8 +273,8 @@ extension PeekabooAgentService {
             executionStart: Date(),
             metadata: session.metadata,
             modelIdentity: modelIdentity,
-            storedToolExecutionPolicy: session.effectiveToolExecutionPolicy,
-            toolExecutionPolicy: toolExecutionPolicy,
+            storedToolExecutionAuthority: session.maximumToolExecutionAuthority,
+            toolExecutionAuthority: toolExecutionAuthority,
             provider: provider,
             executionGeneration: executionGeneration)
     }

@@ -11,6 +11,30 @@ read_when:
 
 Observation is read-only with respect to focus: targeting a background app does not activate it or move its windows.
 
+Pass `--fresh` to require an uncached Accessibility traversal for either a screenshot-backed observation or
+`--tree --no-screenshot`. It is opt-in: ordinary observations retain the existing cache and performance behavior.
+The request fails before publishing a usable snapshot if the host returns cached, unknown, or unacknowledged AX
+evidence. Screenshot-backed remote freshness requires the additive `desktopObservationFreshAccessibilityTree`
+host capability, independently of authenticated producer-bound snapshot support and enabled operations. A host
+can advertise fresh AX yet fail another requirement; the refusal identifies the evaluated requirement, rather
+than assuming fresh AX is missing or the binary is outdated. Explicit `--no-remote` selects caller-local
+observation. There is no cached fallback.
+Pixel-only modes (`--no-elements`, raw image stdout, `area`, and `multi`) and menu-bar capture reject `--fresh`.
+
+JSON `used_cache` is `true` for a known AX cache hit and `false` for a known uncached AX traversal. An absent field
+means the evidence is unknown or not applicable. Freshness does not mean completeness: truncated or partial trees
+retain their existing warnings and targeting restrictions. Text-selection range readback remains limited to the
+focused field; `--fresh` does not make unfocused ranges available.
+
+Pixels and Accessibility metadata are collected at different times, not as one atomic application-state snapshot.
+During asynchronous UI updates, an image can still show the old value while AX already reports the new value.
+Atomic snapshot publication binds the returned artifacts; it does not make their acquisition simultaneous. After
+an unverified or indeterminate action, use [`verify`](verify.md) (or MCP `verify_state`) to check fresh target state,
+then capture again if visual confirmation is needed. Do not replay the action to resolve conflicting observations.
+
+Native Accessibility date values are exposed as ISO-8601 UTC timestamps with milliseconds, alongside existing string,
+number and boolean control values. Nonfinite dates remain unavailable; titles and labels remain string-only.
+
 The command's `--timeout` also bounds pixel-only observations (`--no-elements`, raw image stdout, area, and multi
 capture), including snapshot reservation, capture, optional analysis, and failure cleanup. Multiple captures share
 one budget rather than restarting it for each image. Timed-out work cannot later publish successful command output.
@@ -32,6 +56,13 @@ AX-tree-only forms because their snapshots and capability decisions are host-mem
 Frontmost screenshots retain the application identity observed at the start of the request and report the logical
 `frontmost` capture mode, even when the capture engine uses that application's exact window. The captured process
 generation, window ID, and bounds must still match before the result can be accepted by the Bridge.
+
+Capture window metadata's `isMainWindow` is affirmative only when the captured window information already carries
+main-state evidence for that exact window. Classic or ScreenCaptureKit visibility, capture selection, and window-list
+position do not establish main state. Without that evidence, the existing `false` value means main state is not
+established, not that the native window is definitively not main. Normalization preserves an already supplied value;
+target resolution does not propagate missing inventory/AX main-state evidence into capture. This adds no Accessibility
+polling or public metadata fields.
 
 Every reusable snapshot is identified by a producer-generated reference with the exact form `ps1_` followed by 32
 lowercase ASCII hexadecimal digits, for example `ps1_0123456789abcdef0123456789abcdef`. The 32-digit suffix contains
@@ -56,6 +87,9 @@ peekaboo see --window-id 12345 --roi 100,80,500,300 --json --path /tmp/window-ro
 
 # Add host-local Vision text when an app exposes a sparse or incomplete AX tree
 peekaboo see --app Calendar --window-id 12345 --ocr --json --path /tmp/calendar.png
+
+# Require a new AX traversal without capturing pixels
+peekaboo see --app TextEdit --tree --no-screenshot --fresh --json
 ```
 
 ## When to use
@@ -78,6 +112,7 @@ peekaboo see --app Calendar --window-id 12345 --ocr --json --path /tmp/calendar.
 | `--capture-engine auto|modern|sckit|classic|cg` | Select the engine for this request on the chosen Bridge host. Explicit remote modern/classic selection requires `desktopObservationCaptureEngine`; every transported engine also requires the current `screenCaptureKitProcessOwnership` policy. Live pre-lease hosts/processes are refused during upgrades instead of creating an unrecorded second owner. `--no-remote --capture-engine modern` requests caller-local process-lifetime SCK ownership and refuses immediately if another Peekaboo process owns it; retry remotely, stop that exact owner generation, or explicitly choose classic. An explicit `--bridge-socket` never reroutes and must identify that exact owner for modern capture. |
 | `--no-elements` | Skip element detection for the cheapest pixel path. An exact `--window-id` capture still returns an explicit-reference-only `snapshot_id` with a coordinate receipt for background clicks; it never replaces an earlier element map in implicit latest lookup. Remote receipt publication requires Bridge protocol 1.26 and fails with host-upgrade guidance before capture on older hosts. Ordinary screen, area, frontmost, multi, and app/PID-only pixel captures stay backward-compatible and do not return a receipt. |
 | `--ocr` | Add Apple Vision text recognized on the selected runtime host to the AX element map. Requires screenshot-backed element detection and cannot be combined with `--no-elements`, `--no-screenshot`, `--path -`, `area`, or `multi`. |
+| `--fresh` | Require uncached Accessibility evidence for screenshot-backed or AX-only observations. Defaults to false; rejects pixel-only and menu-bar capture. |
 | `--tree` | Print the accessibility text tree. For an explicit WindowServer ID with no matching AX window, tree-only read-only observation may return application-scoped partial semantics instead of relabeling another window as the requested target. |
 | `--no-screenshot` | Skip pixel capture; requires `--tree` and rejects `--capture-engine` because no backend runs. Ambient engine configuration is ignored so it cannot reroute this AX-only form. Element IDs and a snapshot publish only after pinning the exact process generation, window, and bounds; target drift or a missing receipt fails before publication. |
 | `--annotate` | Overlay element bounds/IDs on the output image. |
@@ -205,7 +240,7 @@ The shared reader also withholds post-mutation value evidence when security meta
 
 ## Troubleshooting tips
 
-- Actionable snapshots on an explicit Bridge host require authenticated, producer-bound snapshot support (protocol 1.34 or newer), not just the older explicit-publication capability. A custom socket without a configured host-signing policy intentionally negotiates protocol 1.28. Use a current signed host on its standard socket, or omit `--bridge-socket` for normal host selection; updating the binary alone does not establish custom-socket trust.
+- Actionable snapshots on an explicit Bridge host require authenticated, producer-bound snapshot support (protocol 1.34 or newer), not just the older explicit-publication or fresh-AX capability. Public CLI automation intentionally negotiates protocol 1.28 on arbitrary custom sockets, even with a current signed host that advertises `desktopObservationFreshAccessibilityTree`. Use the host's standard socket or its actual runtime-derived canonical build-scoped daemon socket, or omit `--bridge-socket` for normal host selection; updating the binary alone does not establish custom-socket trust. `--trusted-host-team-id` is only for receipt validation, not an automation trust override.
 - `--verbose` adds a content-free observed-focus summary to the existing capture log (`debug_logs` in JSON mode): raw true/false/unknown `AXFocused` counts, focused element types, `rawResolver`, and cache/partial/truncation/attached-receipt flags. Raw counts include menu-bar nodes; the resolver retains its existing menu-bar exclusion. `rawResolver` describes the boolean-only candidates, while `attached` reflects the final observation, which may additionally corroborate the native application receiver. ROI-filtered captures skip raw re-resolution because their cropped subset cannot explain the original observation's focus. Logging itself adds no Accessibility reads or input authority.
 - Some apps mark focused ancestor groups as well as their text field. A fresh, complete exact-window observation can resolve that ambiguity only when the application's native focused reference stays unchanged across traversal, uniquely matches a genuinely focused captured node, and proves the same process/window ownership. The optional initial focus read reserves most of the remaining deadline for ordinary traversal; it never restarts the observation timeout. Missing or unstable evidence stays unknown; cached, application-partial and truncated captures cannot use this additional corroboration. Input still performs its normal live receiver and key-window validation.
 

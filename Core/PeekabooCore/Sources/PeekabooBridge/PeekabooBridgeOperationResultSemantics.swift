@@ -23,6 +23,10 @@ extension PeekabooBridgeOperationResultSemantics {
         case let .browserExecute(payload):
             guard payload.isReadOnly else { return self.contract(for: request.operation) }
             return .init(completion: .readOnly, targetPolicy: .notApplicable)
+        case let .dialogHandleFile(payload) where payload.execution != nil:
+            return .init(
+                completion: .dispatchedUnverified(.init(mechanism: .composite, mode: .foreground)),
+                targetPolicy: .responseResolved)
         case let .click(payload):
             let delivery: DesktopActionOutcome.Delivery
             let targetPolicy: TargetPolicy
@@ -280,8 +284,6 @@ extension PeekabooBridgeOperationResultSemantics {
 
     private static func desktopOperationScope(for request: PeekabooBridgeRequest) -> DesktopOperationScope {
         switch request {
-        case .foregroundModifierClick:
-            .global
         case let .exactWindowTargetedTypeActions(payload):
             .process(payload.expectedWindowIdentity.processIdentity)
         case let .exactWindowPixelFocusType(payload):
@@ -290,6 +292,8 @@ extension PeekabooBridgeOperationResultSemantics {
             .process(payload.expectedWindowIdentity.processIdentity)
         case let .beginExactWindowHeldPointer(payload):
             .window(payload.request.windowIdentity)
+        case let .exactWindowDrag(payload):
+            .window(payload.target.identity)
         case let .releaseExactWindowHeldPointer(payload),
              let .revokeExactWindowHeldPointer(payload):
             .window(payload.receipt.windowIdentity)
@@ -328,20 +332,6 @@ extension PeekabooBridgeOperationResultSemantics {
             .window(receipt.target.identity)
         default:
             .global
-        }
-    }
-
-    private static func targetedClickOperationScope(
-        _ payload: PeekabooBridgeTargetedClickRequest) -> DesktopOperationScope
-    {
-        if let targetWindowID = payload.targetWindowID,
-           let identity = payload.expectedWindowIdentity,
-           payload.expectedWindowBounds != nil,
-           identity.windowID == targetWindowID
-        {
-            .process(identity.processIdentity)
-        } else {
-            payload.expectedProcessIdentity.map(DesktopOperationScope.process) ?? .global
         }
     }
 
@@ -450,8 +440,7 @@ extension PeekabooBridgeOperationResultSemantics {
             .typeActions(.init(
                 actions: payload.request.actions,
                 allowsAccessibilityValueDelivery: true,
-                additionalDispatchUnits: 1,
-                additionalUsesAccessibilityValue: true,
+                additionalAccessibilityUnits: 1,
                 allowsConfirmedChange: true))
         case let .setValue(payload):
             .setValue(
@@ -459,6 +448,8 @@ extension PeekabooBridgeOperationResultSemantics {
                 value: self.canonicalSetValue(payload.value))
         case let .performAction(payload):
             .performAction(target: payload.target, actionName: payload.actionName)
+        case let .selectText(payload):
+            .selectText(target: payload.target, request: payload.request)
         case .attestedOperation,
              .projectedAction,
              .handshake,
@@ -491,6 +482,7 @@ extension PeekabooBridgeOperationResultSemantics {
              .foregroundModifierClick,
              .createExactWindowHeldPointerOwner,
              .beginExactWindowHeldPointer,
+             .exactWindowDrag,
              .releaseExactWindowHeldPointer,
              .revokeExactWindowHeldPointer,
              .disconnectExactWindowHeldPointerOwner,
@@ -533,6 +525,7 @@ extension PeekabooBridgeOperationResultSemantics {
              .clickMenuExtra,
              .menuExtraOpenMenuFrame,
              .listMenuBarItems,
+             .prepareMenuBarItem,
              .clickMenuBarItemNamed,
              .clickMenuBarItemIndex,
              .listDockItems,
@@ -596,6 +589,14 @@ extension PeekabooBridgeOperationResultSemantics {
         completion: Completion) -> [DesktopActionOutcome.State]
     {
         guard completion.mutatesDesktop else { return [] }
+        if request.requiresExactFileDialogExecution {
+            return [.confirmedChange, .dispatchedUnverified]
+        }
+        if request.requiresClipboardGuardedExactWindowHotkey || request
+            .requiresPreparedClipboardGuardedExactWindowHotkey
+        {
+            return [.dispatchedUnverified]
+        }
         let verifiedOrAccepted: [DesktopActionOutcome.State] = [
             .confirmedChange,
             .confirmedNoChange,
@@ -612,7 +613,7 @@ extension PeekabooBridgeOperationResultSemantics {
              .detectElements, .inspectAccessibilityTree,
              .exactDialogForceDismiss:
             return [.dispatchedUnverified]
-        case .beginExactWindowHeldPointer:
+        case .beginExactWindowHeldPointer, .exactWindowDrag:
             return [.dispatchedUnverified]
         case .releaseExactWindowHeldPointer, .revokeExactWindowHeldPointer:
             return [.confirmedNoChange, .dispatchedUnverified]
@@ -638,7 +639,7 @@ extension PeekabooBridgeOperationResultSemantics {
         case .click, .type, .typeActions, .targetedTypeActions, .exactWindowTargetedTypeActions,
              .exactWindowPixelFocusType,
              .foregroundModifierClick,
-             .setValue, .performAction, .scroll, .targetedScroll, .hotkey, .targetedHotkey,
+             .setValue, .selectText, .performAction, .scroll, .targetedScroll, .hotkey, .targetedHotkey,
              .exactWindowTargetedHotkey, .targetedClick, .exactWindowTargetedClick,
              .focusWindow, .moveWindow, .resizeWindow, .setWindowBounds, .closeWindow,
              .backgroundCloseWindow, .minimizeWindow, .restoreWindow, .maximizeWindow:
@@ -664,7 +665,8 @@ extension PeekabooBridgeOperationResultSemantics {
              .getFocusedElement, .waitForElement, .listWindows, .getFocusedWindow,
              .listApplications, .findApplication, .getFrontmostApplication, .isApplicationRunning,
              .listMenus, .listFrontmostMenus, .listMenuExtras, .menuExtraOpenMenuFrame,
-             .listMenuBarItems, .listDockItems, .isDockHidden, .findDockItem, .dialogFindActive,
+             .listMenuBarItems, .prepareMenuBarItem, .listDockItems, .isDockHidden, .findDockItem,
+             .dialogFindActive,
              .dialogListElements, .targetedDialogListElements, .prepareDialogAction, .createSnapshot,
              .storeDetectionResult, .getDetectionResult, .ownsSnapshot, .storeScreenshot,
              .storeObservationSnapshot,
@@ -676,7 +678,10 @@ extension PeekabooBridgeOperationResultSemantics {
     }
 
     private static func successResponsePolicy(for request: PeekabooBridgeRequest) -> SuccessResponsePolicy {
-        switch request.operation {
+        if request.requiresExactFileDialogExecution {
+            return .ordinary
+        }
+        return switch request.operation {
         case .unhideApplication, .dialogClickButton, .backgroundDialogClickButton,
              .dialogEnterText, .dialogHandleFile, .dialogDismiss:
             .errorOnly
@@ -801,6 +806,18 @@ extension PeekabooBridgeOperationResultSemantics {
             }
             return rules
         case let .exactWindowTargetedHotkey(payload):
+            if payload.backgroundPreparation != nil {
+                guard payload.clipboardClaim != nil, payload.expectedFocusedElement != nil,
+                      payload.holdDuration > 0, HotkeyService.isPasteShortcut(payload.keys)
+                else { return [] }
+                return [
+                    DeliveryRule(delivery: nativeBackground, units: .exact(1), allowsSuccessfulOutcome: false),
+                    rule(compositeBackground, .exact(8)),
+                ]
+            }
+            if payload.clipboardClaim != nil {
+                return [rule(windowBackground, .exact(4))]
+            }
             var rules = [
                 rule(axBackground, .variable),
                 rule(windowBackground, .variable),
@@ -811,6 +828,12 @@ extension PeekabooBridgeOperationResultSemantics {
             return rules
         case .beginExactWindowHeldPointer:
             return [rule(windowBackground, .exact(2), failureUnits: .oneOf([1, 2, 3]))]
+        case let .exactWindowDrag(payload):
+            guard (try? payload.validate()) != nil else { return [] }
+            return [rule(
+                windowBackground,
+                .exact(payload.dispatchedUnitCount),
+                failureUnits: .range(1...payload.dispatchedUnitCount))]
         case .releaseExactWindowHeldPointer, .revokeExactWindowHeldPointer,
              .disconnectExactWindowHeldPointerOwner:
             return [rule(windowBackground, .exact(1), failureUnits: .exact(2))]
@@ -868,7 +891,7 @@ extension PeekabooBridgeOperationResultSemantics {
             return [rule(globalForeground, .variable)]
         case .swipe, .drag, .moveMouse:
             return [rule(globalForeground, .exact(1))]
-        case .setValue:
+        case .setValue, .selectText:
             return [rule(valueBackground, .exact(1))]
         case .performAction:
             return [rule(axBackground, .exact(1))]
@@ -957,6 +980,15 @@ extension PeekabooBridgeOperationResultSemantics {
             ]
         case .exactDialogEnterText:
             return [rule(valueBackground, .oneOf([1, 2]))]
+        case let .dialogHandleFile(payload) where payload.execution != nil:
+            return [
+                rule(axForeground, .positive),
+                rule(valueForeground, .positive),
+                rule(nativeForeground, .positive),
+                rule(globalForeground, .positive),
+                rule(clipboardForeground, .positive),
+                rule(compositeForeground, .positive),
+            ]
         case .dialogHandleFile:
             return [rule(globalForeground, .variable), rule(clipboardForeground, .variable)]
         case .exactDialogClickButton, .exactDialogDismiss:
@@ -1059,6 +1091,9 @@ extension PeekabooBridgeOperationResultSemantics {
         globalForeground: DesktopActionOutcome.Delivery,
         windowBackground: DesktopActionOutcome.Delivery) -> [DeliveryRule]
     {
+        if request.point != nil, request.foreground || request.target != nil {
+            return []
+        }
         if request.foreground {
             return [.init(delivery: globalForeground, units: .variable)]
         }
@@ -1151,6 +1186,12 @@ extension PeekabooBridgeOperationResultSemantics {
         plan: PeekabooBridgeRequestPlan) -> Bool
     {
         guard outcome.route == .bridge, !outcome.isConfirmed else { return false }
+        if plan.operation == .exactWindowDrag || plan.request.requiresClipboardGuardedExactWindowHotkey ||
+            plan.request.requiresPreparedClipboardGuardedExactWindowHotkey,
+            ![.refused, .dispatchedUnverified, .indeterminate].contains(outcome.state)
+        {
+            return false
+        }
         if outcome.state == .refused {
             return outcome.delivery == nil && outcome.dispatchState == .none
         }
@@ -1160,6 +1201,12 @@ extension PeekabooBridgeOperationResultSemantics {
             return plan.deliveryAgnosticFailureUnits?.acceptsSuccessful(unitCount) == true
         }
         guard let rule = plan.deliveryRule(for: delivery) else { return false }
+        if plan.request.requiresPreparedClipboardGuardedExactWindowHotkey,
+           delivery.mechanism == .composite, let count = outcome.dispatchState.unitCount,
+           !(2...8).contains(count.rawValue)
+        {
+            return false
+        }
         if let units = plan.typedResponseRule.typeActionDispatchUnits {
             return units.acceptsFailureProgress(outcome.dispatchState.unitCount)
         }

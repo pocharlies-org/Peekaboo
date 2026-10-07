@@ -33,9 +33,12 @@ public class RemoteUIAutomationService: DetectElementsRequestTimeoutAdjusting, T
     public let supportsExactWindowTargetedClicks: Bool
     public let supportsTargetedScroll: Bool
     public let supportsRequestPinnedExactWindowScrollReceipt: Bool
+    public let supportsBackgroundCoordinateScroll: Bool
     public let supportsInspectAccessibilityTree: Bool
     public let inspectAccessibilityTreeUnavailableReason: String?
     public let supportsExactWindowTargetedKeyboard: Bool
+    public let supportsClipboardGuardedExactWindowHotkeys: Bool
+    public let supportsPreparedClipboardGuardedExactWindowHotkeys: Bool
     public let exactWindowTargetedKeyboardUnavailableReason: String?
     public let supportsExactWindowCompositeTypeDelivery: Bool
     public let exactWindowCompositeTypeDeliveryUnavailableReason: String?
@@ -45,9 +48,11 @@ public class RemoteUIAutomationService: DetectElementsRequestTimeoutAdjusting, T
     public let supportsForegroundModifierClickSnapshotLease: Bool
     public let foregroundModifierClickUnavailableReason: String?
     public let supportsExactWindowHeldPointerLifecycle: Bool
+    public let supportsExactWindowDrag: Bool
     public let supportsSetValueResultTargetBinding: Bool
+    public let supportsTextSelection: Bool
 
-    public init(
+    public required init(
         client: PeekabooBridgeClient,
         supportsTargetedHotkeys: Bool = false,
         supportsProcessGenerationPinnedHotkeys: Bool = false,
@@ -66,9 +71,12 @@ public class RemoteUIAutomationService: DetectElementsRequestTimeoutAdjusting, T
         supportsExactWindowTargetedClicks: Bool = false,
         supportsTargetedScroll: Bool = false,
         supportsRequestPinnedExactWindowScrollReceipt: Bool = false,
+        supportsBackgroundCoordinateScroll: Bool = false,
         supportsInspectAccessibilityTree: Bool = false,
         inspectAccessibilityTreeUnavailableReason: String? = nil,
         supportsExactWindowTargetedKeyboard: Bool = false,
+        supportsClipboardGuardedExactWindowHotkeys: Bool = false,
+        supportsPreparedClipboardGuardedExactWindowHotkeys: Bool = false,
         exactWindowTargetedKeyboardUnavailableReason: String? = nil,
         supportsExactWindowCompositeTypeDelivery: Bool = false,
         exactWindowCompositeTypeDeliveryUnavailableReason: String? = nil,
@@ -77,7 +85,9 @@ public class RemoteUIAutomationService: DetectElementsRequestTimeoutAdjusting, T
         supportsForegroundModifierClick: Bool = false,
         foregroundModifierClickUnavailableReason: String? = nil,
         supportsExactWindowHeldPointerLifecycle: Bool = false,
-        supportsSetValueResultTargetBinding: Bool = false)
+        supportsExactWindowDrag: Bool = false,
+        supportsSetValueResultTargetBinding: Bool = false,
+        supportsTextSelection: Bool = false)
     {
         self.client = client
         self.supportsTargetedHotkeys = supportsTargetedHotkeys
@@ -97,9 +107,13 @@ public class RemoteUIAutomationService: DetectElementsRequestTimeoutAdjusting, T
         self.supportsExactWindowTargetedClicks = supportsExactWindowTargetedClicks
         self.supportsTargetedScroll = supportsTargetedScroll
         self.supportsRequestPinnedExactWindowScrollReceipt = supportsRequestPinnedExactWindowScrollReceipt
+        self.supportsBackgroundCoordinateScroll = supportsBackgroundCoordinateScroll
         self.supportsInspectAccessibilityTree = supportsInspectAccessibilityTree
         self.inspectAccessibilityTreeUnavailableReason = inspectAccessibilityTreeUnavailableReason
         self.supportsExactWindowTargetedKeyboard = supportsExactWindowTargetedKeyboard
+        self.supportsClipboardGuardedExactWindowHotkeys = supportsClipboardGuardedExactWindowHotkeys
+        self.supportsPreparedClipboardGuardedExactWindowHotkeys = supportsPreparedClipboardGuardedExactWindowHotkeys &&
+            supportsClipboardGuardedExactWindowHotkeys
         self.exactWindowTargetedKeyboardUnavailableReason = exactWindowTargetedKeyboardUnavailableReason
         self.supportsExactWindowCompositeTypeDelivery = supportsExactWindowCompositeTypeDelivery
         self.exactWindowCompositeTypeDeliveryUnavailableReason = exactWindowCompositeTypeDeliveryUnavailableReason
@@ -109,7 +123,9 @@ public class RemoteUIAutomationService: DetectElementsRequestTimeoutAdjusting, T
         self.supportsForegroundModifierClickSnapshotLease = supportsForegroundModifierClick
         self.foregroundModifierClickUnavailableReason = foregroundModifierClickUnavailableReason
         self.supportsExactWindowHeldPointerLifecycle = supportsExactWindowHeldPointerLifecycle
+        self.supportsExactWindowDrag = supportsExactWindowDrag
         self.supportsSetValueResultTargetBinding = supportsSetValueResultTargetBinding
+        self.supportsTextSelection = supportsTextSelection
     }
 
     public func detectElements(
@@ -407,17 +423,29 @@ public class RemoteUIAutomationService: DetectElementsRequestTimeoutAdjusting, T
     }
 
     public func scroll(_ request: ScrollRequest) async throws {
+        try self.validateScrollCapabilities(request)
+        do {
+            try await self.client.scroll(request)
+        } catch let envelope as PeekabooBridgeErrorEnvelope {
+            throw Self.automationError(for: envelope, snapshotId: request.snapshotId)
+        }
+    }
+
+    func validateScrollCapabilities(_ request: ScrollRequest) throws {
+        try request.validatePointSelector()
+        if request.point != nil, !self.supportsBackgroundCoordinateScroll {
+            throw DesktopActionFailure.preDispatchRefusal(
+                route: .bridge,
+                reason: .runtimeIncompatible,
+                message: "Remote bridge host does not support background coordinate scroll.",
+                hint: "Update and relaunch Peekaboo before retrying coordinate scroll.")
+        }
         if !request.foreground,
            !self.supportsTargetedScroll || !self.supportsRequestPinnedExactWindowScrollReceipt
         {
             throw PeekabooError.serviceUnavailable(
                 "Remote bridge host cannot preserve exact-window background scroll receipts; relaunch or update " +
                     "Peekaboo.")
-        }
-        do {
-            try await self.client.scroll(request)
-        } catch let envelope as PeekabooBridgeErrorEnvelope {
-            throw Self.automationError(for: envelope, snapshotId: request.snapshotId)
         }
     }
 
@@ -711,6 +739,18 @@ public class RemoteUIAutomationService: DetectElementsRequestTimeoutAdjusting, T
 @MainActor
 public final class RemoteElementActionUIAutomationService: RemoteUIAutomationService,
 ElementActionAutomationServiceProtocol {
+    public func selectText(
+        target: String,
+        request: TextSelectionRequest,
+        snapshotId: String?) async throws -> UIAutomationActionResult<ElementActionResult>
+    {
+        do {
+            return try await self.client.selectText(target: target, request: request, snapshotId: snapshotId)
+        } catch let envelope as PeekabooBridgeErrorEnvelope {
+            throw Self.automationError(for: envelope, snapshotId: snapshotId)
+        }
+    }
+
     public var supportsProcessGenerationBoundElementMutations: Bool {
         true
     }
@@ -736,6 +776,15 @@ ElementActionAutomationServiceProtocol {
         } catch let envelope as PeekabooBridgeErrorEnvelope {
             throw Self.automationError(for: envelope, snapshotId: snapshotId)
         }
+    }
+}
+
+extension RemoteUIAutomationService: ExactWindowDragServiceProtocol {
+    public func dragExactWindow(
+        _ request: ExactWindowDragRequest,
+        boundTo _: ApplicationProcessIdentity? = nil) async throws -> UIAutomationActionResult<Void>
+    {
+        try await self.client.dragExactWindow(request)
     }
 }
 
