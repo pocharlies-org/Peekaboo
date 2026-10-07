@@ -4,6 +4,23 @@ import PeekabooFoundation
 
 @MainActor
 extension PeekabooBridgeServer {
+    static func updateScopedMenuBarActionsCapability(
+        to resolvedHostCapabilities: inout Set<String>,
+        services: any PeekabooBridgeServiceProviding,
+        supportedVersions: ClosedRange<PeekabooBridgeProtocolVersion>,
+        allowedOperations: Set<PeekabooBridgeOperation>)
+    {
+        if supportedVersions.upperBound >= PeekabooBridgeConstants.scopedMenuBarActionsVersion,
+           allowedOperations.isSuperset(of: [.prepareMenuBarItem, .clickMenuBarItemNamed]),
+           services.menu is any MenuServiceScopedMenuBarPreparationProviding,
+           services.menu is any MenuServiceExactLeafActionResultProviding
+        {
+            resolvedHostCapabilities.insert(PeekabooBridgeHostCapability.scopedMenuBarActions)
+        } else {
+            resolvedHostCapabilities.remove(PeekabooBridgeHostCapability.scopedMenuBarActions)
+        }
+    }
+
     static func invalidRequest(for request: PeekabooBridgeRequest) -> PeekabooBridgeErrorEnvelope {
         PeekabooBridgeErrorEnvelope(
             code: .invalidRequest,
@@ -73,7 +90,27 @@ extension PeekabooBridgeServer {
             usesAttestedOperationReceipts: supportsAttestedOperationReceipts)
         var advertisedOps = compatibleOperations.advertised.sorted { $0.rawValue < $1.rawValue }
         var enabledOps = compatibleOperations.enabled
+        if (self.services.automation as? any ExactWindowTargetedKeyboardServiceProtocol)?
+            .supportsExactWindowTargetedKeyboard != true,
+            !supportsAttestedOperationReceipts ||
+            negotiated < PeekabooBridgeConstants.clipboardGuardedExactWindowHotkeyVersion
+        {
+            advertisedOps.removeAll { $0 == .exactWindowTargetedHotkey }
+            enabledOps.remove(.exactWindowTargetedHotkey)
+        }
+        if !supportsAttestedOperationReceipts {
+            advertisedOps.removeAll { $0 == .exactWindowDrag }
+            enabledOps.remove(.exactWindowDrag)
+        }
         let clientCapabilities = Set(payload.clientCapabilities ?? [])
+        let supportsScopedMenuBarActions = supportsAttestedOperationReceipts &&
+            negotiated >= PeekabooBridgeConstants.scopedMenuBarActionsVersion &&
+            clientCapabilities.contains(PeekabooBridgeClientCapability.scopedMenuBarActions) &&
+            self.hostCapabilities.contains(PeekabooBridgeHostCapability.scopedMenuBarActions)
+        if !supportsScopedMenuBarActions {
+            advertisedOps.removeAll { $0 == .prepareMenuBarItem }
+            enabledOps.remove(.prepareMenuBarItem)
+        }
         let browserHandoffOperations: Set<PeekabooBridgeOperation> = [
             .browserStatus,
             .browserConnect,
@@ -144,6 +181,12 @@ extension PeekabooBridgeServer {
             permissions: permissions,
             enabledOperations: &enabledOps,
             permissionTags: &permissionTags)
+        Self.applyExactFileDialogPermissionContract(
+            supportsAttestedOperationReceipts: supportsAttestedOperationReceipts,
+            advertisedOperations: advertisedOps,
+            permissions: permissions,
+            enabledOperations: &enabledOps,
+            permissionTags: &permissionTags)
         let requestAwareTargetedClickVersion = PeekabooBridgeProtocolVersion(major: 1, minor: 9)
         if negotiated < requestAwareTargetedClickVersion,
            advertisedOps.contains(.targetedClick)
@@ -166,6 +209,18 @@ extension PeekabooBridgeServer {
             """)
 
         var advertisedCapabilities = self.hostCapabilities
+        if !supportsScopedMenuBarActions ||
+            !Set([PeekabooBridgeOperation.prepareMenuBarItem, .clickMenuBarItemNamed]).isSubset(of: advertisedOps)
+        {
+            advertisedCapabilities.remove(PeekabooBridgeHostCapability.scopedMenuBarActions)
+        }
+        if !supportsAttestedOperationReceipts ||
+            negotiated < PeekabooBridgeConstants.exactFileDialogExecutionVersion ||
+            !self.services.dialogs.supportsExactFileDialogExecution ||
+            !advertisedOps.contains(.dialogHandleFile) || !enabledOps.contains(.dialogHandleFile)
+        {
+            advertisedCapabilities.remove(PeekabooBridgeHostCapability.exactFileDialogExecution)
+        }
         if !supportsBrowserConnectionHandoff {
             advertisedCapabilities.remove(PeekabooBridgeHostCapability.browserConnectionHandoff)
         }
@@ -217,6 +272,13 @@ extension PeekabooBridgeServer {
             advertisedCapabilities.remove(PeekabooBridgeHostCapability.exactWindowHeldPointerLifecycle)
         }
         if !supportsAttestedOperationReceipts ||
+            negotiated < PeekabooBridgeConstants.exactWindowDragVersion ||
+            !advertisedOps.contains(.exactWindowDrag) ||
+            (self.services.automation as? any ExactWindowDragServiceProtocol)?.supportsExactWindowDrag != true
+        {
+            advertisedCapabilities.remove(PeekabooBridgeHostCapability.exactWindowDrag)
+        }
+        if !supportsAttestedOperationReceipts ||
             negotiated < PeekabooBridgeConstants.agentExecutionTraceVersion ||
             !advertisedOps.contains(.agentExecutionTrace) ||
             !enabledOps.contains(.agentExecutionTrace)
@@ -245,7 +307,13 @@ extension PeekabooBridgeServer {
         {
             advertisedCapabilities.remove(PeekabooBridgeHostCapability.setValueResultTargetBinding)
         }
-        let elementMutationOperations: Set<PeekabooBridgeOperation> = [.setValue, .performAction]
+        if !supportsAttestedOperationReceipts || negotiated < PeekabooBridgeConstants.textSelectionVersion ||
+            (self.services.automation as? any ElementActionAutomationServiceProtocol)?.supportsTextSelection != true ||
+            !advertisedOps.contains(.selectText)
+        {
+            advertisedCapabilities.remove(PeekabooBridgeHostCapability.textSelection)
+        }
+        let elementMutationOperations: Set<PeekabooBridgeOperation> = [.setValue, .selectText, .performAction]
         if !supportsAttestedOperationReceipts ||
             negotiated < PeekabooBridgeConstants.processGenerationBoundElementMutationsVersion ||
             !(self.services.automation is any UIAutomationActionOutcomeProviding) ||
@@ -283,8 +351,24 @@ extension PeekabooBridgeServer {
         {
             advertisedCapabilities.remove(PeekabooBridgeHostCapability.compositeTypeDelivery)
         }
+        if !supportsAttestedOperationReceipts ||
+            negotiated < PeekabooBridgeConstants.clipboardGuardedExactWindowHotkeyVersion ||
+            (self.services.automation as? any ClipboardGuardedExactWindowHotkeyServiceProtocol)?
+            .supportsClipboardGuardedExactWindowHotkeys != true ||
+            !advertisedOps.contains(.exactWindowTargetedHotkey) ||
+            !enabledOps.contains(.exactWindowTargetedHotkey)
+        {
+            advertisedCapabilities.remove(PeekabooBridgeHostCapability.clipboardGuardedExactWindowHotkeys)
+        }
         if supportsAttestedOperationReceipts {
             advertisedCapabilities.insert(PeekabooBridgeHostCapability.attestedOperationReceipts)
+        }
+        if !advertisedCapabilities.contains(PeekabooBridgeHostCapability.clipboardGuardedExactWindowHotkeys) ||
+            negotiated < PeekabooBridgeConstants.preparedClipboardGuardedExactWindowHotkeyVersion ||
+            (self.services.automation as? any PreparedClipboardGuardedExactWindowHotkeyServiceProtocol)?
+            .supportsPreparedClipboardGuardedExactWindowHotkeys != true
+        {
+            advertisedCapabilities.remove(PeekabooBridgeHostCapability.preparedClipboardGuardedExactWindowHotkeys)
         }
         let operationSessionAttestation: PeekabooBridgeOperationSessionAttestation?
         if supportsAttestedOperationReceipts {
@@ -305,18 +389,29 @@ extension PeekabooBridgeServer {
                             PeekabooBridgeHostCapability.statelessClickVariants),
                         exactWindowHeldPointerLifecycle: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.exactWindowHeldPointerLifecycle),
+                        exactWindowDrag: advertisedCapabilities.contains(PeekabooBridgeHostCapability.exactWindowDrag),
                         nativeBrowserConnectionBinding: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.nativeBrowserConnectionBinding),
                         browserConnectionHandoff: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.browserConnectionHandoff),
                         producerBoundSnapshotReferences: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.producerBoundSnapshotReferences),
+                        scopedMenuBarActions: advertisedCapabilities.contains(
+                            PeekabooBridgeHostCapability.scopedMenuBarActions),
                         targetedClickAccessibilityValueDelivery: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.targetedClickAccessibilityValueDelivery),
                         requestPinnedExactWindowScrollReceipt: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.requestPinnedExactWindowScrollReceipt),
+                        backgroundCoordinateScroll: advertisedCapabilities.contains(
+                            PeekabooBridgeHostCapability.backgroundCoordinateScroll),
                         compositeTypeDelivery: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.compositeTypeDelivery),
+                        exactFileDialogExecution: advertisedCapabilities.contains(
+                            PeekabooBridgeHostCapability.exactFileDialogExecution),
+                        clipboardGuardedExactWindowHotkeys: advertisedCapabilities.contains(
+                            PeekabooBridgeHostCapability.clipboardGuardedExactWindowHotkeys),
+                        preparedClipboardGuardedExactWindowHotkeys: advertisedCapabilities.contains(
+                            PeekabooBridgeHostCapability.preparedClipboardGuardedExactWindowHotkeys),
                         processGenerationBoundElementMutations: advertisedCapabilities.contains(
                             PeekabooBridgeHostCapability.processGenerationBoundElementMutations),
                         setValueVerification: PeekabooBridgeNegotiatedSessionCapabilities.offersSetValueVerification(
@@ -365,6 +460,24 @@ extension PeekabooBridgeServer {
         return .handshake(response)
     }
 
+    private static func applyExactFileDialogPermissionContract(
+        supportsAttestedOperationReceipts: Bool,
+        advertisedOperations: [PeekabooBridgeOperation],
+        permissions: PermissionsStatus,
+        enabledOperations: inout Set<PeekabooBridgeOperation>,
+        permissionTags: inout [String: [PeekabooBridgePermissionKind]])
+    {
+        guard supportsAttestedOperationReceipts, advertisedOperations.contains(.dialogHandleFile) else { return }
+        let requiredPermissions: Set<PeekabooBridgePermissionKind> = [.accessibility, .postEvent]
+        permissionTags[PeekabooBridgeOperation.dialogHandleFile.rawValue] = requiredPermissions
+            .sorted { $0.rawValue < $1.rawValue }
+        if requiredPermissions.isSubset(of: self.grantedPermissions(from: permissions)) {
+            enabledOperations.insert(.dialogHandleFile)
+        } else {
+            enabledOperations.remove(.dialogHandleFile)
+        }
+    }
+
     private static func applyExactDialogInputPermissionContract(
         supportsAttestedOperationReceipts: Bool,
         advertisedOperations: [PeekabooBridgeOperation],
@@ -401,7 +514,25 @@ extension PeekabooBridgeServer {
                   enabledOperations.contains(.targetedScroll)
         else {
             advertisedCapabilities.remove(PeekabooBridgeHostCapability.requestPinnedExactWindowScrollReceipt)
+            advertisedCapabilities.remove(PeekabooBridgeHostCapability.backgroundCoordinateScroll)
             return
+        }
+        Self.updateBackgroundCoordinateScrollCapability(
+            capabilities: &advertisedCapabilities, version: negotiated, automation: self.services.automation)
+    }
+
+    static func updateBackgroundCoordinateScrollCapability(
+        capabilities: inout Set<String>,
+        version: PeekabooBridgeProtocolVersion,
+        automation: any UIAutomationServiceProtocol)
+    {
+        if version >= PeekabooBridgeConstants.backgroundCoordinateScrollVersion,
+           capabilities.contains(PeekabooBridgeHostCapability.requestPinnedExactWindowScrollReceipt),
+           (automation as? any UIAutomationActionOutcomeProviding)?.supportsBackgroundCoordinateScroll == true
+        {
+            capabilities.insert(PeekabooBridgeHostCapability.backgroundCoordinateScroll)
+        } else {
+            capabilities.remove(PeekabooBridgeHostCapability.backgroundCoordinateScroll)
         }
     }
 
@@ -434,6 +565,7 @@ extension PeekabooBridgeServer {
             negotiated < PeekabooBridgeConstants.processGenerationBoundElementMutationsVersion
         {
             compatible.remove(.setValue)
+            compatible.remove(.selectText)
             compatible.remove(.performAction)
         }
         if !usesAttestedOperationReceipts {
@@ -444,6 +576,12 @@ extension PeekabooBridgeServer {
            !self.services.dialogs.supportsBackgroundExactDialogInput
         {
             compatible.remove(.exactDialogEnterText)
+        }
+        if usesAttestedOperationReceipts,
+           negotiated < PeekabooBridgeConstants.exactFileDialogExecutionVersion ||
+           !self.services.dialogs.supportsExactFileDialogExecution
+        {
+            compatible.remove(.dialogHandleFile)
         }
         return compatible
     }
@@ -480,14 +618,18 @@ extension PeekabooBridgeServer {
                 !Self.supportsProcessGenerationBoundElementMutationProvider(self.services.automation))
         {
             operations.remove(.setValue)
+            operations.remove(.selectText)
             operations.remove(.performAction)
         }
         operations = Set(operations.filter {
-            $0 != .setValue ||
-                self.supportedVersions.upperBound <
-                PeekabooBridgeConstants.processGenerationBoundElementMutationsVersion ||
+            ($0 != .selectText ||
                 (self.services.automation as? any ElementActionAutomationServiceProtocol)?
-                .supportsSetValueResultTargetBinding == true
+                .supportsTextSelection == true) &&
+                ($0 != .setValue ||
+                    self.supportedVersions.upperBound <
+                    PeekabooBridgeConstants.processGenerationBoundElementMutationsVersion ||
+                    (self.services.automation as? any ElementActionAutomationServiceProtocol)?
+                    .supportsSetValueResultTargetBinding == true)
         })
         if self.services.automation as? any TargetedFocusedElementServiceProtocol == nil {
             operations.remove(.getFocusedElement)
@@ -496,7 +638,11 @@ extension PeekabooBridgeServer {
             .supportsExactWindowTargetedKeyboard != true
         {
             operations.remove(.exactWindowTargetedTypeActions)
-            operations.remove(.exactWindowTargetedHotkey)
+            if (self.services.automation as? any ClipboardGuardedExactWindowHotkeyServiceProtocol)?
+                .supportsClipboardGuardedExactWindowHotkeys != true
+            {
+                operations.remove(.exactWindowTargetedHotkey)
+            }
         }
         if (self.services.automation as? any ExactWindowPixelFocusTypingServiceProtocol)?
             .supportsExactWindowPixelFocusTyping != true
@@ -521,6 +667,9 @@ extension PeekabooBridgeServer {
                 .revokeExactWindowHeldPointer,
                 .disconnectExactWindowHeldPointerOwner,
             ])
+        }
+        if (self.services.automation as? any ExactWindowDragServiceProtocol)?.supportsExactWindowDrag != true {
+            operations.remove(.exactWindowDrag)
         }
         if !self.services.snapshots.supportsImplicitLatestSnapshotInvalidation {
             operations.remove(.invalidateImplicitLatestSnapshot)
@@ -579,8 +728,14 @@ extension PeekabooBridgeServer {
         var operations = self.effectiveAllowedOperations(permissions: permissions)
         let operation = request.operation
         let advertisedOperations = self.allowedOperationsToAdvertise()
-        if PeekabooBridgeRequestContext.usesAttestedOperationResultSemantics,
-           operation == .exactDialogEnterText
+        if request.requiresExactFileDialogExecution {
+            if !self.services.dialogs.supportsExactFileDialogExecution ||
+                !permissions.accessibility || !permissions.postEvent
+            {
+                operations.remove(operation)
+            }
+        } else if PeekabooBridgeRequestContext.usesAttestedOperationResultSemantics,
+                  operation == .exactDialogEnterText
         {
             if advertisedOperations.contains(operation),
                self.services.dialogs.supportsBackgroundExactDialogInput,

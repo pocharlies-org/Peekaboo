@@ -1,13 +1,16 @@
 import Darwin
 import Foundation
 import MCP
+import PeekabooAgentRuntimeTestSupport
+import PeekabooAutomationKitTestSupport
 import PeekabooBridge
-import PeekabooCore
 import PeekabooFoundation
+import PeekabooFoundationTestSupport
 import Tachikoma
 import TachikomaMCP
 import Testing
 @testable import PeekabooAgentRuntime
+@testable import PeekabooCore
 
 // swiftlint:disable file_length
 
@@ -16,9 +19,195 @@ private final class BrowserFixtureAgentEventDelegate: AgentEventDelegate {
     func agentDidEmitEvent(_: AgentEvent) {}
 }
 
+@Suite(AuthorityTestIsolation())
 @MainActor
 // swiftlint:disable:next type_body_length
 struct BrowserMCPSessionManagerTests {
+    @Test(arguments: [nil, "background_only", "foreground_allowed"] as [String?])
+    func `legacy disk sessions resume without clipboard permission and resave compatibly`(
+        legacyPolicy: String?) async throws
+    {
+        let directory = try AgentTestStorage.sessionDirectory()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var removeDirectory = true
+        defer {
+            if removeDirectory {
+                try? FileManager.default.removeItem(at: directory)
+            }
+        }
+        let sessionID = "legacy-compatibility"
+        let file = directory.appendingPathComponent("\(sessionID).json")
+        let expectedPolicy = legacyPolicy.flatMap(MCPToolExecutionPolicy.init(rawValue:)) ?? .backgroundOnly
+        let history: [ModelMessage] = [
+            .system(AgentSystemPrompt.generate(executionPolicy: expectedPolicy)),
+            .user("legacy original task"),
+            .assistant("legacy prior response"),
+        ]
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let seed = AgentSession(
+            id: sessionID,
+            modelName: "legacy-fixture",
+            toolExecutionPolicy: expectedPolicy,
+            temporaryClipboardPasteMaximum: true,
+            messages: history,
+            metadata: SessionMetadata(customData: ["legacy-marker": "preserved"]),
+            createdAt: Date(),
+            updatedAt: Date())
+        var legacy = try #require(JSONSerialization.jsonObject(with: encoder.encode(seed)) as? [String: Any])
+        legacy.removeValue(forKey: "temporaryClipboardPasteMaximum")
+        if let legacyPolicy {
+            legacy["toolExecutionPolicy"] = legacyPolicy
+        } else {
+            legacy.removeValue(forKey: "toolExecutionPolicy")
+        }
+        try JSONSerialization.data(withJSONObject: legacy, options: [.sortedKeys]).write(to: file, options: .atomic)
+        let onDisk = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+        #expect(onDisk["temporaryClipboardPasteMaximum"] == nil)
+        #expect(onDisk["toolExecutionPolicy"] as? String == legacyPolicy)
+
+        let provider = AgentRemoteBrowserStatusProvider(
+            supportsStreaming: false,
+            requestedToolCall: AgentToolCall(id: "legacy-rich-paste", name: "paste", arguments: [
+                "dataBase64": AnyAgentToolValue(string: "eA=="),
+                "uti": AnyAgentToolValue(string: "public.data"),
+                "snapshot": AnyAgentToolValue(string: "synthetic-snapshot"),
+            ]))
+        let desktop = DesktopContextPolicyServices()
+        let clipboard = ScriptedClipboardService()
+        let services = Self.services(browser: AgentRemoteBrowserRoot(), desktop: desktop, clipboard: clipboard)
+        let manager = try AgentSessionManager(sessionDirectory: directory)
+        let agent = try AuthorityTestSupport.agent(services: services, sessionManager: manager)
+        removeDirectory = false
+        do {
+            // A fresh manager loads the legacy file through public continuation, not a seeded cache.
+            let result = try await agent.continueSession(
+                sessionId: sessionID,
+                userMessage: "continue the legacy task",
+                model: .custom(provider: provider),
+                maxSteps: 2,
+                enhancementOptions: .minimal)
+
+            #expect(result.content == "remote browser execution completed")
+            #expect(result.sessionId == sessionID)
+            #expect(provider.requestCount == 2)
+            #expect(provider.pasteParameterKeys.count == 2)
+            #expect(provider.pasteParameterKeys.allSatisfy {
+                $0.contains("text") && !$0.contains("dataBase64") && !$0.contains("snapshot")
+            })
+            #expect(provider.systemPrompts.allSatisfy {
+                $0.contains("immutable background-only authority") &&
+                    !$0.contains("explicit temporary-clipboard permission") &&
+                    !$0.contains("explicit foreground UI authority")
+            })
+            let trace = result.executionTrace()
+            #expect(trace.entries.count == 1)
+            let entry = try #require(trace.entries.first)
+            #expect(entry.id == "legacy-rich-paste")
+            #expect(entry.disposition == .skippedBeforeDispatch)
+            #expect(entry.mutationDispatch == .notDispatched)
+            #expect(entry.isError == true)
+            #expect(entry.result?.objectValue?["mutation_dispatched"]?.boolValue == false)
+            #expect(clipboard.readAccessStatusCallCount == 0)
+            #expect(clipboard.getCallCount == 0)
+            #expect(clipboard.setCallCount == 0)
+            #expect(clipboard.saveCallCount == 0)
+            #expect(clipboard.restoreCallCount == 0)
+            #expect(clipboard.clearCallCount == 0)
+            #expect(desktop.automationStub.cursorReadCount == 0)
+            #expect(desktop.applicationStub.activationIdentifiers.isEmpty)
+            #expect(desktop.windowStub.focusRequests.isEmpty)
+
+            let reloadedManager = try AgentSessionManager(sessionDirectory: directory)
+            let reloaded = try #require(try await reloadedManager.loadSession(id: sessionID))
+            #expect(reloaded.effectiveToolExecutionPolicy == expectedPolicy)
+            #expect(reloaded.temporaryClipboardPasteMaximum == nil)
+            #expect(reloaded.maximumToolExecutionAuthority == .init(basePolicy: expectedPolicy))
+            #expect(reloaded.metadata.customData["legacy-marker"] == "preserved")
+            for previous in history.dropFirst() {
+                let retained = try #require(reloaded.messages.first { $0.id == previous.id })
+                #expect(try encoder.encode(retained) == encoder.encode(previous))
+            }
+            let resaved = try #require(
+                JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+            #expect(resaved["temporaryClipboardPasteMaximum"] == nil)
+            #expect(resaved["toolExecutionPolicy"] as? String == expectedPolicy.rawValue)
+
+            removeDirectory = await agent.endBrowserClient(forAgentSessionID: sessionID)
+            #expect(removeDirectory)
+        } catch {
+            removeDirectory = await agent.endBrowserClient(forAgentSessionID: sessionID)
+            throw error
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func `granted parent cannot pass temporary clipboard permission to actual nested run or resume`(
+        resume: Bool) async throws
+    {
+        let forcedPaste = AgentToolCall(id: "nested-rich-paste", name: "paste", arguments: [
+            "dataBase64": AnyAgentToolValue(string: "eA=="),
+            "uti": AnyAgentToolValue(string: "public.data"),
+            "snapshot": AnyAgentToolValue(string: "synthetic-snapshot"),
+        ])
+        let provider = AgentRemoteBrowserStatusProvider(supportsStreaming: false, requestedToolCall: forcedPaste)
+        // Public MCP resume resolves a model string. This serial test maps that model to the existing fixture only.
+        let savedConfiguration = try #require(TachikomaConfiguration.default)
+        let configuration = TachikomaConfiguration(loadFromEnvironment: false)
+        configuration.setProviderFactoryOverride { _, _ in provider }
+        TachikomaConfiguration.default = configuration
+        defer { TachikomaConfiguration.default = savedConfiguration }
+
+        let directory = try AgentTestStorage.sessionDirectory()
+        let originalManager = try AgentSessionManager(sessionDirectory: directory)
+        let parentAuthority = MCPToolExecutionAuthority(temporaryClipboardPasteGranted: true)
+        if resume {
+            try originalManager.saveSession(AgentSession(
+                id: "nested-saved-maximum",
+                modelName: "synthetic-model",
+                toolExecutionPolicy: .backgroundOnly,
+                temporaryClipboardPasteMaximum: true,
+                messages: [
+                    .system(AgentSystemPrompt.generate(executionAuthority: parentAuthority)),
+                    .user("synthetic original task"),
+                ],
+                metadata: SessionMetadata(),
+                createdAt: Date(),
+                updatedAt: Date()))
+        }
+        let freshManager = try AgentSessionManager(sessionDirectory: directory)
+        let desktop = DesktopContextPolicyServices()
+        let services = Self.services(browser: AgentRemoteBrowserRoot(), desktop: desktop)
+        let agent = try AuthorityTestSupport.agent(services: services, sessionManager: freshManager)
+        services.agent = agent
+        let context = MCPToolContext(services: services, executionAuthority: parentAuthority)
+        var arguments: [String: Any] = ["task": "synthetic nested task", "model": "gpt-5.5"]
+        if resume {
+            arguments["resumeSession"] = "nested-saved-maximum"
+        }
+
+        let response = try await context.execute(tool: MCPAgentTool(context: context), arguments: .init(raw: arguments))
+
+        #expect(!response.isError)
+        #expect(provider.requestCount == 2)
+        #expect(provider.pasteParameterKeys.allSatisfy { !$0.contains("dataBase64") && !$0.contains("snapshot") })
+        #expect(provider.systemPrompts.allSatisfy { !$0.contains("explicit temporary-clipboard permission") })
+        let entry = try #require(response.meta?.objectValue?["executionTrace"]?.objectValue?["entries"]?
+            .arrayValue?.first?.objectValue)
+        #expect(entry["disposition"] == .string("skipped-before-dispatch"))
+        #expect(entry["mutationDispatch"] == .string("not_dispatched"))
+        #expect(entry["result"]?.objectValue?["mutation_dispatched"] == .bool(false))
+        let sessionID = try #require(response.meta?.objectValue?["sessionId"]?.stringValue)
+        let persisted = try #require(try await freshManager.loadSession(id: sessionID))
+        #expect(persisted.effectiveToolExecutionPolicy == .backgroundOnly)
+        #expect((persisted.temporaryClipboardPasteMaximum == true) == resume)
+        #expect(desktop.automationStub.cursorReadCount > 0)
+        #expect(desktop.clipboardStub.readCount > 0)
+        #expect(desktop.applicationStub.activationIdentifiers.isEmpty)
+        #expect(desktop.windowStub.focusRequests.isEmpty)
+        try await agent.deleteSession(id: sessionID)
+    }
+
     @Test
     func `blocked browser discovery leaves the main actor available`() async {
         let entered = DispatchSemaphore(value: 0)
@@ -348,7 +537,7 @@ struct BrowserMCPSessionManagerTests {
                 browserID: "browser-\(port)")
         }
         let root = BrowserMCPService(authenticatedSessionPool: pool)
-        let services = PeekabooServices()
+        let services = AuthorityTestSupport.services()
         let context = MCPToolContext(
             services: services,
             browser: root,
@@ -396,6 +585,26 @@ struct BrowserMCPSessionManagerTests {
         await secondServer.stopForTesting()
         #expect(secondProvider.removeCount == 1)
         #expect(pool.isEmpty)
+    }
+
+    @Test
+    func `browser context replacement retains temporary clipboard authority without foreground`() async throws {
+        let pool = BrowserMCPAuthenticatedSessionPool { _ in
+            Self.exactSession(
+                manager: MockBrowserMCPManager(),
+                browserURL: "http://127.0.0.1:9321",
+                browserID: "synthetic-clipboard-browser")
+        }
+        let authority = MCPToolExecutionAuthority(temporaryClipboardPasteGranted: true)
+        let context = MCPToolContext(
+            services: AuthorityTestSupport.services(),
+            browser: BrowserMCPService(authenticatedSessionPool: pool),
+            executionAuthority: authority)
+        let scoped = try context.scopingBrowserSession(named: "synthetic-clipboard-child")
+        #expect(scoped.executionAuthority == authority)
+        #expect(scoped.executionPolicy == .backgroundOnly)
+        #expect(scoped.browser !== context.browser)
+        await scoped.browser.disconnect()
     }
 
     @Test
@@ -511,7 +720,7 @@ struct BrowserMCPSessionManagerTests {
         await #expect(throws: BrowserMCPConnectionError.authenticatedSessionCapacityExceeded) {
             _ = try await context.openingBrowserSession(named: "mcp:over-capacity")
         }
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         await #expect(throws: BrowserMCPConnectionError.authenticatedSessionCapacityExceeded) {
             _ = try await agent.browserClient(forAgentSessionID: "over-capacity")
         }
@@ -1972,7 +2181,7 @@ struct BrowserMCPSessionManagerTests {
         }
         let root = BrowserMCPService(authenticatedSessionPool: pool)
         let services = Self.services(browser: root)
-        let agent = try PeekabooAgentService(services: services)
+        let agent = try AuthorityTestSupport.agent(services: services)
         let first = try #require(await agent.browserClient(forAgentSessionID: "session-a") as? BrowserMCPService)
         let resumed = try #require(await agent.browserClient(forAgentSessionID: "session-a") as? BrowserMCPService)
         let other = try #require(await agent.browserClient(forAgentSessionID: "session-b") as? BrowserMCPService)
@@ -1995,7 +2204,7 @@ struct BrowserMCPSessionManagerTests {
         let root = AgentRemoteBrowserRoot()
         let openBarrier = SequenceBarrier()
         root.openBarrier = openBarrier
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
 
         let firstOpen = Task { @MainActor in
             try await agent.browserClient(forAgentSessionID: "session-a")
@@ -2036,7 +2245,7 @@ struct BrowserMCPSessionManagerTests {
         let root = AgentRemoteBrowserRoot()
         let openBarrier = SequenceBarrier()
         root.openBarrier = openBarrier
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
 
         let firstOpen = Task { @MainActor in
             try await agent.browserClient(forAgentSessionID: "simultaneous-a")
@@ -2069,7 +2278,7 @@ struct BrowserMCPSessionManagerTests {
         let root = AgentRemoteBrowserRoot()
         let openBarrier = SequenceBarrier()
         root.openBarrier = openBarrier
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
 
         let ownerOpen = Task { @MainActor in
             try await agent.browserClient(forAgentSessionID: "queued-owner")
@@ -2102,7 +2311,7 @@ struct BrowserMCPSessionManagerTests {
         let root = AgentRemoteBrowserRoot()
         let openBarrier = SequenceBarrier()
         root.openBarrier = openBarrier
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
 
         let ownerOpen = Task { @MainActor in
             try await agent.browserClient(forAgentSessionID: "cancel-owner")
@@ -2147,7 +2356,7 @@ struct BrowserMCPSessionManagerTests {
         let root = AgentRemoteBrowserRoot()
         let ownerBarrier = SequenceBarrier()
         root.openBarrier = ownerBarrier
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let ownerSessionID = "queue-generation-owner"
         let queuedSessionID = "queue-generation-replacement"
 
@@ -2210,7 +2419,7 @@ struct BrowserMCPSessionManagerTests {
         let root = AgentRemoteBrowserRoot()
         let openBarrier = SequenceBarrier()
         root.openBarrier = openBarrier
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let sessionID = "coalesced-cancellation"
         let cancellationFinished = CompletionFlag()
 
@@ -2265,7 +2474,7 @@ struct BrowserMCPSessionManagerTests {
         let root = AgentRemoteBrowserRoot()
         let openBarrier = SequenceBarrier()
         root.openBarrier = openBarrier
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let sessionID = "sole-cancellation"
         let cancellationFinished = CompletionFlag()
 
@@ -2322,7 +2531,7 @@ struct BrowserMCPSessionManagerTests {
                 socketPath: "/private/tmp/peekaboo-agent-claim-retry-no-root.sock",
                 requestTimeoutSec: 0.1),
             sessionTransport: transport)
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let sessionID = "production-claim-cancellation"
         let cancellationFinished = CompletionFlag()
 
@@ -2371,7 +2580,7 @@ struct BrowserMCPSessionManagerTests {
         let root = AgentRemoteBrowserRoot()
         let ownerBarrier = SequenceBarrier()
         root.openBarrier = ownerBarrier
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let queuedSessionID = "coalesced-queued-cancellation"
         let cancellationFinished = CompletionFlag()
 
@@ -2426,7 +2635,7 @@ struct BrowserMCPSessionManagerTests {
     func `retryable remote Agent open uses a fresh task generation`() async throws {
         let root = AgentRemoteBrowserRoot()
         root.failNextOpenIndeterminately = true
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let sessionID = "retry-generation"
 
         await #expect(throws: AgentRemoteBrowserOpenFixtureError.self) {
@@ -2455,7 +2664,7 @@ struct BrowserMCPSessionManagerTests {
     func `remote Agent reports unresolved root recovery separately from capacity`() async throws {
         let root = AgentRemoteBrowserRoot()
         root.failNextOpenIndeterminately = true
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
 
         await #expect(throws: AgentRemoteBrowserOpenFixtureError.self) {
             _ = try await agent.browserClient(forAgentSessionID: "recovery-owner")
@@ -2484,7 +2693,7 @@ struct BrowserMCPSessionManagerTests {
     {
         let root = AgentRemoteBrowserRoot()
         root.failNextOpenIndeterminately = true
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let firstSessionID = "indeterminate-a"
 
         await #expect(throws: AgentRemoteBrowserOpenFixtureError.self) {
@@ -2532,7 +2741,7 @@ struct BrowserMCPSessionManagerTests {
         root.failNextOpenIndeterminately = true
         let provider = AgentRemoteBrowserStatusProvider(supportsStreaming: streaming)
         let model = LanguageModel.custom(provider: provider)
-        let agent = try PeekabooAgentService(
+        let agent = try AuthorityTestSupport.agent(
             services: Self.services(browser: root),
             defaultModel: model)
         let delegate: (any AgentEventDelegate)? = streaming
@@ -2544,6 +2753,7 @@ struct BrowserMCPSessionManagerTests {
                 "Inspect browser status",
                 model: model,
                 eventDelegate: delegate,
+                enhancementOptions: .minimal,
                 persistSession: false)
         }
         #expect(provider.requestCount == 0)
@@ -2561,6 +2771,7 @@ struct BrowserMCPSessionManagerTests {
             "Inspect browser status again",
             model: model,
             eventDelegate: delegate,
+            enhancementOptions: .minimal,
             persistSession: false)
 
         #expect(result.content == "remote browser execution completed")
@@ -2591,7 +2802,7 @@ struct BrowserMCPSessionManagerTests {
         root.failNextOpenIndeterminately = true
         let provider = AgentRemoteBrowserStatusProvider(supportsStreaming: streaming)
         let model = LanguageModel.custom(provider: provider)
-        let agent = try PeekabooAgentService(
+        let agent = try AuthorityTestSupport.agent(
             services: Self.services(browser: root),
             defaultModel: model,
             sessionManager: sessionManager)
@@ -2603,7 +2814,8 @@ struct BrowserMCPSessionManagerTests {
             _ = try await agent.executeTask(
                 "Inspect persistent browser status",
                 model: model,
-                eventDelegate: delegate)
+                eventDelegate: delegate,
+                enhancementOptions: .minimal)
         }
         let sessionID = try #require(sessionManager.listSessions().first?.id)
         #expect(provider.requestCount == 0)
@@ -2621,7 +2833,8 @@ struct BrowserMCPSessionManagerTests {
             sessionId: sessionID,
             userMessage: "Inspect persistent browser status again",
             model: model,
-            eventDelegate: delegate)
+            eventDelegate: delegate,
+            enhancementOptions: .minimal)
 
         #expect(result.content == "remote browser execution completed")
         #expect(result.sessionId == sessionID)
@@ -2666,7 +2879,7 @@ struct BrowserMCPSessionManagerTests {
             supportsStreaming: false,
             terminalResponseBarrier: terminalResponseBarrier)
         let model = LanguageModel.custom(provider: provider)
-        let agent = try PeekabooAgentService(
+        let agent = try AuthorityTestSupport.agent(
             services: Self.services(browser: root),
             defaultModel: model,
             sessionManager: sessionManager)
@@ -2686,8 +2899,8 @@ struct BrowserMCPSessionManagerTests {
                     selection: nil,
                     endpointIdentity: nil,
                     providerIdentity: nil),
-                storedToolExecutionPolicy: .backgroundOnly,
-                toolExecutionPolicy: .backgroundOnly,
+                storedToolExecutionAuthority: .backgroundOnly,
+                toolExecutionAuthority: .backgroundOnly,
                 provider: provider,
                 executionGeneration: generation)
         }
@@ -2776,7 +2989,7 @@ struct BrowserMCPSessionManagerTests {
         root.openBarrier = openBarrier
         let provider = AgentRemoteBrowserStatusProvider(supportsStreaming: streaming)
         let model = LanguageModel.custom(provider: provider)
-        let agent = try PeekabooAgentService(
+        let agent = try AuthorityTestSupport.agent(
             services: Self.services(browser: root),
             defaultModel: model,
             sessionManager: sessionManager)
@@ -2791,6 +3004,7 @@ struct BrowserMCPSessionManagerTests {
                     "Inspect browser status before cancellation",
                     model: model,
                     eventDelegate: delegate,
+                    enhancementOptions: .minimal,
                     persistSession: persistent)
                 Issue.record("Expected Agent setup to be cancelled")
                 return false
@@ -2846,12 +3060,14 @@ struct BrowserMCPSessionManagerTests {
                 sessionId: sessionID,
                 userMessage: "Inspect browser status after cancellation",
                 model: model,
-                eventDelegate: delegate)
+                eventDelegate: delegate,
+                enhancementOptions: .minimal)
         } else {
             result = try await agent.executeTask(
                 "Inspect browser status after cancellation",
                 model: model,
                 eventDelegate: delegate,
+                enhancementOptions: .minimal,
                 persistSession: false)
         }
         #expect(result.content == "remote browser execution completed")
@@ -2878,7 +3094,7 @@ struct BrowserMCPSessionManagerTests {
     @Test
     func `browser filtered Agent execution toolset opens no remote scope`() async throws {
         let root = AgentRemoteBrowserRoot()
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let filters = ToolFiltering.filters(
             config: Configuration(tools: .init(allow: ["permissions", "sleep"])),
             environment: [:])
@@ -2887,7 +3103,7 @@ struct BrowserMCPSessionManagerTests {
             for: .anthropic(.sonnet45),
             agentSessionID: "browser-filtered",
             snapshotOwner: MCPToolSnapshotOwner(sessionID: "browser-filtered"),
-            executionPolicy: .backgroundOnly,
+            executionAuthority: .backgroundOnly,
             filters: filters)
 
         #expect(!tools.contains { $0.name == "browser" })
@@ -2895,13 +3111,151 @@ struct BrowserMCPSessionManagerTests {
         #expect(root.rootExecuteCount == 0)
         #expect(agent.remoteBrowserClients.isEmpty)
         #expect(agent.remoteBrowserOpeningTasks.isEmpty)
+        let prompt = AgentSystemPrompt.generate(availableToolNames: Set(tools.map(\.name)))
+        #expect(!prompt.contains("**Browser Automation**"))
+        #expect(!prompt.contains("**Calculations**"))
+        #expect(prompt.contains("immutable background-only authority"))
+        #expect(prompt.utf8.count * 2 < AgentSystemPrompt.generate().utf8.count)
+    }
+
+    @Test(arguments: [false, true])
+    func `catalog-aware Agent prompt matches final execution tools without reacquiring browser`(
+        streaming: Bool) async throws
+    {
+        let directory = try AgentTestStorage.sessionDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let root = AgentRemoteBrowserRoot()
+        let provider = AgentRemoteBrowserStatusProvider(supportsStreaming: streaming)
+        let model = LanguageModel.custom(provider: provider)
+        let agent = try AuthorityTestSupport.agent(
+            services: Self.services(browser: root),
+            defaultModel: model,
+            sessionManager: AgentSessionManager(sessionDirectory: directory))
+        let sessionID = UUID().uuidString
+        let generation = try agent.beginAgentSessionExecution(for: sessionID)
+        let system = ModelMessage(
+            id: "catalog-system",
+            role: .system,
+            content: [.text("Stale unfiltered recipes")],
+            timestamp: Date(timeIntervalSince1970: 1234),
+            metadata: MessageMetadata(customData: ["preserve": "system identity"]))
+        let context = PeekabooAgentService.SessionContext(
+            id: sessionID,
+            isPersistent: false,
+            messages: [system, .user("Inspect synthetic browser status")],
+            createdAt: Date(),
+            executionStart: Date(),
+            metadata: SessionMetadata(),
+            modelIdentity: .init(
+                displayName: "catalog-fixture", selection: nil, endpointIdentity: nil, providerIdentity: nil),
+            storedToolExecutionAuthority: .backgroundOnly,
+            toolExecutionAuthority: .backgroundOnly,
+            provider: provider,
+            executionGeneration: generation)
+        let result: AgentExecutionResult = if streaming {
+            try await agent.executeWithStreaming(
+                context: context, model: model, maxSteps: 2, enhancementOptions: .minimal)
+        } else {
+            try await agent.executeWithoutStreaming(
+                context: context, model: model, maxSteps: 2, enhancementOptions: .minimal)
+        }
+
+        #expect(provider.catalogRequests.count == 2)
+        for request in provider.catalogRequests {
+            #expect(request.toolNames.contains("browser"))
+            #expect(!request.toolNames.contains("shell"))
+            #expect(!request.toolNames.contains("move"))
+            let observedSystem = try #require(request.systemMessage)
+            #expect(observedSystem.id == system.id)
+            #expect(observedSystem.timestamp == system.timestamp)
+            #expect(observedSystem.metadata == system.metadata)
+            #expect(observedSystem.content == [.text(AgentSystemPrompt.generate(
+                for: model,
+                executionAuthority: .backgroundOnly,
+                availableToolNames: request.toolNames))])
+        }
+        #expect(result.messages.first == provider.catalogRequests.first?.systemMessage)
+        #expect(context.messages.first == system)
+        #expect(root.openCount == 1)
+        let child = try #require(root.children.first)
+        #expect(child.statusCount == 1)
+        #expect(child.endCount == 1)
+        #expect(root.rootExecuteCount == 0)
+        #expect(agent.remoteBrowserClients.isEmpty)
+        #expect(agent.agentSessionExecutionGenerations[sessionID] == nil)
+    }
+
+    @Test(arguments: [false, true])
+    func `catalog-aware Agent prompt is retained in the initial failure checkpoint`(streaming: Bool) async throws {
+        let directory = try AgentTestStorage.sessionDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let manager = try AgentSessionManager(sessionDirectory: directory)
+        let root = AgentRemoteBrowserRoot()
+        let provider = AgentRemoteBrowserStatusProvider(supportsStreaming: streaming, failFirstRequest: true)
+        let model = LanguageModel.custom(provider: provider)
+        let agent = try AuthorityTestSupport.agent(
+            services: Self.services(browser: root), defaultModel: model, sessionManager: manager)
+        let sessionID = UUID().uuidString
+        let messages: [ModelMessage] = [.system("Stale foreground recipes"), .user("Synthetic task")]
+        let now = Date()
+        try manager.saveSession(AgentSession(
+            id: sessionID,
+            modelName: "catalog-fixture",
+            toolExecutionPolicy: .foregroundAllowed,
+            messages: messages,
+            metadata: SessionMetadata(),
+            createdAt: now,
+            updatedAt: now))
+        let generation = try agent.beginAgentSessionExecution(for: sessionID)
+        let context = PeekabooAgentService.SessionContext(
+            id: sessionID,
+            isPersistent: true,
+            messages: messages,
+            createdAt: now,
+            executionStart: now,
+            metadata: SessionMetadata(),
+            modelIdentity: .init(
+                displayName: "catalog-fixture", selection: nil, endpointIdentity: nil, providerIdentity: nil),
+            storedToolExecutionAuthority: .init(basePolicy: .foregroundAllowed),
+            toolExecutionAuthority: .backgroundOnly,
+            provider: provider,
+            executionGeneration: generation)
+
+        await #expect(throws: AgentCatalogProviderFailure.self) {
+            if streaming {
+                _ = try await agent.executeWithStreaming(
+                    context: context, model: model, maxSteps: 2, enhancementOptions: .minimal)
+            } else {
+                _ = try await agent.executeWithoutStreaming(
+                    context: context, model: model, maxSteps: 2, enhancementOptions: .minimal)
+            }
+        }
+
+        #expect(provider.catalogRequests.count == 1)
+        let request = try #require(provider.catalogRequests.first)
+        let saved = try #require(try await manager.loadSession(id: sessionID))
+        #expect(saved.messages.first == request.systemMessage)
+        #expect(saved.messages.first?.content == [.text(AgentSystemPrompt.generate(
+            for: model, executionAuthority: .backgroundOnly, availableToolNames: request.toolNames))])
+        #expect(saved.messages.first?.id == messages.first?.id)
+        #expect(saved.messages.last == messages.last)
+        #expect(saved.metadata.customData["status"] == "failed")
+        #expect(saved.effectiveToolExecutionPolicy == .foregroundAllowed)
+        #expect(agent.agentSessionExecutionGenerations[sessionID] == nil)
+        #expect(root.openCount == 1)
+        let child = try #require(root.children.first)
+        #expect(child.statusCount == 0)
+        #expect(child.endCount == 0)
+        try await agent.deleteSession(id: sessionID)
+        #expect(child.endCount == 1)
+        #expect(agent.remoteBrowserClients.isEmpty)
     }
 
     @Test
     func `browser included remote Agent execution toolset refuses a legacy shared root`() async throws {
         let root = AgentLegacyRemoteBrowserRoot()
         let services = AgentRemoteBrowserServices(base: Self.services(browser: root))
-        let agent = try PeekabooAgentService(services: services)
+        let agent = try AuthorityTestSupport.agent(services: services)
         let filters = ToolFiltering.filters(
             config: Configuration(tools: .init(allow: ["browser"])),
             environment: [:])
@@ -2911,7 +3265,7 @@ struct BrowserMCPSessionManagerTests {
                 for: .anthropic(.sonnet45),
                 agentSessionID: "browser-included",
                 snapshotOwner: MCPToolSnapshotOwner(sessionID: "browser-included"),
-                executionPolicy: .backgroundOnly,
+                executionAuthority: .backgroundOnly,
                 filters: filters)
         }
         #expect(root.executeCount == 0)
@@ -2924,7 +3278,7 @@ struct BrowserMCPSessionManagerTests {
         let root = AgentRemoteBrowserRoot()
         let openBarrier = SequenceBarrier()
         root.openBarrier = openBarrier
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let sessionID = "opening-then-ended"
 
         let opening = Task { @MainActor in
@@ -2970,7 +3324,7 @@ struct BrowserMCPSessionManagerTests {
     func `remote Agent refuses a browser root without scoped session support`() async throws {
         let root = AgentLegacyRemoteBrowserRoot()
         let services = Self.services(browser: root)
-        let agent = try PeekabooAgentService(services: AgentRemoteBrowserServices(base: services))
+        let agent = try AuthorityTestSupport.agent(services: AgentRemoteBrowserServices(base: services))
 
         await #expect(throws: BrowserMCPConnectionError.receiptBindingUnsupported) {
             _ = try await agent.browserClient(forAgentSessionID: "must-not-borrow-root")
@@ -2983,7 +3337,7 @@ struct BrowserMCPSessionManagerTests {
     @Test
     func `local Agent refuses a browser provider without authenticated or scoped sessions`() async throws {
         let root = AgentLegacyRemoteBrowserRoot()
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
 
         await #expect(throws: BrowserMCPConnectionError.receiptBindingUnsupported) {
             _ = try await agent.browserClient(forAgentSessionID: "unsupported-local-provider")
@@ -2997,7 +3351,7 @@ struct BrowserMCPSessionManagerTests {
     @Test
     func `remote Agent capacity counts active and opening sessions and reopens after release`() async throws {
         let root = AgentRemoteBrowserRoot()
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let capacity = BrowserMCPAuthenticatedSessionPool.sessionCapacity
         var activeSessionIDs: [String] = []
         for index in 0..<(capacity - 1) {
@@ -3058,7 +3412,7 @@ struct BrowserMCPSessionManagerTests {
     func `remote Agent cleanup debt blocks resume until exact child cleanup succeeds`() async throws {
         let root = AgentRemoteBrowserRoot()
         root.nextEndResults = [[false, true], [true]]
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let first = try await agent.browserClient(forAgentSessionID: "debt-session")
         let firstChild = try #require(first as? AgentRemoteScopedBrowserChild)
 
@@ -3091,7 +3445,7 @@ struct BrowserMCPSessionManagerTests {
     func `overlapping remote Agent teardown retains one failed child cleanup for a later drain`() async throws {
         let root = AgentRemoteBrowserRoot()
         root.nextEndResults = [[false, true]]
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let sessionID = "overlapping-cleanup"
         let browser = try await agent.browserClient(forAgentSessionID: sessionID)
         let child = try #require(browser as? AgentRemoteScopedBrowserChild)
@@ -3130,7 +3484,7 @@ struct BrowserMCPSessionManagerTests {
     func `overlapping remote Agent teardown retains failed indeterminate recovery for a later drain`() async throws {
         let root = AgentRemoteBrowserRoot()
         root.failNextOpenIndeterminately = true
-        let agent = try PeekabooAgentService(services: Self.services(browser: root))
+        let agent = try AuthorityTestSupport.agent(services: Self.services(browser: root))
         let sessionID = "overlapping-indeterminate-cleanup"
 
         await #expect(throws: AgentRemoteBrowserOpenFixtureError.self) {
@@ -3190,7 +3544,7 @@ struct BrowserMCPSessionManagerTests {
             createdAt: now,
             updatedAt: now))
         let root = AgentRemoteBrowserRoot()
-        let agent = try PeekabooAgentService(
+        let agent = try AuthorityTestSupport.agent(
             services: Self.services(browser: root),
             sessionManager: sessionManager)
 
@@ -3215,8 +3569,8 @@ struct BrowserMCPSessionManagerTests {
                 selection: nil,
                 endpointIdentity: nil,
                 providerIdentity: nil),
-            storedToolExecutionPolicy: .backgroundOnly,
-            toolExecutionPolicy: .backgroundOnly,
+            storedToolExecutionAuthority: .backgroundOnly,
+            toolExecutionAuthority: .backgroundOnly,
             provider: nil,
             executionGeneration: nil)
         #expect(await agent.endEphemeralBrowserClientIfNeeded(context))
@@ -3247,7 +3601,7 @@ struct BrowserMCPSessionManagerTests {
             return Self.exactSession(manager: MockBrowserMCPManager())
         }
         let root = BrowserMCPService(authenticatedSessionPool: pool)
-        let agent = try PeekabooAgentService(
+        let agent = try AuthorityTestSupport.agent(
             services: Self.services(browser: root),
             sessionManager: sessionManager)
         let executionGeneration = try agent.beginAgentSessionExecution(for: sessionID)
@@ -3299,7 +3653,7 @@ struct BrowserMCPSessionManagerTests {
             createdAt: now,
             updatedAt: now))
         let root = AgentRemoteBrowserRoot()
-        let agent = try PeekabooAgentService(
+        let agent = try AuthorityTestSupport.agent(
             services: Self.services(browser: root),
             sessionManager: sessionManager)
         let executionGeneration = try agent.beginAgentSessionExecution(for: sessionID)
@@ -3336,7 +3690,7 @@ struct BrowserMCPSessionManagerTests {
 
     @Test
     func `unrelated cleanup drain cannot acknowledge a deletion before its own cleanup attempt`() throws {
-        let agent = try PeekabooAgentService(services: PeekabooServices())
+        let agent = try AuthorityTestSupport.agent(services: AuthorityTestSupport.services())
         let sessionID = "cleanup-not-started"
         let claims = agent.installAgentSessionDeletionTombstones(for: [sessionID])
         let deletionGeneration = try #require(claims[sessionID])
@@ -3356,7 +3710,7 @@ struct BrowserMCPSessionManagerTests {
 
     @Test(arguments: [false, true])
     func `invalid Agent step budget releases its execution generation`(streaming: Bool) async throws {
-        let agent = try PeekabooAgentService(services: PeekabooServices())
+        let agent = try AuthorityTestSupport.agent(services: AuthorityTestSupport.services())
         let sessionID = "invalid-step-budget"
         let executionGeneration = try agent.beginAgentSessionExecution(for: sessionID)
         let now = Date()
@@ -3372,8 +3726,8 @@ struct BrowserMCPSessionManagerTests {
                 selection: nil,
                 endpointIdentity: nil,
                 providerIdentity: nil),
-            storedToolExecutionPolicy: .backgroundOnly,
-            toolExecutionPolicy: .backgroundOnly,
+            storedToolExecutionAuthority: .backgroundOnly,
+            toolExecutionAuthority: .backgroundOnly,
             provider: nil,
             executionGeneration: executionGeneration)
 
@@ -3427,7 +3781,7 @@ struct BrowserMCPSessionManagerTests {
                 updatedAt: updatedAt))
         }
         let root = AgentRemoteBrowserRoot()
-        let agent = try PeekabooAgentService(
+        let agent = try AuthorityTestSupport.agent(
             services: Self.services(browser: root),
             sessionManager: sessionManager)
         let firstGeneration = try agent.beginAgentSessionExecution(for: firstID)
@@ -3495,7 +3849,7 @@ struct BrowserMCPSessionManagerTests {
             Self.exactSession(manager: providers.removeFirst())
         }
         let root = BrowserMCPService(authenticatedSessionPool: pool)
-        let agent = try PeekabooAgentService(
+        let agent = try AuthorityTestSupport.agent(
             services: Self.services(browser: root),
             sessionManager: sessionManager)
         let first = try #require(await agent.browserClient(forAgentSessionID: sessionID) as? BrowserMCPService)
@@ -3537,7 +3891,7 @@ struct BrowserMCPSessionManagerTests {
             Self.exactSession(manager: providers.removeFirst())
         }
         let root = BrowserMCPService(authenticatedSessionPool: pool)
-        let agent = try PeekabooAgentService(
+        let agent = try AuthorityTestSupport.agent(
             services: Self.services(browser: root),
             sessionManager: sessionManager)
         let first = try #require(await agent.browserClient(forAgentSessionID: sessionID) as? BrowserMCPService)
@@ -3585,7 +3939,7 @@ struct BrowserMCPSessionManagerTests {
             Self.exactSession(manager: provider)
         }
         let root = BrowserMCPService(authenticatedSessionPool: pool)
-        let agent = try PeekabooAgentService(
+        let agent = try AuthorityTestSupport.agent(
             services: Self.services(browser: root),
             sessionManager: sessionManager)
         let browser = try #require(await agent.browserClient(forAgentSessionID: sessionID) as? BrowserMCPService)
@@ -3622,7 +3976,7 @@ struct BrowserMCPSessionManagerTests {
             Self.exactSession(manager: MockBrowserMCPManager())
         }
         let root = BrowserMCPService(authenticatedSessionPool: pool)
-        let agent = try PeekabooAgentService(
+        let agent = try AuthorityTestSupport.agent(
             services: Self.services(browser: root),
             sessionManager: sessionManager)
         let first = try #require(await agent.browserClient(forAgentSessionID: sessionID) as? BrowserMCPService)
@@ -5386,20 +5740,25 @@ extension BrowserMCPSessionManagerTests {
             environment: ["PEEKABOO_BROWSER_MCP_BROWSER_URL": browserURL])
     }
 
-    private static func services(browser: any BrowserMCPClientProviding) -> PeekabooServices {
-        let base = PeekabooServices()
+    private static func services(
+        browser: any BrowserMCPClientProviding,
+        desktop: DesktopContextPolicyServices? = nil,
+        clipboard: (any ClipboardServiceProtocol)? = nil) -> PeekabooServices
+    {
+        let base = AuthorityTestSupport.services()
         return PeekabooServices(
             logging: base.logging,
             screenCapture: base.screenCapture,
-            applications: base.applications,
-            automation: base.automation,
-            windows: base.windows,
+            applications: desktop.map { $0.applicationStub as any ApplicationServiceProtocol } ?? base.applications,
+            automation: desktop.map { $0.automationStub as any UIAutomationServiceProtocol } ?? base.automation,
+            windows: desktop.map { $0.windowStub as any WindowManagementServiceProtocol } ?? base.windows,
             menu: base.menu,
             dock: base.dock,
             dialogs: base.dialogs,
             snapshots: base.snapshots,
             files: base.files,
-            clipboard: base.clipboard,
+            clipboard: clipboard ??
+                desktop.map { $0.clipboardStub as any ClipboardServiceProtocol } ?? base.clipboard,
             permissions: base.permissions,
             audioInput: base.audioInput,
             browser: browser,
@@ -5612,37 +5971,85 @@ private final class AgentClaimRecordingRemoteBrowserTransport: RemoteBrowserMCPS
     }
 }
 
+private enum AgentCatalogProviderFailure: Error {
+    case rejected
+}
+
 private final class AgentRemoteBrowserStatusProvider: ModelProvider, @unchecked Sendable {
+    struct CatalogRequest: Sendable {
+        let toolNames: Set<String>
+        let systemMessage: ModelMessage?
+    }
+
     let modelId = "agent-remote-browser-status"
     let baseURL: String? = nil
     let apiKey: String? = nil
     let capabilities: ModelCapabilities
     let terminalResponseBarrier: SequenceBarrier?
+    let requestedToolCall: AgentToolCall
+    let failFirstRequest: Bool
     private let lock = NSLock()
     private var requests = 0
+    private var observedPasteParameters: [[String]] = []
+    private var observedSystemPrompts: [String] = []
+    private var observedCatalogRequests: [CatalogRequest] = []
 
-    init(supportsStreaming: Bool, terminalResponseBarrier: SequenceBarrier? = nil) {
+    init(
+        supportsStreaming: Bool,
+        terminalResponseBarrier: SequenceBarrier? = nil,
+        requestedToolCall: AgentToolCall? = nil,
+        failFirstRequest: Bool = false)
+    {
         self.capabilities = ModelCapabilities(supportsStreaming: supportsStreaming)
         self.terminalResponseBarrier = terminalResponseBarrier
+        self.failFirstRequest = failFirstRequest
+        self.requestedToolCall = requestedToolCall ?? AgentToolCall(
+            id: "remote-browser-status",
+            name: "browser",
+            arguments: ["action": AnyAgentToolValue(string: "status")])
     }
 
     var requestCount: Int {
         self.lock.withLock { self.requests }
     }
 
-    func generateText(request _: ProviderRequest) async throws -> ProviderResponse {
+    var pasteParameterKeys: [[String]] {
+        self.lock.withLock { self.observedPasteParameters }
+    }
+
+    var systemPrompts: [String] {
+        self.lock.withLock { self.observedSystemPrompts }
+    }
+
+    var catalogRequests: [CatalogRequest] {
+        self.lock.withLock { self.observedCatalogRequests }
+    }
+
+    func generateText(request: ProviderRequest) async throws -> ProviderResponse {
         let requestIndex = self.lock.withLock {
+            self.observedCatalogRequests.append(CatalogRequest(
+                toolNames: Set(request.tools?.map(\.name) ?? []),
+                systemMessage: request.messages.first { $0.role == .system }))
+            self.observedPasteParameters.append(request.tools?.first { $0.name == "paste" }?
+                .parameters.properties.keys.sorted() ?? [])
+            self.observedSystemPrompts
+                .append(contentsOf: request.messages.filter { $0.role == .system }.map { message in
+                    message.content.compactMap { part -> String? in
+                        guard case let .text(text) = part else { return nil }
+                        return text
+                    }.joined()
+                })
             defer { self.requests += 1 }
             return self.requests
         }
         if requestIndex == 0 {
+            if self.failFirstRequest {
+                throw AgentCatalogProviderFailure.rejected
+            }
             return ProviderResponse(
                 text: "",
                 finishReason: .toolCalls,
-                toolCalls: [AgentToolCall(
-                    id: "remote-browser-status",
-                    name: "browser",
-                    arguments: ["action": AnyAgentToolValue(string: "status")])])
+                toolCalls: [self.requestedToolCall])
         }
         await self.terminalResponseBarrier?.block()
         return ProviderResponse(

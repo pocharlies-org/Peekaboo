@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
-export const EXPECTED_ROOT_COMMAND_COUNT = 33;
+export const EXPECTED_ROOT_COMMAND_COUNT = 34;
 
 export const MIGRATION_ADVISOR_PATH =
   'Apps/CLI/Sources/PeekabooCLI/CLI/CommanderMigrationAdvisor.swift';
@@ -258,6 +258,18 @@ function isValidCalendarDate(value) {
   const [, year, month, day] = match.map(Number);
   const date = new Date(Date.UTC(year, month - 1, day));
   return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
+/**
+ * Chooses the remote ref the publication preflight compares HEAD against. A release branch
+ * (`release/<version>` with --force) is frozen at its cut and must match its own pushed branch;
+ * every other checkout keeps comparing against origin/main.
+ */
+export function releaseFreshnessReference({ branch, version, force }) {
+  if (force && typeof version === 'string' && version.length > 0 && branch === `release/${version}`) {
+    return { remoteRef: `origin/${branch}`, releaseBranch: true };
+  }
+  return { remoteRef: 'origin/main', releaseBranch: false };
 }
 
 export function validateChangelogContract({ changelogSource, version, requireDatedHeading }) {

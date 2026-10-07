@@ -33,7 +33,7 @@ struct AgentRun50PolicyTests {
             tools: [tool],
             eventHandler: nil,
             sessionId: "run50-agent-validation",
-            executionPolicy: .backgroundOnly)
+            executionAuthority: .backgroundOnly)
 
         let invalid = try #require(service.makeToolPreflightResult(
             for: AgentToolCall(
@@ -71,7 +71,7 @@ struct AgentRun50PolicyTests {
         let unrestricted = AgentSystemPrompt.generate(for: self.model, executionPolicy: .unrestricted)
 
         #expect(background.contains("immutable background-only authority"))
-        #expect(background.contains("exact targeted direct-text paste"))
+        #expect(background.contains("exact targeted direct-text `paste`"))
         #expect(!background.contains(#""foreground": true"#))
         #expect(!background.contains(#""action": "focus""#))
         #expect(!background.contains(#""action": "switch""#))
@@ -103,7 +103,7 @@ struct AgentRun50PolicyTests {
             from: session,
             userMessage: nil,
             model: self.model,
-            toolExecutionPolicy: .backgroundOnly)
+            toolExecutionAuthority: .backgroundOnly)
         let prompt = resumed.messages
             .first(where: { $0.role == .system })?
             .content
@@ -115,8 +115,8 @@ struct AgentRun50PolicyTests {
 
         #expect(prompt?.contains("immutable background-only authority") == true)
         #expect(prompt?.contains(#""foreground": true"#) == false)
-        #expect(resumed.storedToolExecutionPolicy == .foregroundAllowed)
-        #expect(resumed.toolExecutionPolicy == .backgroundOnly)
+        #expect(resumed.storedToolExecutionAuthority.basePolicy == .foregroundAllowed)
+        #expect(resumed.toolExecutionAuthority == .backgroundOnly)
     }
 
     @Test

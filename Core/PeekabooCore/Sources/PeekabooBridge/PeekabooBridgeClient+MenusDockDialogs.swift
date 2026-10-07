@@ -163,6 +163,31 @@ extension PeekabooBridgeClient {
         }
     }
 
+    public func prepareMenuBarItem(_ request: MenuBarItemPreparationRequest) async throws -> MenuBarItemInfo {
+        try self.requireScopedMenuBarActions()
+        let response = try await self.send(.prepareMenuBarItem(request))
+        switch response {
+        case let .menuBarItems(items):
+            return try Self.validatedMenuBarPreparation(items, request: request)
+        case let .error(envelope):
+            throw envelope
+        default:
+            throw PeekabooBridgeErrorEnvelope(
+                code: .invalidRequest,
+                message: "Unexpected scoped menu bar preparation response")
+        }
+    }
+
+    func requireScopedMenuBarActions() throws {
+        guard self.scopedMenuBarActionsEnabled else {
+            throw DesktopActionFailure.preDispatchRefusal(
+                route: .bridge,
+                reason: .runtimeIncompatible,
+                message: "Bridge host does not advertise scoped menu bar actions; no click was sent.",
+                hint: "Update the Bridge host before retrying.")
+        }
+    }
+
     public func clickMenuBarItem(named name: String) async throws -> ClickResult {
         if self.usesExplicitReceiptlessTransport() {
             return try await self.legacyMenuBarClick(
@@ -212,7 +237,8 @@ extension PeekabooBridgeClient {
         }
         payload = PeekabooBridgeMenuBarClickByNameRequest(
             name: name,
-            expectedLeafEvidence: request.expectedLeafEvidence)
+            expectedLeafEvidence: request.expectedLeafEvidence,
+            applicationScope: request.applicationScope)
         return try await self.actionResult(
             for: .clickMenuBarItemNamed(payload),
             expectedResponse: "named menu bar click",
@@ -276,6 +302,34 @@ extension PeekabooBridgeClient {
                 message: error.localizedDescription,
                 hint: "Use an exact current status-item name or list index.")
         }
+    }
+
+    nonisolated static func validatedMenuBarPreparation(
+        _ items: [MenuBarItemInfo],
+        request: MenuBarItemPreparationRequest) throws -> MenuBarItemInfo
+    {
+        guard items.count == 1,
+              let item = items.first,
+              let evidence = item.selectionEvidence,
+              evidence.isCanonical,
+              evidence.kind == .menuBarItem,
+              evidence.normalizedSelector == DeterministicDesktopLeafSelector.normalized(request.name),
+              evidence.matchKind != .index,
+              evidence.selectedTargetReceipt.windowID == nil,
+              request.applicationScope.explicitProcessIdentifier.map({
+                  $0 == evidence.selectedTargetReceipt.processIdentifier
+              }) ?? true,
+              evidence.selectedIndex == item.index,
+              evidence.winningCandidateCount == 1,
+              !evidence.hasWinningTie
+        else {
+            throw DesktopActionFailure.preDispatchRefusal(
+                route: .bridge,
+                reason: .invalidRequest,
+                message: "Bridge host returned invalid scoped menu bar preparation evidence; no click was sent.",
+                hint: "Refresh the menu bar target and update the Bridge host before retrying.")
+        }
+        return item
     }
 
     private func legacyMenuBarClick(

@@ -85,7 +85,7 @@ extension PeekabooBridgeServer {
              .typeActions,
              .targetedTypeActions, .exactWindowTargetedTypeActions, .exactWindowPixelFocusType,
              .foregroundModifierClick,
-             .setValue, .performAction, .scroll, .targetedScroll, .hotkey, .targetedHotkey,
+             .setValue, .selectText, .performAction, .scroll, .targetedScroll, .hotkey, .targetedHotkey,
              .exactWindowTargetedHotkey, .targetedClick,
              .exactWindowTargetedClick, .swipe, .drag, .moveMouse, .waitForElement:
             return try await self.handleAutomationRequest(request)
@@ -93,6 +93,9 @@ extension PeekabooBridgeServer {
              .releaseExactWindowHeldPointer, .revokeExactWindowHeldPointer,
              .disconnectExactWindowHeldPointerOwner:
             return try await self.handleHeldPointerRequest(request, peer: peer)
+        case .exactWindowDrag:
+            guard case let .exactWindowDrag(payload) = request else { throw Self.invalidRequest(for: request) }
+            return try await self.handleExactWindowDrag(payload, peer: peer)
         case .listWindows, .focusWindow, .moveWindow, .resizeWindow, .setWindowBounds, .closeWindow,
              .backgroundCloseWindow,
              .minimizeWindow, .restoreWindow, .maximizeWindow, .getFocusedWindow:
@@ -103,7 +106,8 @@ extension PeekabooBridgeServer {
              .hideApplication, .unhideApplication, .hideOtherApplications, .showAllApplications:
             return try await self.handleApplicationRequest(request)
         case .listMenus, .listFrontmostMenus, .clickMenuItem, .clickMenuItemByName, .listMenuExtras,
-             .clickMenuExtra, .menuExtraOpenMenuFrame, .listMenuBarItems, .clickMenuBarItemNamed,
+             .clickMenuExtra, .menuExtraOpenMenuFrame, .listMenuBarItems, .prepareMenuBarItem,
+             .clickMenuBarItemNamed,
              .clickMenuBarItemIndex:
             return try await self.handleMenuRequest(request)
         case .listDockItems, .launchDockItem, .rightClickDockItem, .hideDock, .showDock, .isDockHidden,
@@ -287,7 +291,7 @@ extension PeekabooBridgeServer {
              .foregroundModifierClick, .targetedHotkey,
              .exactWindowTargetedHotkey, .targetedClick:
             return try await self.handleTargetedAutomationRequest(request)
-        case .setValue, .performAction:
+        case .setValue, .selectText, .performAction:
             return try await self.handleElementActionRequest(request)
         case let .scroll(payload):
             return try await self.handleScroll(payload.request)
@@ -389,7 +393,7 @@ extension PeekabooBridgeServer {
                 try await self.services.automation.scroll(request)
                 return ()
             },
-            fallbackTarget: request.target == nil ? .global : nil,
+            fallbackTarget: request.foreground && request.target == nil && request.point == nil ? .global : nil,
             response: { _ in .ok })
     }
 
@@ -495,6 +499,19 @@ extension PeekabooBridgeServer {
                         target: payload.target,
                         value: payload.value,
                         snapshotId: payload.snapshotId)
+                },
+                fallbackTarget: nil,
+                failureSnapshotID: payload.snapshotId,
+                response: PeekabooBridgeResponse.elementActionResult)
+        case let .selectText(payload):
+            return try await self.handleAutomationAction(
+                withOutcome: { _ in
+                    try await automation.selectText(
+                        target: payload.target, request: payload.request, snapshotId: payload.snapshotId)
+                },
+                legacy: {
+                    throw PeekabooBridgeErrorEnvelope(
+                        code: .operationNotSupported, message: "Text selection requires receipted outcomes")
                 },
                 fallbackTarget: nil,
                 failureSnapshotID: payload.snapshotId,
@@ -675,12 +692,75 @@ extension PeekabooBridgeServer {
         _ payload: PeekabooBridgeExactWindowHotkeyRequest) async throws
         -> PeekabooBridgeHandledResponse
     {
+        guard payload.backgroundPreparation == nil || payload.clipboardClaim != nil else {
+            throw PeekabooBridgeErrorEnvelope(
+                code: .invalidRequest,
+                actionFailure: .preDispatchRefusal(
+                    route: .bridge, reason: .invalidRequest,
+                    message: "Prepared background paste requires a retained temporary clipboard claim."))
+        }
+        if let clipboardClaim = payload.clipboardClaim {
+            guard payload.holdDuration > 0, HotkeyService.isPasteShortcut(payload.keys) else {
+                throw PeekabooBridgeErrorEnvelope(
+                    code: .invalidRequest,
+                    actionFailure: .preDispatchRefusal(
+                        route: .bridge,
+                        reason: .invalidRequest,
+                        message: "A temporary clipboard claim requires Cmd+V with a positive hold."))
+            }
+            guard let service = self.services.automation as? any ClipboardGuardedExactWindowHotkeyServiceProtocol,
+                  service.supportsClipboardGuardedExactWindowHotkeys
+            else {
+                throw PeekabooBridgeErrorEnvelope(
+                    code: .operationNotSupported,
+                    actionFailure: .preDispatchRefusal(
+                        route: .bridge,
+                        reason: .runtimeIncompatible,
+                        message: "Clipboard-guarded exact-window paste is not supported by this bridge host"))
+            }
+            guard let focusedElement = payload.expectedFocusedElement else {
+                throw PeekabooBridgeErrorEnvelope(
+                    code: .invalidRequest,
+                    actionFailure: .preDispatchRefusal(
+                        route: .bridge,
+                        reason: .invalidRequest,
+                        message: "Clipboard-guarded paste requires a retained focused-element receipt"))
+            }
+            let target = try UIAutomationTarget.ExactWindow(
+                identity: payload.expectedWindowIdentity,
+                bounds: payload.expectedWindowBounds,
+                focusedElement: focusedElement)
+            self.automationActivityObserver?(pid_t(payload.expectedWindowIdentity.ownerProcessIdentifier))
+            let result: UIAutomationActionResult<Void>
+            if let preparation = payload.backgroundPreparation {
+                guard let prepared = service as? any PreparedClipboardGuardedExactWindowHotkeyServiceProtocol,
+                      prepared.supportsPreparedClipboardGuardedExactWindowHotkeys
+                else {
+                    throw PeekabooBridgeErrorEnvelope(
+                        code: .operationNotSupported,
+                        actionFailure: .preDispatchRefusal(
+                            route: .bridge, reason: .runtimeIncompatible,
+                            message: "Prepared background clipboard paste is not supported by this host."))
+                }
+                result = try await prepared.hotkeyWithOutcome(
+                    keys: payload.keys, holdDuration: payload.holdDuration, target: target,
+                    clipboardClaim: clipboardClaim, preparation: preparation)
+            } else {
+                result = try await service.hotkeyWithOutcome(
+                    keys: payload.keys, holdDuration: payload.holdDuration,
+                    target: target, clipboardClaim: clipboardClaim)
+            }
+            return try Self.handledActionResponse(response: .ok, result: result, fallbackTarget: .requestPinned)
+        }
         guard let service = self.services.automation as? any ExactWindowTargetedKeyboardServiceProtocol,
               service.supportsExactWindowTargetedKeyboard
         else {
             throw PeekabooBridgeErrorEnvelope(
                 code: .operationNotSupported,
-                message: "Atomic exact-window background hotkeys are not supported by this bridge host")
+                actionFailure: .preDispatchRefusal(
+                    route: .bridge,
+                    reason: .runtimeIncompatible,
+                    message: "Atomic exact-window background hotkeys are not supported by this bridge host"))
         }
         self.automationActivityObserver?(pid_t(payload.expectedWindowIdentity.ownerProcessIdentifier))
         if let outcomeService = try self.automationOutcomeService() {

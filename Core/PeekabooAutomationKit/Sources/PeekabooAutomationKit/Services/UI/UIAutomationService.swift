@@ -55,7 +55,7 @@ public final class UIAutomationService: TargetedHotkeyServiceProtocol, TargetedT
     ExactWindowTargetedKeyboardServiceProtocol, ExactWindowFocusedElementServiceProtocol,
     ExactWindowPixelFocusTypingServiceProtocol,
     ForegroundModifierClickServiceProtocol,
-    UIAutomationActionOutcomeProviding, UIAutomationGlobalPointerActionResultProviding
+    PreparedClipboardGuardedExactWindowHotkeyServiceProtocol, UIAutomationGlobalPointerActionResultProviding
 {
     public let supportsProcessGenerationPinnedHotkeys = true
     public let supportsProcessGenerationPinnedTypeActions = true
@@ -63,12 +63,15 @@ public final class UIAutomationService: TargetedHotkeyServiceProtocol, TargetedT
     public let supportsStatelessClickVariants = true
     public let supportsTargetedClickAccessibilityValueDelivery = true
     public let supportsExactWindowTargetedKeyboard = true
+    public let supportsClipboardGuardedExactWindowHotkeys = true
+    public let supportsPreparedClipboardGuardedExactWindowHotkeys = true
     public let supportsExactWindowCompositeTypeDelivery = true
     public let supportsExactWindowFocusedElementFocus = true
     public let supportsExactWindowPixelFocusTyping = true
     public let supportsForegroundModifierClick = true
     public let supportsForegroundModifierClickSnapshotLease = true
     public let supportsRequestPinnedExactWindowScrollReceipt = true
+    public let supportsBackgroundCoordinateScroll = true
     public let exactWindowTargetedKeyboardUnavailableReason: String? = nil
     public let exactWindowCompositeTypeDeliveryUnavailableReason: String? = nil
     public let exactWindowPixelFocusTypingUnavailableReason: String? = nil

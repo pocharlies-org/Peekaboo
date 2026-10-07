@@ -14,7 +14,9 @@ read_when:
 - Python 3.9+ for the checkout-local Swift workspace setup (Xcode provides `python3`).
 - Node.js 22.13+ for the pinned pnpm source helpers (Corepack-enabled) — only needed for pnpm helper scripts; core Swift builds do not require Node.
 - pnpm (`corepack enable pnpm`)
-- SwiftLint and SwiftFormat for the repository validation helpers (`brew install swiftlint swiftformat`)
+- SwiftLint and SwiftFormat for the repository validation helpers (`brew install swiftlint swiftformat`). CI runs
+  `pnpm run format:check` with the SwiftFormat version pinned as `SWIFTFORMAT_VERSION` in
+  `.github/workflows/macos-ci.yml`; use the same version locally so formatting output matches.
 
 See [platform-support.md](platform-support.md) for the support matrix across released binaries, apps,
 Swift packages, source builds, and pnpm helper scripts.
@@ -41,6 +43,11 @@ pnpm run build:swift:all
 # Standalone helper
 ./scripts/build-cli-standalone.sh [--install]
 ```
+
+The standalone helper collects the compatibility libraries required by the executable into its build output.
+`--install` copies both the binary and those libraries to `/usr/local/bin`; keep them together when moving the CLI.
+Standalone builds check companion loader paths, architectures, and signatures using the selected toolchain.
+The release-only older-SDK runtime export audit remains mandatory for release builders and verifiers.
 
 The universal CLI build uses `--triple x86_64-apple-macosx15.0` for Intel compilation and binary-directory lookup,
 matching the CLI package's existing `.macOS(.v15)` minimum. It also sets Swift Build's aggregate deployment minimum,
@@ -79,7 +86,10 @@ themselves. Installing the published npm binary does not run source setup. The h
 and AXorcist submodule identities and HEADs against this checkout's gitlinks. Uncommitted local Commander edits remain
 visible to development builds; source-stamped release builds still require the existing clean-source gate.
 
-AXorcist always declares remote Commander at exact `0.2.4`. Peekaboo's internal package graph already selects the live
+The `run` wrapper preserves ordinary command exit statuses and reports signal-terminated children using the shell
+convention (`128 + signal`, such as 143 for SIGTERM). Post-command mapping integrity checks and lock cleanup still run.
+
+AXorcist always declares remote Commander at exact `0.3.0`. Peekaboo's internal package graph already selects the live
 Commander submodule through explicit filesystem dependencies. The helper aligns the remote URL with that same canonical
 absolute directory using a `file://` URL; it neither changes a dependency requirement nor substitutes SwiftPM's version
 checkout. A bare absolute mirror path is classified as local source control by SwiftPM, whose validation rejects the
@@ -103,7 +113,7 @@ navigator package-root reference. Promoting Commander to a root package also res
 dependency, which is outside the consuming graph's canonical lock. Keep Commander as a dependency rather than adding
 it as another workspace root; the compile-only real-submodule fixture verifies that its uncommitted source stays live.
 
-The public root `Package.swift` pins AXorcist exact `0.1.11`, matching the internal AXorcist submodule.
+The public root `Package.swift` pins AXorcist exact `0.2.1`, matching the internal AXorcist submodule.
 Standalone AutomationKit, Foundation, Protocols, Visualizer, and submodule builds are not given a Commander override:
 those graphs do not select Peekaboo's live Commander package.
 Adding another consuming package requires adding its explicit context to the helper and qualifying it. A transitive
@@ -138,6 +148,30 @@ consumer locks already select 1.6.0; do not advance this constraint until the bu
 macOS runtime baseline. Release runtime verification rejects that strong import in every architecture, including
 reused binaries and extracted archives. Weak imports remain distinct; this does not weak-link the Swift runtime or
 replace system libraries. Successful execution on the build host alone does not prove older-macOS compatibility.
+
+Runtime verification also audits every strong `libswift*` import per architecture by parsing the
+installed SDK's Swift `.tbd` files at verification time, following re-exports transitively. Weak imports
+and bundled `libswiftCompatibility*` libraries are excluded; undefined symbols without a two-level
+source library fail closed. Swift symbols imported from frameworks such as Foundation and SwiftUI are
+outside this audit. Generated export data is intentionally not checked in.
+
+Compatibility-library imports and executable-relative loader paths are checked independently for each Mach-O slice. A library needs the architectures that actually import it, not unrelated slices. `bash scripts/test-swift-runtime-libraries.sh` includes synthetic inspection-only slice fixtures and the existing real-runtime Span probe. Add `--inspection-only` for local inspection proof without executing that probe; hosted CI retains the full default check. Synthetic-runtime fixture executables are never run.
+
+The audit selects the oldest installed macOS SDK at or above the highest slice's minimum macOS version
+and older than macOS 27. It records the SDK version, build, full path, and export digest with each
+successful audit. Hosts may legitimately select different SDKs: an older eligible SDK is stricter and
+still correct, and the record line makes proofs comparable. The macOS 27 limit is a deliberate code
+constant, `BASELINE_MUST_PREDATE`, protecting against the macOS 27-only symbol behind #831; raise it only
+deliberately, when no older SDK can be provisioned on release hosts.
+
+When no eligible SDK is installed, verification fails closed. Release and signed-build hosts need
+Command Line Tools or Xcode providing such an SDK, for example CLT's `MacOSX26.5.sdk`. A host with only
+macOS 27 SDKs cannot weaken this gate.
+
+A 26.x SDK proves compatibility with that runtime, not every release down to the macOS 15.0 deployment
+target. Symbols introduced between 15.0 and the selected SDK remain guarded by compiler availability
+checking. A host with a macOS 15 SDK, for example from Xcode 16, automatically audits more strictly
+because the oldest eligible SDK wins.
 
 ## Tachikoma integration
 

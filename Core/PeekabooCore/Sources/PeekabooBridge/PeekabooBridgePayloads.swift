@@ -160,6 +160,18 @@ public struct PeekabooBridgeForegroundModifierClickRequest: Codable, Sendable {
     }
 }
 
+public struct PeekabooBridgeSelectTextRequest: Codable, Sendable {
+    public let target: String
+    public let request: TextSelectionRequest
+    public let snapshotId: String?
+
+    public init(target: String, request: TextSelectionRequest, snapshotId: String?) {
+        self.target = target
+        self.request = request
+        self.snapshotId = snapshotId
+    }
+}
+
 public struct PeekabooBridgeSetValueRequest: Codable, Sendable {
     public let target: String
     public let value: UIElementValue
@@ -255,19 +267,25 @@ public struct PeekabooBridgeExactWindowHotkeyRequest: Codable, Sendable {
     public let expectedWindowIdentity: WindowMutationIdentity
     public let expectedWindowBounds: CGRect
     public let expectedFocusedElement: FocusedElementIdentity?
+    public let clipboardClaim: GeneralPasteboardWriteClaim?
+    public let backgroundPreparation: BackgroundWindowKeyboardPreparationMode?
 
     public init(
         keys: String,
         holdDuration: Int,
         expectedWindowIdentity: WindowMutationIdentity,
         expectedWindowBounds: CGRect,
-        expectedFocusedElement: FocusedElementIdentity? = nil)
+        expectedFocusedElement: FocusedElementIdentity? = nil,
+        clipboardClaim: GeneralPasteboardWriteClaim? = nil,
+        backgroundPreparation: BackgroundWindowKeyboardPreparationMode? = nil)
     {
         self.keys = keys
         self.holdDuration = holdDuration
         self.expectedWindowIdentity = expectedWindowIdentity
         self.expectedWindowBounds = expectedWindowBounds
         self.expectedFocusedElement = expectedFocusedElement
+        self.clipboardClaim = clipboardClaim
+        self.backgroundPreparation = backgroundPreparation
     }
 }
 
@@ -565,10 +583,16 @@ public struct PeekabooBridgeMenuClickByNameRequest: Codable, Sendable {
 public struct PeekabooBridgeMenuBarClickByNameRequest: Codable, Sendable {
     public let name: String
     public let expectedLeafEvidence: DesktopSelectedLeafEvidence?
+    public let applicationScope: MenuBarApplicationScope?
 
-    public init(name: String, expectedLeafEvidence: DesktopSelectedLeafEvidence? = nil) {
+    public init(
+        name: String,
+        expectedLeafEvidence: DesktopSelectedLeafEvidence? = nil,
+        applicationScope: MenuBarApplicationScope? = nil)
+    {
         self.name = name
         self.expectedLeafEvidence = expectedLeafEvidence
+        self.applicationScope = applicationScope
     }
 }
 
@@ -630,6 +654,69 @@ public struct PeekabooBridgeDialogHandleFileRequest: Codable, Sendable {
     public let actionButton: String?
     public let ensureExpanded: Bool?
     public let appName: String?
+    public let execution: DialogFileExecutionRequest?
+
+    public init(
+        path: String?,
+        filename: String?,
+        actionButton: String?,
+        ensureExpanded: Bool?,
+        appName: String?)
+    {
+        self.path = path
+        self.filename = filename
+        self.actionButton = actionButton
+        self.ensureExpanded = ensureExpanded
+        self.appName = appName
+        self.execution = nil
+    }
+
+    public init(execution: DialogFileExecutionRequest) {
+        self.path = nil
+        self.filename = nil
+        self.actionButton = nil
+        self.ensureExpanded = nil
+        self.appName = nil
+        self.execution = execution
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case path, filename, actionButton, ensureExpanded, appName, execution
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.execution) {
+            let legacyKeys: [CodingKeys] = [.path, .filename, .actionButton, .ensureExpanded, .appName]
+            guard !legacyKeys.contains(where: container.contains) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .execution,
+                    in: container,
+                    debugDescription: "Typed file execution cannot be combined with legacy file fields")
+            }
+            try self.init(execution: container.decode(DialogFileExecutionRequest.self, forKey: .execution))
+        } else {
+            try self.init(
+                path: container.decodeIfPresent(String.self, forKey: .path),
+                filename: container.decodeIfPresent(String.self, forKey: .filename),
+                actionButton: container.decodeIfPresent(String.self, forKey: .actionButton),
+                ensureExpanded: container.decodeIfPresent(Bool.self, forKey: .ensureExpanded),
+                appName: container.decodeIfPresent(String.self, forKey: .appName))
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if let execution {
+            try container.encode(execution, forKey: .execution)
+        } else {
+            try container.encodeIfPresent(self.path, forKey: .path)
+            try container.encodeIfPresent(self.filename, forKey: .filename)
+            try container.encodeIfPresent(self.actionButton, forKey: .actionButton)
+            try container.encodeIfPresent(self.ensureExpanded, forKey: .ensureExpanded)
+            try container.encodeIfPresent(self.appName, forKey: .appName)
+        }
+    }
 }
 
 public struct PeekabooBridgeDialogDismissRequest: Codable, Sendable {

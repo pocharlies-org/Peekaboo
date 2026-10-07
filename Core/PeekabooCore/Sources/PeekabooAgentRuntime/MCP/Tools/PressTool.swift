@@ -26,9 +26,10 @@ public struct PressTool: MCPTool {
             """
         }
         return """
-        Presses one or more raw keyboard chords. Use `keys` for an xdotool-style chord sequence such as
+        Presses one or more raw keyboard chords. Use `keys` for a Peekaboo chord sequence such as
         ["cmd+c", "Return"], or use `key` plus `modifiers` for a single chord. The two input shapes are
         mutually exclusive. \(targeting)
+        \(KeyboardChord.syntaxHelp)
         Raw chords cannot prove semantic intent or effect; observe the exact target after unverified delivery.
         \(PeekabooMCPVersion.banner) using openai/gpt-5.6, anthropic/claude-opus-5
         """
@@ -39,7 +40,7 @@ public struct PressTool: MCPTool {
         var properties: [String: Value] = [
             "keys": SchemaBuilder.array(
                 items: SchemaBuilder.string(),
-                description: "Optional chord sequence using xdotool key syntax, e.g. ['cmd+c', 'Return'].",
+                description: "Optional chord sequence, e.g. ['cmd+c', 'Return']. \(KeyboardChord.syntaxHelp)",
                 minItems: 1),
             "key": SchemaBuilder.string(
                 description: "Optional single primary key, used with modifiers instead of keys."),
@@ -341,7 +342,7 @@ public struct PressTool: MCPTool {
             let outcomeAutomation = try ExactWindowKeyboardRuntime.requireOutcomeProvider(
                 automation: self.context.automation,
                 operation: "Background hotkeys")
-            guard let focusedElement = exactWindow.focusedElement else {
+            guard let keyboardTarget = exactWindow.keyboardTarget else {
                 throw PressToolValidationError(
                     message: "Exact-window background hotkeys require a focused-element receipt.")
             }
@@ -349,10 +350,7 @@ public struct PressTool: MCPTool {
                 outcomeAutomation.hotkeyWithOutcome(
                     keys: chord.serviceKeys,
                     holdDuration: hold,
-                    target: ExactWindowKeyboardTarget(
-                        windowIdentity: exactWindow.identity,
-                        windowBounds: exactWindow.bounds,
-                        focusedElement: focusedElement)),
+                    target: keyboardTarget),
                 keys: chord.serviceKeys,
                 operation: "Background hotkeys")
         }
@@ -584,39 +582,18 @@ public struct PressTool: MCPTool {
     private static func responseMessage(_ input: PressResponseMessageInput) -> String {
         let sequence = input.display.joined(separator: " → ")
         let duration = String(format: "%.2f", input.elapsed)
-        guard let outcome = input.outcome else {
-            if input.confirmedNoChangeWithoutAggregate {
-                if input.targetFocusCompleted {
-                    return "\(AgentDisplayTokens.Status.warning) Completed \(sequence); " +
-                        "all chords confirmed no change. The setup-focus effect is unverifiable; " +
-                        "observe before continuing. Completed in \(duration)s"
-                }
-                return "\(AgentDisplayTokens.Status.success) Completed \(sequence); " +
-                    "all chords confirmed no change in \(duration)s"
+        if input.outcome == nil, input.confirmedNoChangeWithoutAggregate {
+            if input.targetFocusCompleted {
+                return "\(AgentDisplayTokens.Status.warning) Completed \(sequence); " +
+                    "all chords confirmed no change. The setup-focus effect is unverifiable; " +
+                    "observe before continuing. Completed in \(duration)s"
             }
-            return "\(AgentDisplayTokens.Status.success) Dispatched \(sequence) " +
-                "(\(input.completed) raw chord\(input.completed == 1 ? "" : "s")); effect is unverifiable. " +
-                "Observe before continuing. Completed in \(duration)s"
+            return "\(AgentDisplayTokens.Status.success) Completed \(sequence); " +
+                "all chords confirmed no change in \(duration)s"
         }
-        return switch outcome.state {
-        case .confirmedChange:
-            "\(AgentDisplayTokens.Status.success) Completed \(sequence); effect confirmed in \(duration)s"
-        case .confirmedNoChange:
-            "\(AgentDisplayTokens.Status.success) Completed \(sequence); confirmed no change in \(duration)s"
-        case .partial:
-            "\(AgentDisplayTokens.Status.warning) Completed \(sequence) with a partial effect in \(duration)s"
-        case .dispatchedUnverified:
-            "\(AgentDisplayTokens.Status.warning) Dispatched \(sequence); effect is unverifiable. " +
-                "Observe before continuing. Completed in \(duration)s"
-        case .suspectedNoop:
-            "\(AgentDisplayTokens.Status.warning) Dispatched \(sequence), but no change was observed. " +
-                "Refresh the target before retrying. Completed in \(duration)s"
-        case .refused:
-            "\(AgentDisplayTokens.Status.failure) \(sequence) was refused before dispatch in \(duration)s"
-        case .indeterminate:
-            "\(AgentDisplayTokens.Status.warning) \(sequence) has an indeterminate outcome. " +
-                "Observe before continuing. Completed in \(duration)s"
-        }
+        return ActionOutcomeHumanRenderer.statusLine(for: input.outcome, operation: "Press") +
+            "\nSequence: \(sequence) (\(input.completed) raw chord\(input.completed == 1 ? "" : "s")); " +
+            "elapsed \(duration)s"
     }
 
     private static func foregroundConsentRefusal() throws -> ToolResponse {

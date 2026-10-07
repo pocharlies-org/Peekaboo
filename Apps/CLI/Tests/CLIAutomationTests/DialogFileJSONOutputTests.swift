@@ -83,6 +83,7 @@ struct DialogFileJSONOutputTests {
         #expect(response.outcome?.route == .local)
         #expect(response.outcome?.deliveryMechanism == .globalEvents)
         #expect(response.outcome?.deliveryMode == .foreground)
+        #expect(dialogService.exactFileRequests.isEmpty)
     }
 
     @Test
@@ -147,7 +148,15 @@ struct DialogFileJSONOutputTests {
         let outcome = try #require(object["outcome"] as? [String: Any])
 
         #expect(result.exitStatus == 0)
-        #expect(windows.pinnedFocusCalls.count == 1)
+        #expect(windows.pinnedFocusCalls.isEmpty)
+        let request = try #require(dialogService.exactFileRequests.first)
+        #expect(request.target.windowID == DialogFileFocusWindowService.windowID)
+        #expect(request.target.processIdentifier == DialogFileFocusWindowService.processIdentifier)
+        #expect(request.path == "/tmp")
+        #expect(request.filename == "out.txt")
+        #expect(request.actionButton == "Save")
+        #expect(request.focus.timeout == 0.001)
+        #expect(request.focus.retryCount == 1)
         #expect(target["kind"] as? String == "window")
         #expect(target["pid"] as? Int == Int(DialogFileFocusWindowService.processIdentifier))
         #expect(target["process_start_identity_decimal"] as? String ==
@@ -175,11 +184,11 @@ struct DialogFileJSONOutputTests {
         let object = try Self.jsonObject(result.stdout)
         let outcome = try #require(object["outcome"] as? [String: Any])
 
-        #expect(result.exitStatus == 0)
-        #expect(windows.pinnedFocusCalls.count == 1)
+        #expect(result.exitStatus == 1)
+        #expect(windows.pinnedFocusCalls.isEmpty)
         #expect(object["target_identity"] == nil)
         #expect(object["target_receipt"] == nil)
-        #expect(outcome["state"] as? String == "dispatched_unverified")
+        #expect(outcome["state"] as? String == "indeterminate")
         #expect(outcome["dispatched_unit_count"] as? Int == 2)
     }
 
@@ -190,7 +199,7 @@ struct DialogFileJSONOutputTests {
             success: true,
             action: .handleFileDialog,
             details: ["button_clicked": "Save"],
-            outcome: nil,
+            outcome: Self.ownerOutcome,
             targetReceipt: DesktopActionTargetReceipt(
                 processIdentifier: DialogFileFocusWindowService.processIdentifier,
                 processStartIdentity: DialogFileFocusWindowService.processStartIdentity,
@@ -211,7 +220,7 @@ struct DialogFileJSONOutputTests {
         let outcome = try #require(object["outcome"] as? [String: Any])
 
         #expect(result.exitStatus == 1)
-        #expect(windows.pinnedFocusCalls.count == 1)
+        #expect(windows.pinnedFocusCalls.isEmpty)
         #expect(object["target_identity"] == nil)
         #expect(object["target_receipt"] == nil)
         #expect(outcome["state"] as? String == "indeterminate")
@@ -223,12 +232,13 @@ struct DialogFileJSONOutputTests {
         [
             "dialog", "file",
             "--window-id", String(DialogFileFocusWindowService.windowID),
+            "--pid", String(DialogFileFocusWindowService.processIdentifier),
             "--path", "/tmp",
             "--name", "out.txt",
             "--select", "Save",
             "--foreground",
             "--focus-timeout", "1ms",
-            "--focus-retry-count", "0",
+            "--focus-retry-count", "1",
             "--json",
             "--no-remote",
         ]
@@ -254,7 +264,7 @@ struct DialogFileJSONOutputTests {
             success: true,
             action: .handleFileDialog,
             details: ["button_clicked": "Save"],
-            outcome: nil,
+            outcome: self.ownerOutcome,
             targetReceipt: targetIdentity.map {
                 DesktopActionTargetReceipt(
                     processIdentifier: $0.ownerProcessIdentifier,
@@ -265,6 +275,14 @@ struct DialogFileJSONOutputTests {
             targetWindowIdentity: targetIdentity,
             targetWindowBounds: targetBounds,
             focusedElement: nil
+        )
+    }
+
+    private static var ownerOutcome: DesktopActionOutcome {
+        .dispatchedUnverified(
+            delivery: .init(mechanism: .composite, mode: .foreground),
+            evidence: .deliveryAccepted,
+            unitCount: .init(2)
         )
     }
 
@@ -314,7 +332,7 @@ WindowManagementPinnedFocusActionResultProviding {
         expectedIdentity: WindowMutationIdentity
     ) async throws -> UIAutomationActionResult<Void> {
         self.pinnedFocusCalls.append((target, expectedIdentity))
-        try await self.focusWindow(target: target)
+        try await focusWindow(target: target)
         return try UIAutomationActionResult(
             payload: (),
             outcome: .confirmedChange(

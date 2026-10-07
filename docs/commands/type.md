@@ -23,10 +23,17 @@ confirmed using the earlier receiver metadata.
 Text edits and cursor changes also recheck their source text and selection immediately before mutation. If either
 changes during asynchronous preflight, the unit stops without recomputing or replaying it. These checks do not make
 macOS Accessibility reads and writes an atomic transaction.
-The original selection stays bound while a value write settles. A changed selection stops the follow-up cursor
-write unless the requested range is already present, including when it settles during selection preflight;
-in that case no selection write is sent, and subsequent input continues from the verified range.
+The original text and selection stay bound until the value write. An accepted value writer then freezes its
+actual coherent, focused text-and-selection completion state after confirming the exact requested UTF-16 value.
+This accommodates native controls that move their caret while applying AXValue; it cannot attribute a caret change
+during settlement to the app rather than a user. The follow-up cursor write must still match that frozen state:
+later text, selection, receiver, window or process-generation drift stops the unit without resampling or rebasing.
+If the requested range is already present with the expected text, no selection write is sent. A value no-op retains the original
+state's authority, and missing or incoherent post-write evidence remains indeterminate and unsafe to retry.
 Focused-text edits preserve exact Unicode storage; canonically equivalent text is not an automatic no-op.
+An already-empty clear or already-satisfied caret move contributes no dispatch units. Signed Bridge receipts preserve
+those no-ops while separately accounting for subsequent text writes and keyboard fallback; they do not invent a write
+or reject a delivered text edit merely because its preceding clear needed no work.
 Cancellation prevents starting keyboard fallback or another stroke; an already-started stroke still finishes its
 key-up cleanup, and any accepted prefix remains unsafe to replay.
 
@@ -108,7 +115,7 @@ key-up cleanup, and any accepted prefix remains unsafe to replay.
   `set-value`: it verifies the AX value readback without exposing field contents in the result. Secure fields, special
   keys, IME-dependent input, and controls without readable values remain intentionally unverifiable.
 - JSON output reports confirmed `totalCharacters`, `keyPresses`, `specialKeyPresses`, delivery mode, optional target PID/window ID, and elapsed time; this matches what the agent logs when executing scripted steps. Legacy providers that omit the special-key count retain the former derived fallback.
-- `keyPresses` counts all actual keyboard events, `specialKeyPresses` counts only events emitted for special-key and clear actions, and canonical `dispatched_unit_count` counts every accepted mutation. Direct background text insertion, editable selection/deletion keys, and clear use `accessibility_value` with zero key presses when AX succeeds. Event fallback counts the posted key events; a request that uses both mechanisms reports `composite`. Keyboard-clear fallback remains two key presses, two special-key presses, and two dispatches.
+- `keyPresses` counts completed keystrokes, not individual key-down/key-up events; `specialKeyPresses` counts the subset for special-key and clear actions. Canonical `dispatched_unit_count` counts accepted typing units, not raw Accessibility setter calls: one character edit can include both a value write and caret completion. Direct background text insertion, editable selection/deletion keys, and clear use `accessibility_value` with zero key presses when AX succeeds. A request that uses both AX and keyboard delivery reports `composite`. Keyboard-clear fallback remains two key presses, two special-key presses, and two dispatch units.
 
 ## Examples
 ```bash

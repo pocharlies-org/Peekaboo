@@ -1275,6 +1275,8 @@ extension PeekabooBridgeRequest {
             [DesktopTargetEvidenceAdapter.evidence(
                 windowIdentity: payload.request.windowIdentity,
                 bounds: payload.request.windowBounds)]
+        case let .exactWindowDrag(payload):
+            [.init(target: DesktopTargetIdentity(exactWindow: payload.target))]
         case let .releaseExactWindowHeldPointer(payload),
              let .revokeExactWindowHeldPointer(payload):
             [DesktopTargetEvidenceAdapter.evidence(
@@ -1352,6 +1354,10 @@ extension PeekabooBridgeRequest {
             } ?? []
         case let .exactDialogClickButton(receipt), let .exactDialogDismiss(receipt):
             [.init(target: DesktopTargetIdentity(exactWindow: receipt.target))]
+        case let .dialogHandleFile(payload):
+            payload.execution.map {
+                [.init(processIdentifier: $0.target.processIdentifier, windowID: $0.target.windowID)]
+            } ?? []
         case let .inspectAccessibilityTree(payload):
             payload.windowContext.map(DesktopTargetEvidenceAdapter.evidence(selectorContext:)).map { [$0] } ?? []
         default:

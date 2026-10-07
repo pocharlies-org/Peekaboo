@@ -233,7 +233,7 @@ enum AutomationServiceBridge {
                     operation: "Background typing"
                 )
             }
-            guard let focusedElement = exactWindow.focusedElement else {
+            guard let keyboardTarget = exactWindow.keyboardTarget else {
                 throw PeekabooError.invalidInput(
                     field: "target",
                     reason: "Exact-window typing requires a focused-element receipt"
@@ -244,11 +244,7 @@ enum AutomationServiceBridge {
                     request.actions,
                     cadence: request.cadence,
                     snapshotId: request.snapshotId,
-                    target: ExactWindowKeyboardTarget(
-                        windowIdentity: exactWindow.identity,
-                        windowBounds: exactWindow.bounds,
-                        focusedElement: focusedElement
-                    )
+                    target: keyboardTarget
                 ),
                 operation: "Background typing",
                 allowsCompositeTypeDelivery: requiresCompositeTypeDelivery
@@ -362,8 +358,31 @@ enum AutomationServiceBridge {
         automation: any UIAutomationServiceProtocol,
         keys: String,
         holdDuration: Int,
-        target: UIAutomationTarget
+        target: UIAutomationTarget,
+        clipboardClaim: GeneralPasteboardWriteClaim? = nil
     ) async throws -> UIAutomationActionResult<Void> {
+        if let clipboardClaim {
+            guard let exactWindow = target.exactWindow, exactWindow.focusedElement != nil else {
+                throw DesktopActionFailure.preDispatchRefusal(
+                    reason: .invalidRequest,
+                    message: "Clipboard-guarded paste requires an exact-window focused-element receipt."
+                )
+            }
+            let provider = try ExactWindowKeyboardRuntime.requirePreparedClipboardGuardedPasteProvider(
+                automation: automation,
+                operation: "Background paste"
+            )
+            return try await ExactWindowKeyboardRuntime.validatePreparedPasteReceipt(
+                provider.hotkeyWithOutcome(
+                    keys: keys,
+                    holdDuration: holdDuration,
+                    target: exactWindow,
+                    clipboardClaim: clipboardClaim,
+                    preparation: .blankWindowChrome
+                ),
+                operation: "Background paste"
+            )
+        }
         switch target {
         case .foreground:
             return try await self.hotkey(automation: automation, keys: keys, holdDuration: holdDuration)
@@ -385,7 +404,7 @@ enum AutomationServiceBridge {
                 automation: automation,
                 operation: "Background hotkeys"
             )
-            guard let focusedElement = exactWindow.focusedElement else {
+            guard let keyboardTarget = exactWindow.keyboardTarget else {
                 throw PeekabooError.invalidInput(
                     field: "target",
                     reason: "Exact-window hotkeys require a focused-element receipt"
@@ -395,11 +414,7 @@ enum AutomationServiceBridge {
                 outcomeService.hotkeyWithOutcome(
                     keys: keys,
                     holdDuration: holdDuration,
-                    target: ExactWindowKeyboardTarget(
-                        windowIdentity: exactWindow.identity,
-                        windowBounds: exactWindow.bounds,
-                        focusedElement: focusedElement
-                    )
+                    target: keyboardTarget
                 ),
                 keys: keys,
                 operation: "Background hotkeys"
@@ -1061,6 +1076,21 @@ enum MenuServiceBridge {
     -> [MenuBarItemInfo] {
         try await Task { @MainActor in
             try await menu.listMenuBarItems(includeRaw: includeRaw)
+        }.value
+    }
+
+    static func prepareMenuBarItem(
+        menu: any MenuServiceProtocol, request: MenuBarItemPreparationRequest
+    ) async throws -> MenuBarItemInfo {
+        try await Task<MenuBarItemInfo, any Error> { @MainActor in
+            guard let provider = menu as? any MenuServiceScopedMenuBarPreparationProviding else {
+                throw DesktopActionFailure.preDispatchRefusal(
+                    reason: .runtimeIncompatible,
+                    message: "The selected runtime cannot prepare application-scoped menu bar items.",
+                    hint: "Update the selected Peekaboo runtime; scoped clicks never fall back to global lookup."
+                )
+            }
+            return try await provider.prepareMenuBarItem(request)
         }.value
     }
 
