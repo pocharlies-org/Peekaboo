@@ -9,6 +9,10 @@ import Foundation
 public class ElementToolFormatter: BaseToolFormatter {
     override public func formatCompactSummary(arguments: [String: Any]) -> String {
         switch toolType {
+        case .selectText:
+            let mode = arguments["selection_type"] as? String ?? "text"
+            let target = arguments["on"] as? String ?? "element"
+            return "\(mode) on \(target)"
         case .setValue:
             let target = arguments["on"] as? String ?? "element"
             if let value = arguments["value"] {
@@ -467,12 +471,12 @@ public class ElementToolFormatter: BaseToolFormatter {
             return intValue
         }
         if let doubleValue = value as? Double {
-            return Int(doubleValue.rounded())
+            return ToolResultExtractor.integer(doubleValue, rounding: .toNearestOrAwayFromZero)
         }
         if let stringValue = value as? String,
            let doubleValue = Double(stringValue)
         {
-            return Int(doubleValue.rounded())
+            return ToolResultExtractor.integer(doubleValue, rounding: .toNearestOrAwayFromZero)
         }
         return nil
     }

@@ -89,8 +89,13 @@ rg -Fq 'readonly GITHUB_HOST GITHUB_REPOSITORY GITHUB_API_REPOSITORY NPM_REGISTR
 rg -Fq -- '--registry "$NPM_REGISTRY"' "$ROOT_DIR/scripts/release-binaries.sh"
 rg -Fq '@steipete:registry=%s/' "$ROOT_DIR/scripts/release-binaries.sh"
 rg -Fq -- '--resume-publication' "$ROOT_DIR/scripts/release-binaries.sh"
-rg -Fq 'gh release upload "v${VERSION}" "${RELEASE_ASSETS[@]}"' \
+rg -Fq 'select_release_asset_uploads' "$ROOT_DIR/scripts/release-binaries.sh"
+rg -Fq 'gh release upload "v${VERSION}" "${RELEASE_ASSET_UPLOADS[@]}"' \
   "$ROOT_DIR/scripts/release-binaries.sh"
+if rg -Fq 'gh release upload "v${VERSION}" "${RELEASE_ASSETS[@]}"' "$ROOT_DIR/scripts/release-binaries.sh"; then
+  echo 'resume must upload only the draft assets that are missing or differ from the frozen receipt' >&2
+  exit 1
+fi
 rg -Fq 'npm_publication_exists' "$ROOT_DIR/scripts/release-binaries.sh"
 rg -Fq 'validate_npm_publish_attempt' "$ROOT_DIR/scripts/release-binaries.sh"
 rg -Fq -- '--retry-npm-publish' "$ROOT_DIR/scripts/release-binaries.sh"
@@ -151,6 +156,17 @@ for release_build in \
   fi
 done
 rg -Fq -- '--entitlements "$ENTITLEMENTS_PATH"' "$ROOT_DIR/scripts/build-swift-debug.sh"
+debug_cli_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+  "$ROOT_DIR/Apps/CLI/Sources/Resources/Info.plist")
+debug_signing_calls=$(rg -Fc \
+  '"$PROJECT_ROOT/scripts/codesign-with-retry.sh" --force --sign "$SIGN_IDENTITY"' \
+  "$ROOT_DIR/scripts/build-swift-debug.sh" || true)
+debug_signing_identifiers=$(rg -Fc -- "--identifier \"$debug_cli_identifier\"" \
+  "$ROOT_DIR/scripts/build-swift-debug.sh" || true)
+if [[ ${debug_signing_calls:-0} -eq 0 || ${debug_signing_identifiers:-0} -ne $debug_signing_calls ]]; then
+  printf 'Every debug CLI signing path must use the canonical plist identifier\n' >&2
+  exit 1
+fi
 rg -Fq 'unexpectedly retains the AppleEvents entitlement' "$ROOT_DIR/scripts/release-macos-app.sh"
 
 while IFS= read -r native_only_surface; do

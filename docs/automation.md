@@ -47,7 +47,7 @@ Focus flags tune foreground focus behavior but do not silently change delivery m
 
 All CLI timing flags use the same grammar: bare numbers are milliseconds, and `ms`/`s` suffixes are accepted (`500`, `500ms`, `2s`, `1.5s`).
 
-Pointer delivery is deliberately stricter. A targeted `scroll --on <id>` stays in the background and prefers the element's Accessibility scroll action. Opaque groups in a visible WebKit-linked app may use exact PID/window-routed wheel events from a fresh pixel snapshot; that route is retry-unsafe because macOS does not acknowledge the receiver's effect. It never falls back to the shared cursor. Targetless, smooth, or delayed wheel input requires `--foreground`. `move`, `drag`, and `click --long-press` manipulate shared physical pointer state, so they also require explicit `--foreground` consent. Their Space/focus modifiers are only valid with that foreground mode; there is no misleading `--no-auto-focus` escape hatch.
+Pointer delivery is deliberately stricter. A targeted `scroll --on <id>` stays in the background and prefers the element's Accessibility scroll action. Groups, web areas, and scroll areas in an eligible visible WebKit-linked or recognized Safari app may use exact PID/window-routed wheel events from a fresh pixel snapshot; that route is retry-unsafe because macOS does not acknowledge the receiver's effect. It never falls back to the shared cursor. Targetless, smooth, or delayed wheel input requires `--foreground`. A bounded linear `drag --snapshot <id>` routes only inside that snapshot's exact window, with no cursor movement or activation; it requires protocol 1.39 and reports unverified, retry-unsafe dispatch. Cross-window/app drops, modifiers, and human movement require `--foreground`. `move` and `click --long-press` still manipulate shared physical pointer state and require explicit `--foreground` consent. Space/focus modifiers are only valid with foreground mode; there is no `--no-auto-focus` escape hatch.
 
 Multi-unit background input is prefix-aware. Once any scroll unit or semantic click has been accepted—or may have been accepted—Peekaboo stops instead of replaying the request through a fallback route. Canonical partial and indeterminate outcomes retain the accepted/possible unit count, stay retry-unsafe, and provide recovery or observation escalation. This also covers SwiftUI tab buttons whose `AXPress` returns before selection can be confirmed: Peekaboo reports the accepted press as indeterminate rather than issuing a second synthetic click.
 
@@ -128,6 +128,16 @@ peekaboo press cmd+s --foreground
 ```
 
 Three primitives, four lines. The agent does the same thing under the hood — it just plans the sequence for you.
+
+## Swift SDK waits
+
+Source consumers of the `PeekabooCore` package can call `PeekabooServices.automate(appIdentifier:actions:)` with
+`.wait(milliseconds:)` actions. Waits use signed integer milliseconds: zero remains a successful immediate action,
+and positive values retain the full `Int` range without an overflow-prone nanosecond conversion. Suspended waits are
+cancellable and retain the method's existing action-error wrapping.
+
+A negative wait anywhere in the sequence rejects the entire request before snapshot creation, capture, detection or
+earlier input actions. Correct the request instead of expecting a preceding action to run before the invalid wait.
 
 ## Resilience tips
 

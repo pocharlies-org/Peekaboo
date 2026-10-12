@@ -26,6 +26,8 @@ public enum TerminalColor {
 
 /// Update the terminal title using VibeTunnel or ANSI escape sequences
 public func updateTerminalTitle(_ title: String) {
+    let title = sanitizedTerminalTitle(title)
+
     // Try VibeTunnel first
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -46,6 +48,13 @@ public func updateTerminalTitle(_ title: String) {
     // Fallback to ANSI escape sequence
     print("\u{001B}]0;\(title)\u{0007}", terminator: "")
     fflush(stdout)
+}
+
+/// OSC title text cannot contain control characters that terminate or escape the title sequence.
+func sanitizedTerminalTitle(_ title: String) -> String {
+    String(String.UnicodeScalarView(title.unicodeScalars.filter {
+        !(0...0x1F).contains($0.value) && !(0x7F...0x9F).contains($0.value)
+    }))
 }
 
 enum TerminalTitleProcessWaitError: Error {
