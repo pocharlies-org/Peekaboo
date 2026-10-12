@@ -7,6 +7,7 @@ import PeekabooFoundation
 @MainActor
 final class OutcomeStubAutomationService: StubAutomationService, ScriptedUIAutomationActionOutcomeProviding,
     ExactWindowTargetedKeyboardServiceProtocol, TargetedFocusedElementServiceProtocol,
+    PreparedClipboardGuardedExactWindowHotkeyServiceProtocol,
     UIAutomationGlobalPointerActionResultProviding {
     struct ExactTypeActionsCall {
         let actions: [TypeAction]
@@ -19,6 +20,7 @@ final class OutcomeStubAutomationService: StubAutomationService, ScriptedUIAutom
     }
 
     let uiAutomationOutcomeScript = UIAutomationOutcomeScript()
+    var supportsBackgroundCoordinateScroll = false
     var setValueResultTargetBindingSupported = true
     override var supportsSetValueResultTargetBinding: Bool {
         self.setValueResultTargetBindingSupported
@@ -28,12 +30,17 @@ final class OutcomeStubAutomationService: StubAutomationService, ScriptedUIAutom
         true
     }
 
-    let supportsExactWindowTargetedKeyboard = true
+    var supportsExactWindowTargetedKeyboard = true
+    var supportsClipboardGuardedExactWindowHotkeys = true
+    var supportsPreparedClipboardGuardedExactWindowHotkeys = true
+    var backgroundPreparations: [BackgroundWindowKeyboardPreparationMode] = []
     let supportsExactWindowCompositeTypeDelivery = true
     let exactWindowTargetedKeyboardUnavailableReason: String? = nil
     let exactWindowCompositeTypeDeliveryUnavailableReason: String? = nil
     var exactTypeActionsCalls: [ExactTypeActionsCall] = []
     var exactHotkeyCalls: [ExactHotkeyCall] = []
+    var guardedHotkeyClaims: [GeneralPasteboardWriteClaim] = []
+    var beforeGuardedHotkey: (() throws -> Void)?
     var targetedFocusedElement: UIFocusInfo?
     var actionOutcomeTargetIdentity: DesktopTargetIdentity?
     var allowsContradictoryOutcomeTargetIdentityForTesting = false
@@ -81,6 +88,44 @@ final class OutcomeStubAutomationService: StubAutomationService, ScriptedUIAutom
     func getFocusedElement(targetProcessIdentifier: pid_t) async -> UIFocusInfo? {
         guard self.targetedFocusedElement?.processId == Int(targetProcessIdentifier) else { return nil }
         return self.targetedFocusedElement
+    }
+
+    func hotkeyWithOutcome(
+        keys: String,
+        holdDuration: Int,
+        target: UIAutomationTarget.ExactWindow,
+        clipboardClaim: GeneralPasteboardWriteClaim
+    ) async throws -> UIAutomationActionResult<Void> {
+        self.guardedHotkeyClaims.append(clipboardClaim)
+        try self.beforeGuardedHotkey?()
+        guard let focused = target.focusedElement else {
+            throw PeekabooError.invalidInput("Missing retained focus")
+        }
+        let keyboardTarget = ExactWindowKeyboardTarget(
+            windowIdentity: target.identity,
+            windowBounds: target.bounds,
+            focusedElement: focused
+        )
+        let result = try self.scriptedExactHotkeyResult(target: keyboardTarget)
+        try await self.hotkey(
+            keys: keys,
+            holdDuration: holdDuration,
+            target: keyboardTarget
+        )
+        return result
+    }
+
+    func hotkeyWithOutcome(
+        keys: String,
+        holdDuration: Int,
+        target: UIAutomationTarget.ExactWindow,
+        clipboardClaim: GeneralPasteboardWriteClaim,
+        preparation: BackgroundWindowKeyboardPreparationMode
+    ) async throws -> UIAutomationActionResult<Void> {
+        self.backgroundPreparations.append(preparation)
+        return try await self.hotkeyWithOutcome(
+            keys: keys, holdDuration: holdDuration, target: target, clipboardClaim: clipboardClaim
+        )
     }
 
     func dragWithOutcome(_ request: DragOperationRequest) async throws -> UIAutomationActionResult<Void> {

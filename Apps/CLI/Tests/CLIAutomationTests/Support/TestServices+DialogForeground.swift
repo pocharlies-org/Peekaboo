@@ -4,6 +4,17 @@ import PeekabooFoundation
 
 @MainActor
 extension StubDialogService {
+    func handleFileDialog(_ request: DialogFileExecutionRequest) async throws -> DialogActionResult {
+        self.exactFileRequests.append(request)
+        return try await self.handleFileDialog(
+            path: request.path,
+            filename: request.filename,
+            actionButton: request.actionButton,
+            ensureExpanded: request.ensureExpanded,
+            appName: nil
+        )
+    }
+
     func enterText(_ request: DialogLegacyInputExecutionRequest) async throws -> DialogActionResult {
         self.legacyInputFocusPolicies.append(request.focus)
         return try await self.enterText(

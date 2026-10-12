@@ -36,6 +36,7 @@ public enum PeekabooBridgeRequest: Codable, Sendable {
     case exactWindowPixelFocusType(PeekabooBridgeExactWindowPixelFocusTypeRequest)
     case foregroundModifierClick(PeekabooBridgeForegroundModifierClickRequest)
     case setValue(PeekabooBridgeSetValueRequest)
+    case selectText(PeekabooBridgeSelectTextRequest)
     case performAction(PeekabooBridgePerformActionRequest)
     case scroll(PeekabooBridgeScrollRequest)
     case targetedScroll(PeekabooBridgeScrollRequest)
@@ -44,6 +45,7 @@ public enum PeekabooBridgeRequest: Codable, Sendable {
     case exactWindowTargetedHotkey(PeekabooBridgeExactWindowHotkeyRequest)
     case createExactWindowHeldPointerOwner
     case beginExactWindowHeldPointer(PeekabooBridgeBeginHeldPointerRequest)
+    case exactWindowDrag(ExactWindowDragRequest)
     case releaseExactWindowHeldPointer(PeekabooBridgeFinishHeldPointerRequest)
     case revokeExactWindowHeldPointer(PeekabooBridgeFinishHeldPointerRequest)
     case disconnectExactWindowHeldPointerOwner(PeekabooBridgeHeldPointerOwnerRequest)
@@ -86,6 +88,7 @@ public enum PeekabooBridgeRequest: Codable, Sendable {
     case clickMenuExtra(PeekabooBridgeMenuBarClickByNameRequest)
     case menuExtraOpenMenuFrame(PeekabooBridgeMenuExtraOpenRequest)
     case listMenuBarItems(Bool)
+    case prepareMenuBarItem(MenuBarItemPreparationRequest)
     case clickMenuBarItemNamed(PeekabooBridgeMenuBarClickByNameRequest)
     case clickMenuBarItemIndex(PeekabooBridgeMenuBarClickByIndexRequest)
     case listDockItems(PeekabooBridgeDockListRequest)
@@ -162,6 +165,7 @@ extension PeekabooBridgeRequest {
         case .exactWindowPixelFocusType: .exactWindowPixelFocusType
         case .foregroundModifierClick: .foregroundModifierClick
         case .setValue: .setValue
+        case .selectText: .selectText
         case .performAction: .performAction
         case .scroll: .scroll
         case .targetedScroll: .targetedScroll
@@ -170,6 +174,7 @@ extension PeekabooBridgeRequest {
         case .exactWindowTargetedHotkey: .exactWindowTargetedHotkey
         case .createExactWindowHeldPointerOwner: .createExactWindowHeldPointerOwner
         case .beginExactWindowHeldPointer: .beginExactWindowHeldPointer
+        case .exactWindowDrag: .exactWindowDrag
         case .releaseExactWindowHeldPointer: .releaseExactWindowHeldPointer
         case .revokeExactWindowHeldPointer: .revokeExactWindowHeldPointer
         case .disconnectExactWindowHeldPointerOwner: .disconnectExactWindowHeldPointerOwner
@@ -211,6 +216,7 @@ extension PeekabooBridgeRequest {
         case .clickMenuExtra: .clickMenuExtra
         case .menuExtraOpenMenuFrame: .menuExtraOpenMenuFrame
         case .listMenuBarItems: .listMenuBarItems
+        case .prepareMenuBarItem: .prepareMenuBarItem
         case .clickMenuBarItemNamed: .clickMenuBarItemNamed
         case .clickMenuBarItemIndex: .clickMenuBarItemIndex
         case .listDockItems: .listDockItems

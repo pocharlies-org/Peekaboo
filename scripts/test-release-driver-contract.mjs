@@ -14,7 +14,9 @@ import {
   classifyNpmViewResult,
   composeGitHubBody,
   extractReleaseNotes,
+  githubReleaseAssetsNeedingUpload,
   npmIntegrity,
+  npmVersionPageURL,
   validateAppZipMembers,
   validateGitHubRelease,
   validateNpmPublication,
@@ -278,6 +280,7 @@ assert.throws(() => validateTrackedReleaseNotes({ changelog, notes: `${notes}- d
 const packageBytes = Buffer.from('deterministic npm package');
 const localIntegrity = npmIntegrity(packageBytes);
 const npmMetadata = {
+  name: '@steipete/peekaboo',
   version: '9.8.7',
   time: { '9.8.7': '2026-08-26T12:00:00.000Z' },
   dist: {
@@ -292,6 +295,7 @@ assert.doesNotThrow(() => validateNpmPublication({
   localIntegrity,
 }));
 for (const changed of [
+  { ...npmMetadata, name: '@steipete/other' },
   { ...npmMetadata, version: '9.8.6' },
   { ...npmMetadata, dist: { ...npmMetadata.dist, integrity: 'sha512-wrong' } },
   { ...npmMetadata, dist: { ...npmMetadata.dist, tarball: 'https://example.com/peekaboo.tgz' } },
@@ -304,12 +308,49 @@ for (const changed of [
     localIntegrity,
   }));
 }
+assert.equal(npmVersionPageURL('@steipete/peekaboo', '9.8.7'),
+  'https://www.npmjs.com/package/@steipete/peekaboo/v/9.8.7');
+assert.equal(npmVersionPageURL('peekaboo', '1.0.0-beta.1+build.5'),
+  'https://www.npmjs.com/package/peekaboo/v/1.0.0-beta.1%2Bbuild.5');
+for (const name of [undefined, '', '@steipete', '@steipete/', '@/peekaboo', 'a/b', '@a/b/c', '..', '@./x']) {
+  assert.throws(() => npmVersionPageURL(name, '9.8.7'), /package name is invalid/);
+}
+assert.throws(() => npmVersionPageURL('@steipete/peekaboo', ''), /version is invalid/);
 assert.equal(classifyNpmViewResult({
   exitCode: 0, stdout: '"9.8.7"', stderr: '', expectedVersion: '9.8.7',
 }), 'published');
 assert.equal(classifyNpmViewResult({
   exitCode: 1, stdout: '', stderr: 'npm error code E404', expectedVersion: '9.8.7',
 }), 'absent');
+for (const probe of [
+  { stdout: JSON.stringify({ error: { code: 'E404' } }), stderr: '' },
+  { stdout: '', stderr: 'npm ERR! code E404\r\n' },
+  { stdout: JSON.stringify({ error: { code: 'E404' } }), stderr: 'npm error code E404\r\n' },
+  { stdout: '', stderr: 'npm error code E404\nnpm error code E404\n' },
+]) {
+  assert.equal(classifyNpmViewResult({ ...probe, exitCode: 1, expectedVersion: '9.8.7' }), 'absent');
+}
+for (const probe of [
+  { stdout: JSON.stringify({ error: { code: 'E500', summary: 'GET http://owned.invalid/E404/pkg' } }), stderr: 'npm error code E500\nnpm error 500 GET http://owned.invalid/E404/pkg' },
+  { stdout: '', stderr: 'npm error code E401\nnpm error authentication failed; server said 404 Not Found' },
+  { stdout: '', stderr: 'npm error code E404\nnpm error code E401' },
+  { stdout: JSON.stringify({ error: { code: 'E404' } }), stderr: 'npm error code E500\n' },
+  { stdout: JSON.stringify({ error: { code: 'E500' } }), stderr: 'npm ERR! code E404\r\n' },
+  { stdout: '', stderr: '404 Not Found' },
+  { stdout: 'E404', stderr: '' },
+  { stdout: '', stderr: 'npm error request URL: http://owned.invalid/E404/pkg' },
+]) {
+  const input = { ...probe, exitCode: 1, expectedVersion: '9.8.7' };
+  assert.throws(() => classifyNpmViewResult(input), /probe failed/);
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL('./release-driver-contract.mjs', import.meta.url)), 'npm-view-state'], {
+    input: JSON.stringify(input), encoding: 'utf8', timeout: 3000,
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.signal, null);
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /npm publication state probe failed/);
+}
 for (const probe of [
   { exitCode: 0, stdout: 'null', stderr: '' },
   { exitCode: 0, stdout: 'not-json', stderr: '' },
@@ -348,6 +389,9 @@ assert.throws(() => composeGitHubBody({
 const publishedBody = composeGitHubBody({
   notes, proof, plan: bodyPlan, checksumsSHA256: 'f'.repeat(64), npm: npmMetadata,
 });
+assert.ok(publishedBody.includes(
+  '- npm version: [`9.8.7`](https://www.npmjs.com/package/@steipete/peekaboo/v/9.8.7)\n' +
+  '- npm tarball: https://registry.npmjs.org/@steipete/peekaboo/-/peekaboo-9.8.7.tgz\n'));
 assert.match(publishedBody, /npm integrity:/);
 assert.match(publishedBody, /2026-08-26T12:00:00.000Z/);
 const foreignRun = spawnSync(process.execPath, [
@@ -391,6 +435,42 @@ assert.doesNotThrow(() => validateGitHubRelease({
   version: '9.8.7', sourceCommit, tagCommit: sourceCommit,
   expectedAssets, expectedBody: null, expectDraft: true, allowAssetRepair: true,
 }));
+const repairInput = {
+  release, version: '9.8.7', sourceCommit, tagCommit: sourceCommit,
+  expectedAssets, expectedBody: notes, expectDraft: true, allowAssetRepair: true,
+};
+assert.deepEqual(validateGitHubRelease(repairInput), []);
+const firstAsset = release.assets[0];
+const assetWithoutDigest = { name: firstAsset.name, size: firstAsset.size };
+for (const assets of [
+  release.assets.slice(1),
+  [{ ...firstAsset, size: firstAsset.size + 1 }, ...release.assets.slice(1)],
+  [{ ...firstAsset, digest: 'sha256:wrong' }, ...release.assets.slice(1)],
+  [assetWithoutDigest, ...release.assets.slice(1)],
+  [{ ...firstAsset, digest: null }, ...release.assets.slice(1)],
+  [{ ...firstAsset, digest: 42 }, ...release.assets.slice(1)],
+]) {
+  assert.deepEqual(validateGitHubRelease({ ...repairInput, release: { ...release, assets } }), [firstAsset.name]);
+}
+const combinedRepairAssets = release.assets.slice(1).map((asset, index) => {
+  if (index === 0) return { ...asset, size: asset.size + 1 };
+  if (index === 1) return { ...asset, digest: 'sha256:wrong' };
+  if (index === 2) return { name: asset.name, size: asset.size };
+  return asset;
+});
+const combinedRepairNames = release.assets.slice(0, 4).map(asset => asset.name).sort();
+assert.deepEqual(validateGitHubRelease({
+  ...repairInput, release: { ...release, assets: combinedRepairAssets },
+}), combinedRepairNames);
+assert.deepEqual(githubReleaseAssetsNeedingUpload({ assets: combinedRepairAssets, expectedAssets }), combinedRepairNames);
+assert.deepEqual(validateGitHubRelease({ ...repairInput, release: { ...release, assets: [] } }),
+  Object.keys(expectedAssets).sort());
+assert.throws(() => validateGitHubRelease({
+  ...repairInput, release: { ...release, assets: [...release.assets, firstAsset] },
+}), /cannot be repaired/);
+assert.throws(() => validateGitHubRelease({
+  ...repairInput, release: { ...release, isDraft: false },
+}), /draft state/);
 assert.throws(() => validateGitHubRelease({
   release: { ...release, assets: [...release.assets, { name: 'foreign', size: 1, digest: 'sha256:bad' }] },
   version: '9.8.7', sourceCommit, tagCommit: sourceCommit,
@@ -419,12 +499,39 @@ for (const changed of [
   { ...release, assets: release.assets.map((asset, index) => index === 0 ? { ...asset, size: 43 } : asset) },
   { ...release, assets: release.assets.map((asset, index) => index === 0 ?
     { ...asset, digest: `sha256:${'e'.repeat(64)}` } : asset) },
+  { ...release, assets: [assetWithoutDigest, ...release.assets.slice(1)] },
   { ...release, assets: [...release.assets, { name: 'extra', size: 1, digest: `sha256:${'f'.repeat(64)}` }] },
 ]) {
   assert.throws(() => validateGitHubRelease({
     release: changed, version: '9.8.7', sourceCommit, tagCommit: sourceCommit,
     expectedAssets, expectedBody: notes, expectDraft: true,
   }));
+}
+
+for (const [input, expectedOutput] of [
+  [{ ...repairInput, release: { ...release, assets: combinedRepairAssets } }, `${combinedRepairNames.join('\n')}\n`],
+  [repairInput, ''],
+  [{ ...repairInput, allowAssetRepair: false }, ''],
+]) {
+  const result = spawnSync(process.execPath, [
+    fileURLToPath(new URL('./release-driver-contract.mjs', import.meta.url)), 'github-release',
+  ], { encoding: 'utf8', input: JSON.stringify(input) });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, expectedOutput);
+}
+for (const control of ['\u0000', '\t', '\n', '\r', '\u001f', '\u007f']) {
+  const result = spawnSync(process.execPath, [
+    fileURLToPath(new URL('./release-driver-contract.mjs', import.meta.url)), 'github-release',
+  ], {
+    encoding: 'utf8',
+    input: JSON.stringify({
+      ...repairInput, release: { ...release, assets: [] },
+      expectedAssets: { ...expectedAssets, [`unsafe${control}name`]: expectedAssets[firstAsset.name] },
+    }),
+  });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /release-driver-contract: .*control character/);
 }
 
 console.log('test-release-driver-contract: ok');

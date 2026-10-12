@@ -210,6 +210,9 @@ server.listen(socketPath, () => {
 });
 const tick = () => {
   if (sealed) return;
+  const preMutationPath = process.env.FAKE_PRE_MUTATION_HEARTBEAT_PATH;
+  // Observe the grant before sampling: a phase read after publication can retain grant-stable itself.
+  const runningAtStart = preMutationPath && fs.readFileSync(arg('--phase'), 'utf8').trim() === 'running';
   const producer = JSON.parse(fs.readFileSync(producersPath));
   sequence += 1;
   epoch += 1;
@@ -217,7 +220,7 @@ const tick = () => {
   // The fake external producer acts only after the owner emits the perform window.
   const activity = producer.revision === 2
     && (process.env.FAKE_EARLY_ACTIVITY === '1' || fs.existsSync(process.env.FAKE_FOREGROUND_ACTIVITY_PATH)) ? 3 : 0;
-  write(heartbeatPath, {
+  const heartbeat = {
     sequence,
     monotonicMicroseconds: Number(process.hrtime.bigint() / 1000n),
     wallClockMilliseconds: Date.now() + (process.env.FAKE_CLOCK_DRIFT === '1' ? sequence * 3000 : 0),
@@ -241,12 +244,11 @@ const tick = () => {
     executionNonce: nonce,
     monitorInstanceID: monitorID,
     historyCommitmentSHA256: fs.readFileSync(historyPath, 'utf8').trim(),
-  });
-  const preMutationPath = process.env.FAKE_PRE_MUTATION_HEARTBEAT_PATH;
-  if (preMutationPath && !fs.existsSync(preMutationPath)
-      && fs.readFileSync(arg('--phase'), 'utf8').trim() === 'running') {
+  };
+  write(heartbeatPath, heartbeat);
+  if (runningAtStart && !fs.existsSync(preMutationPath)) {
     if (!preMutationHeartbeat) {
-      preMutationHeartbeat = JSON.parse(fs.readFileSync(heartbeatPath));
+      preMutationHeartbeat = heartbeat;
     } else if (Date.now() > preMutationHeartbeat.wallClockMilliseconds) {
       // Release the fake controllers on a later tick so the stale sample is unambiguous.
       write(preMutationPath, preMutationHeartbeat);
@@ -290,8 +292,8 @@ const write = (file, value) => {
   const temporary = file + '.' + process.pid + '.' + randomUUID() + '.tmp';
   const descriptor = fs.openSync(temporary, 'wx', 0o600);
   try {
+    // Fake receipts need atomic publication, not crash durability or a disk flush per marker.
     fs.writeFileSync(descriptor, JSON.stringify(canonical(value), null, 2) + '\n');
-    fs.fsyncSync(descriptor);
   } finally {
     fs.closeSync(descriptor);
   }
@@ -343,6 +345,13 @@ if (args[0] === '--attest-monitor') {
   });
 } else if (args[0] === '--plan') {
   const plan = read(args[1]);
+  const releaseTestTarget = process.env.FAKE_RELEASE_TEST_TARGET === plan.controller_id;
+  if (releaseTestTarget && process.env.FAKE_IGNORE_TERM === '1') {
+    process.on('SIGTERM', () => {
+      fs.appendFileSync(process.env.FAKE_RELEASE_TEST_LOG,
+        JSON.stringify({ event: 'term', pid: process.pid }) + '\n');
+    });
+  }
   const root = plan.artifacts_directory;
   fs.mkdirSync(root + '/bundles', { mode: 0o700 });
   fs.mkdirSync(root + '/observations', { mode: 0o700 });
@@ -387,6 +396,11 @@ if (args[0] === '--attest-monitor') {
   } else {
     // Default fixtures model overlap by ownership; explicit delays still exercise timing failures.
     await wait(process.env.FAKE_EXTERNAL_RESTORE_STARTED_PATH);
+    const restored = read(process.env.FAKE_EXTERNAL_RESTORE_STARTED_PATH);
+    // Preserve strict timestamp ordering even if the owner handoff fits within one millisecond.
+    while (Date.now() <= restored.timestamp_milliseconds) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
   }
   write(root + '/mutation-completed.json', {
     version: 1, phase: 'mutation-completed', execution_nonce: plan.execution_nonce,
@@ -453,6 +467,15 @@ if (args[0] === '--attest-monitor') {
     slots: slots.map((slot) => ({ slot_id: plan.controller_id + '-' + slot })),
   });
   await wait(plan.release_path);
+  if (releaseTestTarget) {
+    if (process.env.FAKE_RELEASE_TEST_LOG) {
+      fs.appendFileSync(process.env.FAKE_RELEASE_TEST_LOG,
+        JSON.stringify({ event: 'released', pid: process.pid }) + '\n');
+    }
+    const releaseDelay = Number(process.env.FAKE_RELEASE_DELAY_MILLISECONDS ?? 0);
+    if (releaseDelay > 0) await new Promise((resolve) => setTimeout(resolve, releaseDelay));
+    if (process.env.FAKE_RELEASE_EXIT_CODE) process.exit(Number(process.env.FAKE_RELEASE_EXIT_CODE));
+  }
   process.stdout.write(JSON.stringify({ result: 'passed', receipt: root + '/' + plan.controller_id + '-receipt.json' }) + '\n');
   process.exit(0);
 } else if (args[0] === '--observe-only-plan') {
@@ -686,6 +709,7 @@ async function runInteractive(fix, {
   let stdout = '';
   let stderr = '';
   const events = [];
+  const markerTimers = new Set();
   let buffered = '';
   child.stdout.on('data', (chunk) => {
     stdout += chunk;
@@ -715,16 +739,26 @@ async function runInteractive(fix, {
           phase,
         });
         const delay = markerDelayMilliseconds[window.phase] ?? 0;
-        if (delay > 0) setTimeout(publish, delay);
-        else publish();
+        if (delay > 0) {
+          const timer = setTimeout(() => {
+            markerTimers.delete(timer);
+            publish();
+          }, delay);
+          markerTimers.add(timer);
+        } else publish();
       }
     }
   });
   child.stderr.on('data', (chunk) => { stderr += chunk; });
-  const result = await new Promise((resolve, reject) => {
-    child.once('error', reject);
-    child.once('close', (code, signal) => resolve({ code, signal }));
-  });
+  let result;
+  try {
+    result = await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) => resolve({ code, signal }));
+    });
+  } finally {
+    for (const timer of markerTimers) clearTimeout(timer);
+  }
   return { ...result, stdout, stderr, events };
 }
 
@@ -1068,9 +1102,8 @@ test('greater-than-20-second asymmetric external window retains the bounded cont
       env: {
         // Cross the former 450 ms activity timer before operations-start, without input.
         FAKE_CONTROLLER_START_DELAY_MILLISECONDS: '600',
-        FAKE_CONTROLLER_MUTATION_DELAY_MILLISECONDS: '24000',
       },
-      markerDelayMilliseconds: { perform: performDelayMilliseconds, restore: 25 },
+      markerDelayMilliseconds: { perform: performDelayMilliseconds },
     });
     assert.equal(run.code, 0, run.stderr);
     assert.ok(Date.now() - startedAt > 20_000);
@@ -1173,11 +1206,69 @@ test('semantic discriminator rejects empty, oversized, and NUL values before lau
 test('sorted-key fake lifecycle reaches ineligible test completion with bounded typing', async () => {
   const fix = fixture();
   try {
+    const idlePath = path.join(fix.root, 'completion-resources.json');
+    const preload = path.join(fix.root, 'completion-resources.mjs');
+    writeExecutable(preload, String.raw`
+import assert from 'node:assert/strict';
+import { createHook } from 'node:async_hooks';
+import childProcess from 'node:child_process';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { fileURLToPath } from 'node:url';
+
+const stdout = process.stdout;
+void process.stderr;
+const stdioResources = process.getActiveResourcesInfo().filter((type) => type === 'PipeWrap').sort();
+const processDestructions = [];
+const destroying = new Map();
+createHook({
+  init(id, type) {
+    if (type === 'PROCESSWRAP') {
+      processDestructions.push(new Promise((resolve) => destroying.set(id, resolve)));
+    }
+  },
+  destroy(id) {
+    destroying.get(id)?.();
+    destroying.delete(id);
+  },
+}).enable();
+const spawn = childProcess.spawn;
+const children = [];
+const closedChildren = [];
+childProcess.spawn = (...args) => {
+  const child = spawn(...args);
+  children.push(child);
+  closedChildren.push(new Promise((resolve) => child.once('close', resolve)));
+  return child;
+};
+syncBuiltinESMExports();
+const write = stdout.write.bind(stdout);
+stdout.write = (chunk, ...args) => {
+  const result = write(chunk, ...args);
+  if (String(chunk).includes('"event":"test-runtime-complete"')) {
+    assert.ok(children.every((child) => child.exitCode !== null || child.signalCode !== null),
+      'coordinator completed with a live child');
+    // A ProcessWrap can outlive close; await destruction and the owner's finally microtasks too.
+    Promise.all([...closedChildren, ...processDestructions]).then(() => setImmediate(() => {
+      const activeResources = process.getActiveResourcesInfo().sort();
+      fs.writeFileSync(fileURLToPath(new URL('completion-resources.json', import.meta.url)), JSON.stringify({
+        activeResources, stdioResources,
+      }), { flag: 'wx', mode: 0o600 });
+      // Fail inside the child so even a leaked interval cannot hang the test waiting for exit.
+      assert.deepEqual(activeResources, stdioResources, 'coordinator retained resources after completion');
+    }));
+  }
+  return result;
+};
+`);
     const run = await runInteractive(fix, {
       // Exceed the former 900 ms fake mutation lifetime before operations-complete.
       env: { FAKE_OBSERVER_READBACK_DELAY_MILLISECONDS: '1000' },
+      nodeArguments: ['--import', preload],
     });
     assert.equal(run.code, 0, run.stderr);
+    const { activeResources, stdioResources } = JSON.parse(fs.readFileSync(idlePath));
+    assert.deepEqual(activeResources, stdioResources);
     assert.deepEqual(run.events.filter((event) => event.event === 'external-foreground-window')
       .map((event) => event.phase), ['perform', 'restore']);
     const completion = run.events.at(-1);
@@ -1408,6 +1499,58 @@ test('controller exit before owner release aborts the live run', async () => {
     assert.notEqual(run.code, 0);
     assert.match(run.stderr, /controller-a exited before its owner release/);
     assert.equal(fs.readFileSync(fix.finalizerLog, 'utf8'), '');
+  } finally {
+    fs.rmSync(fix.root, { recursive: true, force: true });
+  }
+});
+
+test('release cleanup waits for a delayed successful child close', async () => {
+  const fix = fixture();
+  try {
+    const log = path.join(fix.root, 'release-test.jsonl');
+    const run = await runInteractive(fix, { env: {
+      FAKE_RELEASE_TEST_TARGET: 'controller-a',
+      FAKE_RELEASE_DELAY_MILLISECONDS: '300',
+      FAKE_RELEASE_TEST_LOG: log,
+    } });
+    assert.equal(run.code, 0, run.stderr);
+    assert.equal(run.events.at(-1).event, 'test-runtime-complete');
+    assert.deepEqual(fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse).map((x) => x.event),
+      ['released']);
+  } finally {
+    fs.rmSync(fix.root, { recursive: true, force: true });
+  }
+});
+
+test('release cleanup retains nonzero child status failure', async () => {
+  const fix = fixture();
+  try {
+    const run = await runInteractive(fix, { env: {
+      FAKE_RELEASE_TEST_TARGET: 'controller-a', FAKE_RELEASE_EXIT_CODE: '9',
+    } });
+    assert.notEqual(run.code, 0);
+    assert.match(run.stderr, /controller-a exited with status 9/);
+    assert.equal(run.events.at(-1).event, 'failed');
+  } finally {
+    fs.rmSync(fix.root, { recursive: true, force: true });
+  }
+});
+
+test('release cleanup keeps the timeout and TERM to KILL escalation', async () => {
+  const fix = fixture();
+  try {
+    const log = path.join(fix.root, 'release-test.jsonl');
+    const run = await runInteractive(fix, { env: {
+      FAKE_RELEASE_TEST_TARGET: 'controller-a', FAKE_RELEASE_DELAY_MILLISECONDS: '30000',
+      FAKE_IGNORE_TERM: '1', FAKE_RELEASE_TEST_LOG: log,
+    } });
+    assert.notEqual(run.code, 0);
+    assert.match(run.stderr, /controller-a did not exit after release/);
+    assert.equal(run.events.at(-1).event, 'failed');
+    const events = fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.deepEqual(events.map((x) => x.event), ['released', 'term']);
+    assert.equal(events[0].pid, events[1].pid);
+    assert.throws(() => process.kill(events[0].pid, 0), { code: 'ESRCH' });
   } finally {
     fs.rmSync(fix.root, { recursive: true, force: true });
   }

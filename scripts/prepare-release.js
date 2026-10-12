@@ -18,6 +18,7 @@ import {
   MIGRATION_ADVISOR_PATH,
   REMOVED_ROOT_COMMANDS,
   parseRemovedRootReplacements,
+  releaseFreshnessReference,
   validateChangelogContract,
   validateNpmVersionAvailability,
   validateSourceDocumentationContracts,
@@ -183,13 +184,44 @@ function checkGitStatus() {
   }
   logSuccess('No uncommitted changes');
 
-  // Check if up to date with origin
+  // Check if up to date with origin. A release branch is frozen at its cut and must match its pushed branch.
   exec('git fetch');
-  const behind = exec('git rev-list HEAD..origin/main --count');
-  const ahead = exec('git rev-list origin/main..HEAD --count');
-  
+  const { version } = JSON.parse(readFileSync(join(projectRoot, 'package.json'), 'utf8'));
+  const { remoteRef, releaseBranch } = releaseFreshnessReference({ branch: currentBranch, version, force });
+  if (releaseBranch) {
+    // Ask the live remote: `git fetch` does not prune, so a stale tracking ref could outlive the pushed branch.
+    const head = exec('git rev-parse HEAD');
+    let pushed = '';
+    try {
+      pushed = execFileSync('git', ['ls-remote', '--exit-code', 'origin', `refs/heads/${currentBranch}`], {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        stdio: 'pipe'
+      }).trim().split(/\s+/)[0] ?? '';
+    } catch {
+      pushed = '';
+    }
+    if (!/^[0-9a-f]{40}$/.test(pushed)) {
+      logError(`${currentBranch} is not on origin; push it before releasing`);
+      return false;
+    }
+    if (pushed !== head) {
+      logError(`HEAD ${head.slice(0, 9)} does not match the pushed ${remoteRef} ${pushed.slice(0, 9)}`);
+      return false;
+    }
+    logSuccess(`Release branch matches the pushed ${remoteRef}`);
+    const landedAfterCut = exec('git rev-list HEAD..origin/main --count', { allowFailure: true });
+    if (landedAfterCut && landedAfterCut !== '0') {
+      logWarning(`${landedAfterCut} commits landed on origin/main after the release cut; they ship in a later release`);
+    }
+    return true;
+  }
+
+  const behind = exec(`git rev-list HEAD..${remoteRef} --count`);
+  const ahead = exec(`git rev-list ${remoteRef}..HEAD --count`);
+
   if (behind !== '0') {
-    logError(`Branch is ${behind} commits behind origin/main`);
+    logError(`Branch is ${behind} commits behind ${remoteRef}`);
     return false;
   }
   if (ahead !== '0') {
@@ -258,20 +290,12 @@ terminal_artifact_run_build "$@"`,
 function checkSwift() {
   logStep('Swift Checks');
 
-  // Run SwiftFormat
-  if (!execWithOutput('pnpm run format:swift', 'SwiftFormat')) {
-    logError('SwiftFormat failed');
+  // Check formatting without rewriting files (same command as the CI SwiftFormat job)
+  if (!execWithOutput('pnpm run format:check', 'SwiftFormat')) {
+    logError('SwiftFormat found unformatted files. Run `pnpm run format` and commit the result before releasing.');
     return false;
   }
-  logSuccess('SwiftFormat completed');
-
-  // Check if SwiftFormat made any changes
-  const formatChanges = exec('git status --porcelain');
-  if (formatChanges) {
-    logError('SwiftFormat made changes. Please commit them before releasing:');
-    console.log(formatChanges);
-    return false;
-  }
+  logSuccess('SwiftFormat passed');
 
   // Run SwiftLint
   if (!execWithOutput('pnpm run lint:swift', 'SwiftLint')) {
@@ -441,11 +465,22 @@ function checkSwiftCLIIntegration(binaryPath) {
   const run = (args) => spawnSync(binaryPath, args, {
     cwd: projectRoot,
     encoding: 'utf8',
-    stdio: 'pipe'
+    stdio: 'pipe',
+    timeout: 30_000,
+    killSignal: 'SIGKILL'
   });
+  const probeFailed = (result, args) => {
+    if (!result.error) return false;
+    const reason = result.error.code === 'ETIMEDOUT'
+      ? 'timed out after 30 seconds'
+      : result.error.message;
+    logError(`CLI probe failed for '${args.join(' ')}': ${reason}`);
+    return true;
+  };
   const combinedOutput = (result) => `${result.stdout || ''}\n${result.stderr || ''}`;
 
   const invalid = run(['invalid-command']);
+  if (probeFailed(invalid, ['invalid-command'])) return false;
   if (invalid.status === 0 || !combinedOutput(invalid).includes("Unknown command 'invalid-command'")) {
     logError('Unknown commands must fail with the Commander unknown-command diagnostic');
     return false;
@@ -470,6 +505,7 @@ function checkSwiftCLIIntegration(binaryPath) {
       return false;
     }
     const result = run([command, '--help']);
+    if (probeFailed(result, [command, '--help'])) return false;
     if (result.status === 0) {
       logError(`Removed command unexpectedly resolved: peekaboo ${command}`);
       return false;
@@ -507,6 +543,7 @@ function checkSwiftCLIIntegration(binaryPath) {
 
   for (const contract of helpContracts) {
     const result = run(contract.args);
+    if (probeFailed(result, contract.args)) return false;
     const output = combinedOutput(result);
     if (result.status !== 0 || !contract.required.every((token) => output.includes(token))) {
       logError(`CLI help contract failed: peekaboo ${contract.args.join(' ')}`);
@@ -526,6 +563,7 @@ function checkSwiftCLIIntegration(binaryPath) {
   ];
   for (const contract of jsonContracts) {
     const result = run(contract.args);
+    if (probeFailed(result, contract.args)) return false;
     try {
       const payload = JSON.parse(result.stdout);
       if (result.status !== 0 || payload.success !== true || !(contract.field in payload.data)) {
@@ -693,7 +731,9 @@ function buildAndVerifyPackage() {
     const lipoOutput = execFileSync('lipo', ['-info', binaryPath], {
       cwd: projectRoot,
       stdio: 'pipe',
-      encoding: 'utf8'
+      encoding: 'utf8',
+      timeout: 30_000,
+      killSignal: 'SIGKILL'
     }).trim();
     const hasArm64 = lipoOutput.includes('arm64');
     const hasX86 = lipoOutput.includes('x86_64');
@@ -722,7 +762,9 @@ function buildAndVerifyPackage() {
     const helpOutput = execFileSync(binaryPath, ['--help'], {
       cwd: projectRoot,
       stdio: 'pipe',
-      encoding: 'utf8'
+      encoding: 'utf8',
+      timeout: 30_000,
+      killSignal: 'SIGKILL'
     }).trim();
     if (!helpOutput || helpOutput.length === 0) {
       logError('peekaboo binary does not respond to --help command');

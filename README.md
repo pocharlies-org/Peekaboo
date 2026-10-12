@@ -51,9 +51,9 @@ peekaboo see --app Finder --json
 
 That is the core loop: observe the current screen, choose an element from the result, and act on it.
 
-## What's new in 4.7.0
+## What's new in 4.9.1
 
-Peekaboo 4.7.0 fixes the 4.6.0 CLI startup failure on Macs without the macOS 27 runtime and adds GPT-6 Astra, Sol, and Luna plus GPT-6.1 Sol model selection. Unattended clipboard reads no longer trigger macOS privacy prompts, and paste cleanup preserves newer clipboard contents. MCP clients can request structured element tables with `include_elements`, CLI JSON and observations report focused text selection and visible display bounds, and compatible-provider Agent streams keep fragmented tool arguments intact. CLI clipboard reads that previously prompted now refuse; see the changelog Compatibility notes for `clipboard status` and `--allow-prompt`.
+Peekaboo 4.9.1 is a fix release. An idle `peekaboo mcp` server no longer burns CPU whenever other applications launch or quit (about 30× less work per launch on a Mac with ~600 running processes), the CLI accepts renamed or symlinked executables such as `pb`, configuration changes refuse to overwrite a config file that cannot be read, and capture output cut at the retention limit keeps its valid text. 4.9.0 added exact app- and PID-scoped menu-bar extra clicks and parent-bound foreground file dialogs; see the changelog for both releases.
 
 ## Automate an app
 

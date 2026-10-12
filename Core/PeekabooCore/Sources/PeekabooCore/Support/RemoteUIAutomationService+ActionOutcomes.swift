@@ -4,7 +4,7 @@ import PeekabooAutomationKit
 import PeekabooBridge
 import PeekabooFoundation
 
-extension RemoteUIAutomationService: UIAutomationActionOutcomeProviding,
+extension RemoteUIAutomationService: PreparedClipboardGuardedExactWindowHotkeyServiceProtocol,
 UIAutomationGlobalPointerActionResultProviding {
     public func foregroundModifierClickWithOutcome(
         _ request: ForegroundModifierClickRequest) async throws
@@ -249,13 +249,7 @@ UIAutomationGlobalPointerActionResultProviding {
     }
 
     public func scrollWithOutcome(_ request: ScrollRequest) async throws -> UIAutomationActionResult<Void> {
-        if !request.foreground,
-           !self.supportsTargetedScroll || !self.supportsRequestPinnedExactWindowScrollReceipt
-        {
-            throw PeekabooError.serviceUnavailable(
-                "Remote bridge host cannot preserve exact-window background scroll receipts; relaunch or update " +
-                    "Peekaboo.")
-        }
+        try self.validateScrollCapabilities(request)
         return try await self.remoteAction(snapshotId: request.snapshotId) {
             try await self.client.scrollWithOutcome(request)
         }
@@ -347,6 +341,45 @@ UIAutomationGlobalPointerActionResultProviding {
         try self.requireExactWindowKeyboard()
         return try await self.remoteAction(snapshotId: nil) {
             try await self.client.hotkeyWithOutcome(keys: keys, holdDuration: holdDuration, target: target)
+        }
+    }
+
+    public func hotkeyWithOutcome(
+        keys: String,
+        holdDuration: Int,
+        target: UIAutomationTarget.ExactWindow,
+        clipboardClaim: GeneralPasteboardWriteClaim) async throws -> UIAutomationActionResult<Void>
+    {
+        guard self.supportsClipboardGuardedExactWindowHotkeys else {
+            throw DesktopActionFailure.preDispatchRefusal(
+                route: .bridge,
+                reason: .runtimeIncompatible,
+                message: "The selected host does not support clipboard-guarded exact-window paste.",
+                hint: "Update and relaunch Peekaboo on the selected host before writing a temporary clipboard payload.")
+        }
+        return try await self.remoteAction(snapshotId: nil) {
+            try await self.client.hotkeyWithOutcome(
+                keys: keys, holdDuration: holdDuration, target: target, clipboardClaim: clipboardClaim)
+        }
+    }
+
+    public func hotkeyWithOutcome(
+        keys: String,
+        holdDuration: Int,
+        target: UIAutomationTarget.ExactWindow,
+        clipboardClaim: GeneralPasteboardWriteClaim,
+        preparation: BackgroundWindowKeyboardPreparationMode) async throws -> UIAutomationActionResult<Void>
+    {
+        guard self.supportsPreparedClipboardGuardedExactWindowHotkeys else {
+            throw DesktopActionFailure.preDispatchRefusal(
+                route: .bridge, reason: .runtimeIncompatible,
+                message: "The selected host does not support prepared background clipboard paste.",
+                hint: "Update and relaunch the selected host before writing a temporary clipboard payload.")
+        }
+        return try await self.remoteAction(snapshotId: nil) {
+            try await self.client.hotkeyWithOutcome(
+                keys: keys, holdDuration: holdDuration, target: target, clipboardClaim: clipboardClaim,
+                preparation: preparation)
         }
     }
 

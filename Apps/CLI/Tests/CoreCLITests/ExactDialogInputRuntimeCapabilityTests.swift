@@ -156,4 +156,35 @@ struct ExactDialogForegroundRuntimeCapabilityTests {
             hostCapabilities: capabilities
         )
     }
+
+    @Test
+    func `exact file execution requires attestation floor capability and explicit operation enablement`() {
+        let capability = PeekabooBridgeHostCapability.exactFileDialogExecution
+        let attested = PeekabooBridgeHostCapability.attestedOperationReceipts
+        let capable = Self.handshake(operations: [.dialogHandleFile], capabilities: [capability, attested])
+        let missingCapability = Self.handshake(operations: [.dialogHandleFile], capabilities: [attested])
+        let receiptless = Self.handshake(operations: [.dialogHandleFile], capabilities: [capability])
+        let old = Self.handshake(
+            version: .init(major: 1, minor: 42),
+            operations: [.dialogHandleFile],
+            capabilities: [capability, attested]
+        )
+        let missingOperation = Self.handshake(operations: [], capabilities: [capability, attested])
+        let disabled = Self.handshake(
+            operations: [.dialogHandleFile], enabledOperations: [], capabilities: [capability, attested]
+        )
+        let implicitEnablement = PeekabooBridgeHandshakeResponse(
+            negotiatedVersion: PeekabooBridgeConstants.protocolVersion,
+            hostKind: .gui,
+            build: nil,
+            supportedOperations: [.dialogHandleFile],
+            enabledOperations: nil,
+            hostCapabilities: [capability, attested]
+        )
+
+        #expect(RuntimeHostResolver.remoteDialogCapabilities(for: capable).exactFileExecution)
+        for incompatible in [missingCapability, receiptless, old, missingOperation, disabled, implicitEnablement] {
+            #expect(!RuntimeHostResolver.remoteDialogCapabilities(for: incompatible).exactFileExecution)
+        }
+    }
 }
