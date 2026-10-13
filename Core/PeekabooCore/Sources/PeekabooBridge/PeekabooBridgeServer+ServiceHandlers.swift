@@ -373,6 +373,7 @@ extension PeekabooBridgeServer {
     }
 
     func handleMenuRequest(_ request: PeekabooBridgeRequest) async throws -> PeekabooBridgeHandledResponse {
+        try self.requireScopedMenuBarActionSupport(for: request)
         switch request {
         case let .listMenus(payload):
             let menus = try await self.services.menu.listMenus(for: payload.appIdentifier)
@@ -431,6 +432,14 @@ extension PeekabooBridgeServer {
         case let .listMenuBarItems(includeRaw):
             let items = try await self.services.menu.listMenuBarItems(includeRaw: includeRaw)
             return .init(response: .menuBarItems(items))
+        case let .prepareMenuBarItem(payload):
+            guard let preparation = self.services.menu as? any MenuServiceScopedMenuBarPreparationProviding else {
+                throw PeekabooBridgeErrorEnvelope(
+                    code: .operationNotSupported,
+                    message: "The menu service does not support scoped menu bar preparation")
+            }
+            let item = try await preparation.prepareMenuBarItem(payload)
+            return .init(response: .menuBarItems([item]))
         case let .clickMenuBarItemNamed(payload):
             guard PeekabooBridgeRequestContext.usesAttestedOperationResultSemantics else {
                 let result = try await self.services.menu.clickMenuBarItem(named: payload.name)
@@ -445,7 +454,8 @@ extension PeekabooBridgeServer {
             }
             let result = try await results.clickMenuBarItemActionResult(request: MenuBarItemActionRequest(
                 named: payload.name,
-                expectedLeafEvidence: expectedLeafEvidence))
+                expectedLeafEvidence: expectedLeafEvidence,
+                applicationScope: payload.applicationScope))
             return try Self.menuMutationResponse(
                 .clickResult(result.payload),
                 result: result,
@@ -471,6 +481,27 @@ extension PeekabooBridgeServer {
                 operation: "click indexed menu bar item")
         default:
             throw Self.invalidRequest(for: request)
+        }
+    }
+
+    private func requireScopedMenuBarActionSupport(for request: PeekabooBridgeRequest) throws {
+        if case let .clickMenuExtra(payload) = request, payload.applicationScope != nil {
+            throw PeekabooBridgeErrorEnvelope(
+                code: .invalidRequest,
+                message: "Application scope requires a prepared named menu bar action")
+        }
+        guard request.requiresScopedMenuBarActions else { return }
+        guard PeekabooBridgeRequestContext.usesAttestedOperationResultSemantics,
+              let capabilities = PeekabooBridgeRequestContext.negotiatedSessionCapabilities,
+              capabilities.scopedMenuBarActions,
+              capabilities.protocolVersion >= PeekabooBridgeConstants.scopedMenuBarActionsVersion,
+              self.hostCapabilities.contains(PeekabooBridgeHostCapability.scopedMenuBarActions)
+        else {
+            throw DesktopActionFailure.preDispatchRefusal(
+                route: .bridge,
+                reason: .runtimeIncompatible,
+                message: "This Bridge session cannot preserve menu bar application scope; no action was sent.",
+                hint: "Update the Bridge host and negotiate scoped menu bar actions before retrying.")
         }
     }
 
@@ -801,6 +832,11 @@ extension PeekabooBridgeServer {
             }
             return try Self.dialogMutationResponse(result)
         case let .dialogHandleFile(payload):
+            if let execution = payload.execution {
+                try self.validateExactFileDialogExecutionAccess(request)
+                let result = try await self.services.dialogs.handleFileDialog(execution)
+                return try Self.dialogMutationResponse(result)
+            }
             try Self.requireLegacyDialogMutationCompatibility(
                 operation: .dialogHandleFile,
                 replacement: "an explicit exact-target file-dialog workflow")

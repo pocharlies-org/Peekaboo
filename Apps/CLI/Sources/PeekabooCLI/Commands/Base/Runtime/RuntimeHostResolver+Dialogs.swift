@@ -38,7 +38,12 @@ extension RuntimeHostResolver {
             exactForceDismiss: exactForceDismiss &&
                 BridgeCapabilityPolicy.supportsOperation(.exactDialogForceDismiss, for: handshake),
             legacyInputFocusPolicy: legacyInputFocusPolicy &&
-                BridgeCapabilityPolicy.supportsOperation(.dialogEnterText, for: handshake)
+                BridgeCapabilityPolicy.supportsOperation(.dialogEnterText, for: handshake),
+            exactFileExecution: usesAttestedReceipts &&
+                handshake.negotiatedVersion >= PeekabooBridgeConstants.exactFileDialogExecutionVersion &&
+                handshake.hostCapabilities?.contains(PeekabooBridgeHostCapability.exactFileDialogExecution) == true &&
+                handshake.supportedOperations.contains(.dialogHandleFile) &&
+                handshake.enabledOperations?.contains(.dialogHandleFile) == true
         )
     }
 }

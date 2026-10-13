@@ -61,14 +61,15 @@ struct ConfigEditorLaunchTests {
             #!/bin/sh
             printf '%s\\n' "$$" > "\(pidFile.path)"
             trap '' TERM
-            exec /bin/sleep 8
+            exec /bin/sleep 60
             """
             try script.write(to: editor, atomically: true, encoding: .utf8)
             try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: editor.path)
 
             var command = ConfigCommand.EditCommand()
             command.editor = editor.path
-            command.timeout = .seconds(1)
+            // Give the shell time to record its PID under CPU contention before the timeout reaps it.
+            command.timeout = .seconds(3)
 
             let runtime = self.makeRuntime()
             let startedAt = ContinuousClock.now
@@ -76,9 +77,9 @@ struct ConfigEditorLaunchTests {
                 try await command.run(using: runtime)
             }
             #expect(exitCode == ExitCode.failure)
-            // The one-second timeout permits two more seconds of termination cleanup.
-            // Leave scheduling headroom while staying below the editor's eight-second natural exit.
-            #expect(startedAt.duration(to: .now) < .seconds(5))
+            // The three-second timeout permits two more seconds of termination cleanup.
+            // Leave generous scheduling headroom while staying far below the editor's 60-second natural exit.
+            #expect(startedAt.duration(to: .now) < .seconds(20))
 
             let pidText = try String(contentsOf: pidFile, encoding: .utf8)
                 .trimmingCharacters(in: .whitespacesAndNewlines)

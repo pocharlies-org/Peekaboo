@@ -12,6 +12,29 @@ import Testing
 @Suite(.serialized)
 struct MCPDesktopActionOutcomeProjectionTests {
     @Test
+    func `selection metadata is public only for the selection tool`() {
+        let selectionFields: [String: Value] = [
+            "target": .string("T1"),
+            "selection_type": .string("cursor_before"),
+            "matched_text_range": .object(["location": .int(3), "length": .int(7)]),
+            "selected_text_range": .object(["location": .int(3), "length": .int(0)]),
+        ]
+        let metadata = Value.object(selectionFields.merging([
+            "text": .string("private literal"),
+            "prefix": .string("private prefix"),
+            "suffix": .string("private suffix"),
+            "internal_diagnostics": .string("private"),
+        ]) { current, _ in current })
+
+        #expect(MCPToolResponseMetadataProjector.externalFields(
+            from: metadata,
+            toolName: "select_text") == selectionFields)
+        for toolName in ["click", "set_value", "agent"] {
+            #expect(MCPToolResponseMetadataProjector.externalFields(from: metadata, toolName: toolName).isEmpty)
+        }
+    }
+
+    @Test
     func `canonical projection drives the complete seven state MCP matrix`() throws {
         for expectation in DesktopActionOutcomeFixtures.canonicalCases {
             let outcome = expectation.outcome
@@ -151,6 +174,60 @@ struct MCPDesktopActionOutcomeProjectionTests {
         let provider = MCPToolResponseMetadataProjector.providerFields(from: trusted)
         #expect(provider["target_identity"] == nil)
         #expect(provider["provider_meta"]?.objectValue == ["untrusted": .string("drop")])
+    }
+
+    @Test(arguments: ["restored", "preserved_newer_contents", "not_needed"])
+    func `Public paste errors retain only known cleanup status and canonical outcome`(cleanup: String) throws {
+        let failure = DesktopActionFailure.indeterminate(
+            delivery: .init(mechanism: .clipboardTransaction, mode: .foreground),
+            evidence: .completionUnknown,
+            message: "Paste input refused after temporary clipboard mutation")
+        let response = try MCPToolResponseMetadataProjector.errorResponse(
+            for: failure,
+            invalidatedSnapshotID: nil,
+            additionalFields: [
+                "clipboard_cleanup_status": .string(cleanup),
+                "prior_clipboard": .string("private prior payload"),
+            ])
+
+        let result = PeekabooMCPServer.callToolResult(from: response, toolName: "paste")
+        let data = try JSONEncoder().encode(result)
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let metadata = try #require(json["_meta"] as? [String: Any])
+
+        #expect(metadata["clipboard_cleanup_status"] as? String == cleanup)
+        #expect(metadata["state"] as? String == "indeterminate")
+        #expect(metadata["delivery_mechanism"] as? String == "clipboard_transaction")
+        #expect(metadata["delivery_mode"] as? String == "foreground")
+        #expect(metadata["mutation_dispatched"] as? Bool == true)
+        #expect(metadata["retry_safe"] as? Bool == false)
+        #expect(metadata["target_receipt"] == nil)
+        #expect(metadata["prior_clipboard"] == nil)
+    }
+
+    @Test
+    func `Cleanup projection rejects unknown values and untrusted provider claims`() {
+        let invalid: [Value] = [
+            .string("unknown"), .string("RESTORED"), .string("restored "),
+            .bool(true), .int(1), .null, .object(["status": .string("restored")]),
+        ]
+        for value in invalid {
+            let fields = MCPToolResponseMetadataProjector.externalFields(
+                from: .object(["clipboard_cleanup_status": value]), toolName: "paste")
+            #expect(fields["clipboard_cleanup_status"] == nil)
+        }
+
+        let metadata: Value = .object([
+            "clipboard_cleanup_status": .string("restored"),
+            "diagnostic": .string("provider diagnostic"),
+        ])
+        let provider = MCPToolResponseMetadataProjector.providerFields(from: metadata)
+        #expect(provider["clipboard_cleanup_status"] == nil)
+        #expect(provider["provider_meta"]?.objectValue == ["diagnostic": .string("provider diagnostic")])
+        #expect(MCPToolResponseMetadataProjector.agentFields(
+            from: .object(provider))["clipboard_cleanup_status"] == nil)
+        #expect(MCPToolResponseMetadataProjector.externalFields(
+            from: metadata, toolName: "browser")["clipboard_cleanup_status"] == nil)
     }
 
     @Test
@@ -543,11 +620,14 @@ struct MCPDesktopActionOutcomeProjectionTests {
     @MainActor
     func `scroll partial failure projects exact accepted prefix without retry permission`() async throws {
         let automation = StubAutomationService()
+        let reportedTarget = try DesktopTargetIdentity(
+            processIdentity: .init(processIdentifier: 778, processStartIdentity: 78))
         automation.uiAutomationOutcomeScript.appendFailure(
             DesktopActionFailure.partial(
                 delivery: .init(mechanism: .accessibilityAction, mode: .background),
                 unitCount: .one,
-                message: "One of three page units was accepted"),
+                message: "One of three page units was accepted")
+                .attributed(to: reportedTarget.actionTargetReceipt),
             for: .scroll)
         let context = await MCPToolTestHelpers.makeContext(
             automation: automation,
@@ -571,6 +651,7 @@ struct MCPDesktopActionOutcomeProjectionTests {
         #expect(meta["requires_fresh_observation"] == .bool(false))
         #expect(meta["escalation"] == .string("recover_side_effect"))
         #expect(meta["invalidated_snapshot"] == .string(snapshotID))
+        #expect(try meta["target_receipt"] == Value(reportedTarget.actionTargetReceipt))
     }
 
     @Test
@@ -753,9 +834,11 @@ extension MCPDesktopActionOutcomeProjectionTests {
             return
         }
         let meta = try #require(response.meta?.objectValue)
+        #expect(text.hasPrefix("\(AgentDisplayTokens.Status.success) Completed "))
         #expect(text.contains("all chords confirmed no change"))
         #expect(!text.contains("Dispatched"))
         #expect(!text.contains("unverifiable"))
+        #expect(!text.contains("receiver effect was not reported"))
         #expect(meta["delivery_mode"] == nil)
         #expect(meta["mutation_dispatched"] == .bool(false))
         #expect(meta["retry_safe"] == .bool(true))
@@ -785,12 +868,44 @@ extension MCPDesktopActionOutcomeProjectionTests {
             return
         }
         let meta = try #require(response.meta?.objectValue)
-        #expect(text.contains("effect confirmed"))
+        #expect(text.hasPrefix("✅ Press confirmed\n"))
         #expect(meta["state"] == .string("confirmed_change"))
         #expect(meta["effect"] == .string("confirmed"))
         #expect(meta["dispatched_unit_count"] == .int(1))
         #expect(meta["mutation_dispatched"] == .bool(true))
         #expect(meta["requires_fresh_observation"] == .bool(false))
+    }
+
+    @Test
+    @MainActor
+    func `mixed route press reports missing aggregate without inventing outcome evidence`() async throws {
+        let automation = StubAutomationService()
+        let delivery = DesktopActionOutcome.Delivery(mechanism: .globalEvents, mode: .foreground)
+        automation.uiAutomationOutcomeScript.append(
+            .confirmedChange(route: .local, delivery: delivery, unitCount: .one), for: .hotkey)
+        automation.uiAutomationOutcomeScript.append(
+            .confirmedChange(route: .bridge, delivery: delivery, unitCount: .one), for: .hotkey)
+        let context = await MCPToolTestHelpers.makeContext(automation: automation)
+
+        let response = try await PressTool(context: context).execute(arguments: ToolArguments(raw: [
+            "keys": ["cmd+a", "cmd+c"],
+            "foreground": true,
+        ]))
+
+        #expect(!response.isError)
+        let meta = try #require(response.meta?.objectValue)
+        #expect(meta["state"] == nil)
+        #expect(meta["effect"] == .string("unverifiable"))
+        #expect(meta["mutation_dispatched"] == .bool(true))
+        #expect(meta["retry_safe"] == .bool(false))
+        #expect(meta["requires_fresh_observation"] == .bool(true))
+        guard case let .text(text, _, _) = response.content.first else {
+            Issue.record("Expected receiptless aggregate text")
+            return
+        }
+        #expect(text.hasPrefix(ActionOutcomeHumanRenderer.statusLine(for: nil, operation: "Press") + "\n"))
+        #expect(!text.contains("effect is unverifiable"))
+        #expect(!text.contains(AgentDisplayTokens.Status.success))
     }
 
     @Test
@@ -1240,7 +1355,7 @@ extension MCPDesktopActionOutcomeProjectionTests {
             Issue.record("Expected press text response")
             return
         }
-        #expect(text.contains("effect confirmed"))
+        #expect(text.hasPrefix(ActionOutcomeHumanRenderer.statusLine(for: outcome, operation: "Press") + "\n"))
         #expect(!text.contains("unverifiable"))
         #expect(!text.contains("Observe before continuing"))
     }
@@ -1502,49 +1617,6 @@ extension MCPDesktopActionOutcomeProjectionTests {
             automation: automation,
             applications: applications,
             snapshots: InMemorySnapshotManager())
-    }
-
-    @MainActor
-    private static func makeExactScrollSnapshot(context: MCPToolContext) async throws -> String {
-        let snapshot = try await MCPToolTestHelpers.createSnapshot(in: context)
-        let snapshotID = await snapshot.id
-        let bounds = CGRect(x: 0, y: 0, width: 200, height: 100)
-        await snapshot.setScreenshot(
-            path: "/tmp/scroll-outcome.png",
-            metadata: CaptureMetadata(
-                size: bounds.size,
-                mode: .window,
-                applicationInfo: ServiceApplicationInfo(
-                    processIdentifier: 778,
-                    processStartIdentity: 78,
-                    bundleIdentifier: "com.example.editor",
-                    name: "Editor"),
-                windowInfo: ServiceWindowInfo(
-                    windowID: 42,
-                    title: "Editor",
-                    bounds: bounds,
-                    mutationIdentity: WindowMutationIdentity(
-                        windowID: 42,
-                        ownerProcessIdentifier: 778,
-                        ownerProcessStartIdentity: 78,
-                        capturedBounds: bounds))))
-        await snapshot.setUIElements([
-            UIElement(
-                id: "T1",
-                elementId: "T1",
-                role: "scrollArea",
-                title: nil,
-                label: "Editor",
-                value: nil,
-                description: nil,
-                help: nil,
-                roleDescription: "scroll area",
-                identifier: nil,
-                frame: CGRect(x: 10, y: 10, width: 100, height: 30),
-                isActionable: true),
-        ])
-        try await MCPToolTestHelpers.publishSnapshotMetadata(snapshot, in: context)
-        return snapshotID
     }
 
     @MainActor
