@@ -271,7 +271,7 @@ extension PeekabooAgentService {
                 agentSessionID: context.id,
                 agentExecutionGeneration: context.executionGeneration,
                 snapshotOwner: snapshotOwner,
-                executionPolicy: context.toolExecutionPolicy,
+                executionAuthority: context.toolExecutionAuthority,
                 onBrowserAcquisitionStarted: {
                     browserAcquisitionStarted = true
                     self.beginAgentSessionBrowserExecution(
@@ -329,6 +329,11 @@ extension PeekabooAgentService {
             await self.endEphemeralBrowserClientIfNeeded(context)
             throw PeekabooError.invalidInput("The session has no verified model provider; refusing to execute it.")
         }
+        let initialMessages = Self.updatingSystemPrompt(
+            in: context.messages,
+            for: model,
+            executionAuthority: context.toolExecutionAuthority,
+            availableToolNames: Set(tools.map(\.name)))
 
         let configuration = StreamingLoopConfiguration(
             model: model,
@@ -338,17 +343,17 @@ extension PeekabooAgentService {
             eventHandler: eventHandler,
             textHandler: textHandler,
             enhancementOptions: enhancementOptions,
-            executionPolicy: context.toolExecutionPolicy)
+            executionAuthority: context.toolExecutionAuthority)
 
         var latestCheckpoint = self.makeLoopOutcome(
-            state: StreamingLoopState(messages: context.messages),
+            state: StreamingLoopState(messages: initialMessages),
             reachedStepLimit: false)
         let outcome: StreamingLoopOutcome
         do {
             outcome = try await self.runStreamingLoop(
                 configuration: configuration,
                 maxSteps: maxSteps,
-                initialMessages: context.messages,
+                initialMessages: initialMessages,
                 queueMode: queueMode)
             { latestCheckpoint = $0 }
         } catch {
@@ -433,6 +438,11 @@ extension PeekabooAgentService {
             await self.endEphemeralBrowserClientIfNeeded(context)
             throw PeekabooError.invalidInput("The session has no verified model provider; refusing to execute it.")
         }
+        let initialMessages = Self.updatingSystemPrompt(
+            in: context.messages,
+            for: model,
+            executionAuthority: context.toolExecutionAuthority,
+            availableToolNames: Set(tools.map(\.name)))
 
         let configuration = StreamingLoopConfiguration(
             model: model,
@@ -441,17 +451,17 @@ extension PeekabooAgentService {
             sessionId: context.id,
             eventHandler: eventHandler,
             enhancementOptions: enhancementOptions,
-            executionPolicy: context.toolExecutionPolicy)
+            executionAuthority: context.toolExecutionAuthority)
 
         var latestCheckpoint = self.makeLoopOutcome(
-            state: StreamingLoopState(messages: context.messages),
+            state: StreamingLoopState(messages: initialMessages),
             reachedStepLimit: false)
         let outcome: StreamingLoopOutcome
         do {
             outcome = try await self.runGenerationLoop(
                 configuration: configuration,
                 maxSteps: maxSteps,
-                initialMessages: context.messages)
+                initialMessages: initialMessages)
             { latestCheckpoint = $0 }
         } catch {
             let wasCancelled = self.isAgentCancellation(error)
@@ -525,7 +535,7 @@ extension PeekabooAgentService {
             imageContextID: imageContextID,
             initialMessages: initialMessages,
             enhancementOptions: configuration.enhancementOptions,
-            executionPolicy: configuration.executionPolicy)
+            executionAuthority: configuration.executionAuthority)
         return try await self.withAgentToolImageLifecycle(
             executionID: imageContextID,
             imageStore: imageStore)
@@ -568,7 +578,7 @@ extension PeekabooAgentService {
             try Task.checkCancellation()
 
             let request = ProviderRequest(
-                messages: state.messages.sanitizedForProviderContext(
+                messages: AgentToolMCPBridge.providerContextMessages(state.messages).sanitizedForProviderContext(
                     model: configuration.model,
                     configuration: resolvedConfiguration,
                     peekabooConfiguration: self.services.configuration,

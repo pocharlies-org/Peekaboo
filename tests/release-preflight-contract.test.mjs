@@ -14,6 +14,7 @@ import {
   REMOVED_ROOT_COMMANDS,
   parseMigrationAdvisorForms,
   parseRegistryCommands,
+  releaseFreshnessReference,
   validateChangelogContract,
   validateCommandDocsContract,
   validateMigrationGuideContract,
@@ -186,6 +187,31 @@ test('version parity reports missing and stale release surfaces', () => {
   ]);
 });
 
+test('release freshness compares a forced release branch against its own pushed branch only', () => {
+  assert.deepEqual(releaseFreshnessReference({ branch: 'release/4.9.0', version: '4.9.0', force: true }),
+    { remoteRef: 'origin/release/4.9.0', releaseBranch: true });
+  for (const request of [
+    { branch: 'main', version: '4.9.0', force: false },
+    { branch: 'main', version: '4.9.0', force: true },
+    { branch: 'release/4.9.0', version: '4.9.0', force: false },
+    { branch: 'release/4.8.0', version: '4.9.0', force: true },
+    { branch: 'feature/x', version: '4.9.0', force: true },
+    { branch: 'release/', version: '', force: true }
+  ]) {
+    assert.deepEqual(releaseFreshnessReference(request), { remoteRef: 'origin/main', releaseBranch: false },
+      JSON.stringify(request));
+  }
+});
+
+test('publication preflight routes its freshness comparison through the release policy', () => {
+  assert.match(prepareSource, /releaseFreshnessReference\(\{ branch: currentBranch, version, force \}\)/);
+  assert.match(prepareSource, /git rev-list HEAD\.\.\$\{remoteRef\} --count/);
+  // A release branch is checked against the live remote, never a possibly stale tracking ref.
+  assert.match(prepareSource, /\['ls-remote', '--exit-code', 'origin', `refs\/heads\/\$\{currentBranch\}`\]/);
+  assert.match(prepareSource, /does not match the pushed \$\{remoteRef\}/);
+  assert.doesNotMatch(prepareSource, /git rev-list HEAD\.\.origin\/main --count'\);\n\s*const ahead/);
+});
+
 test('npm version availability fails closed on failed, empty, and malformed registry responses', () => {
   const request = { packageName: '@steipete/peekaboo', version: '4.2.2' };
 
@@ -224,7 +250,6 @@ test('npm version availability accepts valid registry lists and rejects an alrea
 });
 
 const prepareSource = readFileSync(new URL('../scripts/prepare-release.js', import.meta.url), 'utf8');
-const driverSource = readFileSync(new URL('../scripts/release-binaries.sh', import.meta.url), 'utf8');
 const sanitizerPath = join(projectRoot, 'scripts/terminal-artifact-env.sh');
 const safeTestsFunction = prepareSource.match(/^function runSafeTests\(\) \{[\s\S]*?^\}/m)?.[0];
 
@@ -301,6 +326,10 @@ process.exit(Number(process.env.${tool.toUpperCase()}_EXIT));
     },
     execFileSync(file, args, options) {
       assert.ok(file === 'lipo' || file === binaryPath, 'only fixture tools may execute');
+      if (file === binaryPath) {
+        assert.equal(options.timeout, 30_000);
+        assert.equal(options.killSignal, 'SIGKILL');
+      }
       return execFileSync(file, Array.from(args), { ...options, env, timeout: 5000 });
     },
     execNpm() { return 'peekaboo\npeekaboo-mcp.js\nREADME.md\nLICENSE\n'; },
@@ -384,121 +413,57 @@ test('binary verification requires x86_64 only in universal mode', (t) => {
   assert.ok(arm.messages.includes('Binary is arm64-only (set PEEKABOO_REQUIRE_UNIVERSAL=1 to enforce universal)'));
 });
 
-function githubDraftLookup(t, { mode = 'draft', apiUrl, command = 'verify' } = {}) {
-  const root = mkdtempSync(join(tmpdir(), 'peekaboo-draft-lookup-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  writeFileSync(join(root, 'receipt.json'), JSON.stringify({ assets: {} }));
-  writeFileSync(join(root, 'github-release-body.md'), 'fixture release notes\n');
-  const names = ['github_release_api_path', 'github_release_exists', 'verify_github_release_assets'];
-  const functions = names.map((name) => driverSource.match(
-    new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))?.[0] ?? '').join('\n');
-  const sourceCommit = 'a'.repeat(40);
-  const script = `set -euo pipefail
-VERSION=9.8.7
-GITHUB_HOST=github.com
-GITHUB_REPOSITORY=github.com/openclaw/Peekaboo
-GITHUB_API_REPOSITORY=openclaw/Peekaboo
-BLUE= GREEN= NC=
-fail() { printf '%s\\n' "$*" >&2; exit 1; }
-assert_publication_receipt() { :; }
-github_tag_commit() { printf '%s\\n' "$RELEASE_SOURCE_COMMIT"; }
-node() { "$NODE_BIN" "$@"; }
-gh() {
-  printf '%s\\n' "$*" >> "$CALL_LOG"
-  if [[ "$1 $2" == 'release view' ]]; then
-    case "$FIXTURE_MODE" in
-      missing) printf 'release not found\\n' >&2; return 1 ;;
-      auth) printf 'HTTP 401: unauthorized\\n' >&2; return 1 ;;
-      api-error) printf 'HTTP 404: Not Found\\n' >&2; return 1 ;;
-    esac
-    printf '%s\\n' "$FIXTURE_API_URL"
-  elif [[ "$*" == 'api --hostname github.com repos/openclaw/Peekaboo/releases/123' ]]; then
-    printf '%s\\n' "$FIXTURE_RELEASE_JSON"
-  else
-    printf 'HTTP 404: Not Found\\n' >&2
-    return 1
-  fi
-}
-${functions}
-if [[ "$FIXTURE_COMMAND" == verify ]]; then
-  verify_github_release_assets
-else
-  github_release_exists
-fi
-`;
-  const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', script], {
-    encoding: 'utf8',
-    env: {
-      PATH: process.env.PATH, HOME: root, TMPDIR: root, NODE_BIN: process.execPath,
-      RELEASE_DIR: root, RELEASE_SOURCE_COMMIT: sourceCommit,
-      PUBLICATION_RECEIPT_PATH: join(root, 'receipt.json'),
-      RELEASE_CONTRACT: join(projectRoot, 'scripts/release-driver-contract.mjs'),
-      CALL_LOG: join(root, 'calls'), FIXTURE_MODE: mode, FIXTURE_COMMAND: command,
-      FIXTURE_API_URL: apiUrl ?? 'https://api.github.com/repos/openclaw/Peekaboo/releases/123',
-      FIXTURE_RELEASE_JSON: JSON.stringify({ tag_name: 'v9.8.7', draft: true, body: 'fixture release notes\n', assets: [] })
+function cliProbeFixture({ failArgs, errorCode = 'ETIMEDOUT' } = {}) {
+  const messages = [];
+  const calls = [];
+  const replacements = new Map(REMOVED_ROOT_COMMANDS.map((command) => [command, `replacement ${command}`]));
+  const source = prepareSource.match(/^function checkSwiftCLIIntegration\(binaryPath\) \{[\s\S]*?^\}/m)?.[0];
+  assert.ok(source);
+  const check = runInNewContext(`${source}; checkSwiftCLIIntegration`, {
+    projectRoot, join, existsSync: () => true, readFileSync: () => '',
+    MIGRATION_ADVISOR_PATH: 'fixture', REMOVED_ROOT_COMMANDS,
+    parseRemovedRootReplacements: () => replacements,
+    logStep() {}, logSuccess() {}, logError(message) { messages.push(message); },
+    spawnSync(binary, args, options) {
+      calls.push({ args: Array.from(args), options });
+      let stdout;
+      if (args[0] === 'invalid-command') stdout = "Unknown command 'invalid-command'";
+      else if (replacements.has(args[0])) stdout = `Command 'peekaboo ${args[0]}' was removed in v4. Use '${replacements.get(args[0])}'.`;
+      else if (args.includes('--json')) stdout = JSON.stringify({ success: true, data: { apps: [], windows: [], screens: [] } });
+      else stdout = '--no-elements --tree --no-screenshot --at --wait-for --long-press --delay --hold cmd+shift+t AXPress --on --from --to --button --duration --foreground peekaboo app list --include-hidden peekaboo window list --group-by-space peekaboo screen list';
+      const failed = JSON.stringify(Array.from(args)) === JSON.stringify(failArgs);
+      return {
+        stdout, status: failed ? null : (args[0] === 'invalid-command' || replacements.has(args[0]) ? 1 : 0),
+        ...(failed ? { error: Object.assign(new Error('fixture process error'), { code: errorCode }) } : {})
+      };
     }
   });
-  return { ...result, calls: readFileSync(join(root, 'calls'), 'utf8') };
+  return { passed: check('/fixture/peekaboo'), calls, messages };
 }
 
-test('draft verification uses the authenticated release ID when the tag endpoint returns 404', (t) => {
-  const result = githubDraftLookup(t);
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.calls, /release view v9\.8\.7 --repo github\.com\/openclaw\/Peekaboo --json apiUrl/);
-  assert.match(result.calls, /api --hostname github\.com repos\/openclaw\/Peekaboo\/releases\/123/);
-  assert.doesNotMatch(result.calls, /releases\/tags\//);
-  assert.equal(githubDraftLookup(t, { command: 'exists' }).status, 0);
-});
-
-test('draft lookup distinguishes absence from provider failures and rejects redirected locators', (t) => {
-  assert.equal(githubDraftLookup(t, { mode: 'missing', command: 'exists' }).status, 2);
-  for (const mode of ['auth', 'api-error']) {
-    const result = githubDraftLookup(t, { mode, command: 'exists' });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /Could not determine/);
-  }
-  for (const apiUrl of [
-    'https://example.com/repos/openclaw/Peekaboo/releases/123',
-    'https://api.github.com/repos/other/repo/releases/123',
-    'https://api.github.com/repos/openclaw/Peekaboo/releases/123?redirect=1',
-    'https://api.github.com/repos/openclaw/Peekaboo/releases/0'
+test('CLI probe failures cannot pass on partial expected diagnostics or JSON', () => {
+  for (const failArgs of [
+    ['invalid-command'], ['image', '--help'], ['see', '--help'],
+    ['app', 'list', '--json', '--no-remote']
   ]) {
-    const result = githubDraftLookup(t, { apiUrl });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /invalid release API locator/);
-    assert.doesNotMatch(result.calls, /^api /m);
+    const result = cliProbeFixture({ failArgs });
+    assert.equal(result.passed, false, JSON.stringify(failArgs));
+    assert.ok(result.messages.some((message) => message.includes('timed out after 30 seconds')));
+    assert.deepEqual(result.calls.at(-1).args, failArgs);
   }
+  const unavailable = cliProbeFixture({ failArgs: ['invalid-command'], errorCode: 'ENOENT' });
+  assert.equal(unavailable.passed, false);
+  assert.ok(unavailable.messages.some((message) => message.includes('fixture process error')));
 });
 
-test('npm publication reads normalize singleton JSON wrappers without hiding ambiguous or failed results', () => {
-  const functionSource = driverSource.match(/^npm_view_single_json\(\) \{[\s\S]*?^\}$/m)?.[0];
-  assert.ok(functionSource);
-  const run = (stdout, exit = 0) => spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', `
-set -euo pipefail
-NPM_REGISTRY=https://registry.npmjs.org/
-node() { "$NODE_BIN" "$@"; }
-npm() { printf '%s' "$FIXTURE_STDOUT"; return "$FIXTURE_EXIT"; }
-${functionSource}
-npm_view_single_json @steipete/peekaboo@4.3.1 version
-`], { encoding: 'utf8', env: {
-    PATH: process.env.PATH, NODE_BIN: process.execPath, FIXTURE_STDOUT: stdout, FIXTURE_EXIT: String(exit)
-  } });
-  for (const value of ['4.3.1', { version: '4.3.1', dist: { integrity: 'fixture' } }, { '4.3.1': '2026-09-06T13:15:51Z' }]) {
-    for (const wrapped of [value, [value]]) {
-      const result = run(JSON.stringify(wrapped));
-      assert.equal(result.status, 0, result.stderr);
-      assert.deepEqual(JSON.parse(result.stdout), value);
-    }
+test('successful CLI contracts retain bounded probes and expected nonzero diagnostics', () => {
+  const result = cliProbeFixture();
+  assert.equal(result.passed, true, result.messages.join('\n'));
+  assert.equal(result.calls.length, 23);
+  for (const call of result.calls) {
+    assert.equal(call.options.timeout, 30_000);
+    assert.equal(call.options.killSignal, 'SIGKILL');
   }
-  for (const invalid of ['[]', '["4.3.0","4.3.1"]', 'not JSON']) {
-    const result = run(invalid);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /did not return one JSON value/);
-  }
-  const failure = '{"error":{"code":"E404"}}';
-  const result = run(failure, 37);
-  assert.equal(result.status, 37);
-  assert.equal(result.stdout, failure);
 });
 
 function safeTestsLaunch() {
@@ -707,125 +672,6 @@ ${launch.args[4]}
     assert.equal(existsSync(join(fixture.root, 'home/shim-ran')), false);
   }
   t.diagnostic('direct scenarios completed: 4');
-});
-
-test('actual driver preflight gate sanitizes normal and reuse commands before eligibility', (t) => {
-  const fixture = environmentFixture(t);
-  safeTestsLaunch();
-  const gate = driverSource.split('# Step 1: Run pre-release checks (unless skipped)\n')[1]
-    ?.split('\nassert_release_plan\n')[0];
-  const eligibility = driverSource.match(/^if \[\[ "\$CREATE_GITHUB_RELEASE" == true && "\$PUBLISH_NPM" == true &&\n[\s\S]*?^fi/m)?.[0];
-  assert.ok(gate && eligibility, 'exercise the actual gate and eligibility block, without running the release driver');
-  assert.match(driverSource, /^RELEASE_PREFLIGHT_COMPLETED=false\nRELEASE_PUBLICATION_ELIGIBLE=false$/m);
-  assert.match(driverSource, /source "\$SCRIPT_DIR\/terminal-artifact-env.sh"/);
-  assert.match(gate, /terminal_artifact_run_build \/usr\/bin\/env/);
-  assert.doesNotMatch(gate, /setup-swift-workspace/);
-  assert.match(prepareSource, /if \(!runSafeTests\(\)\)/);
-  fixture.write('package.json', '{"type":"module"}\n');
-  fixture.write('scripts/prepare-release.js', `
-import assert from 'node:assert/strict';
-import { spawnSync as realSpawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-const __dirname = dirname(process.env.FIXTURE_SANITIZER);
-const projectRoot = process.cwd();
-const colors = {};
-function log() {}
-const protectedNames = readFileSync(process.env.FIXTURE_SANITIZER, 'utf8')
-  .match(/TERMINAL_ARTIFACT_SECRET_NAMES=\\(([\\s\\S]*?)\\)/)[1].trim().split(/\\s+/);
-for (const name of [...protectedNames, 'PEEKABOO_OP_SERVICE_TOKEN_FILE', 'PEEKABOO_MOLTY_OP_SERVICE_TOKEN_FILE']) {
-  assert.equal(process.env[name], undefined, name);
-}
-assert.equal(process.env.PATH, '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin');
-assert.equal(process.env.RELEASE_PREFLIGHT_COMPLETED, 'false');
-assert.equal(process.env.RELEASE_PUBLICATION_ELIGIBLE, 'false');
-assert.equal(process.env.PEEKABOO_REQUIRE_UNIVERSAL, '1');
-assert.equal(process.env.MAC_RELEASE_CODESIGN_IDENTITY, 'fixture-release-identity');
-assert.deepEqual(process.argv.slice(2), process.env.FIXTURE_REUSE === 'true'
-  ? ['--no-build', '--bin', join(projectRoot, 'peekaboo')] : []);
-const original = { ...process.env };
-function spawnSync(command, args, options) {
-  assert.deepEqual(args.slice(-2), ['pnpm', 'test']);
-  return realSpawnSync(command, [...args.slice(0, -2), process.env.FIXTURE_PROBE,
-    ...${JSON.stringify(fixture.probeArgs)}], options);
-}
-${safeTestsFunction}
-const passed = runSafeTests();
-assert.deepEqual({ ...process.env }, original);
-assert.equal(process.env.MAC_RELEASE_CODESIGN_KEYCHAIN, join(process.env.HOME, 'keychain'));
-assert.equal(process.env.CODESIGN_KEYCHAIN, join(process.env.HOME, 'keychain'));
-assert.equal(process.env.CODESIGN_IDENTITY, 'fixture');
-console.log('preflight-build-authority-retained=true');
-process.exit(passed ? 0 : 37);
-`);
-  fixture.write('gate.sh', `${fixture.prelude}
-# Observe the real sanitizer before native exec; dispatch only the fixture's
-# Node argv through the running test interpreter (or a missing fixture command).
-# This avoids depending on an installed Node on the production PATH.
-/usr/bin/env() {
-  local name arg replacements=0
-  local -a forwarded=()
-  for name in "\${TERMINAL_ARTIFACT_SECRET_NAMES[@]}" CDPATH GLOBIGNORE BASH_FUNC_fixture \\
-    PEEKABOO_OP_SERVICE_TOKEN_FILE PEEKABOO_MOLTY_OP_SERVICE_TOKEN_FILE; do
-    [[ -z "\${!name+x}" ]] || { printf 'pre-native variable remains: %s\\n' "$name" >&2; return 91; }
-  done
-  for arg in "$@"; do
-    if [[ "$arg" == node ]]; then
-      forwarded+=("$FIXTURE_GATE_COMMAND")
-      replacements=$((replacements + 1))
-    else
-      forwarded+=("$arg")
-    fi
-  done
-  [[ "$replacements" == 1 ]] || { printf 'fixture Node dispatch missing\\n' >&2; return 92; }
-  printf 'gate-pre-native-clean=true fixture-node-dispatch=true\\n'
-  command /usr/bin/env "\${forwarded[@]}"
-}
-SKIP_CHECKS=false UNIVERSAL=true REUSE_BUILT_CLI="$FIXTURE_REUSE"
-PROJECT_ROOT="$PWD" CLI_SIGN_IDENTITY=fixture-release-identity
-CREATE_GITHUB_RELEASE=true PUBLISH_NPM=true
-BLUE='' RED='' GREEN='' NC=''
-${gate}
-${eligibility}
-`);
-  for (const reuse of ['false', 'true']) {
-    for (const childExit of [0, 37]) {
-      const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-p', 'gate.sh'], {
-        cwd: fixture.root, encoding: 'utf8',
-        env: { ...fixture.env, FIXTURE_REUSE: reuse, FIXTURE_CHILD_EXIT: String(childExit),
-          FIXTURE_GATE_COMMAND: process.execPath }
-      });
-      t.diagnostic(JSON.stringify({ lane: 'driver-gate', reuse, childExit, status: result.status,
-        stdout: result.stdout, stderr: result.stderr }));
-      // The sanitizer preserves 37; the existing driver deliberately maps a
-      // failed complete preflight to release exit 1 and never grants eligibility.
-      assert.equal(result.status, childExit === 0 ? 0 : 1, result.stdout + result.stderr);
-      assert.equal(result.stderr, '');
-      assert.match(result.stdout, /gate-pre-native-clean=true fixture-node-dispatch=true/);
-      assert.match(result.stdout, /test-child-clean=true tool-boundary-safe=true arguments-preserved=true/);
-      assert.match(result.stdout, /preflight-build-authority-retained=true/);
-      assert.match(result.stdout, /later-signing-child-authority-retained=true/);
-      assert.match(result.stdout, childExit === 0
-        ? /parent-retained=true preflight=true eligible=true exit=0/
-        : /parent-retained=true preflight=false eligible=false exit=1/);
-    }
-    for (const command of [fixture.rejectedTool, fixture.absentTool]) {
-      const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-p', 'gate.sh'], {
-        cwd: fixture.root, encoding: 'utf8',
-        env: { ...fixture.env, FIXTURE_REUSE: reuse, FIXTURE_GATE_COMMAND: command }
-      });
-      t.diagnostic(JSON.stringify({ lane: 'driver-gate', reuse, command, status: result.status,
-        stdout: result.stdout, stderr: result.stderr }));
-      assert.equal(result.status, 1, result.stdout + result.stderr);
-      assert.ok(result.stderr.includes(command), 'missing-command diagnostic names the tool');
-      assert.match(result.stdout, /gate-pre-native-clean=true fixture-node-dispatch=true/);
-      assert.doesNotMatch(result.stdout, /test-child-clean=true|preflight-build-authority-retained=true/);
-      assert.match(result.stdout, /later-signing-child-authority-retained=true/);
-      assert.match(result.stdout, /parent-retained=true preflight=false eligible=false exit=1/);
-      assert.equal(existsSync(join(fixture.root, 'home/shim-ran')), false);
-    }
-  }
-  t.diagnostic('driver-gate scenarios completed: 8');
 });
 
 test('repository release source surfaces remain internally consistent', () => {

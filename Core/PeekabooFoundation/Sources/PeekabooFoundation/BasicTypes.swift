@@ -137,10 +137,10 @@ public enum SpecialKey: String, Sendable, Codable {
         }
     }
 
-    /// Deletion at an empty boundary can be handled without issuing either an AX write or key event.
+    /// An already-satisfied deletion or caret move can finish without an AX write or key event.
     public var mayCompleteWithoutDispatch: Bool {
         switch self {
-        case .delete, .forwardDelete:
+        case .delete, .forwardDelete, .leftArrow, .rightArrow, .home, .end:
             true
         default:
             false
@@ -173,6 +173,15 @@ public enum TypeAction: Sendable, Codable {
             key.mayUseAccessibilityValueDelivery
         case .clear:
             true
+        }
+    }
+
+    /// Shared action-shape eligibility; confirmation still requires exact receiver and value evidence.
+    public static func hasDeterministicReplacementValue(_ actions: [Self]) -> Bool {
+        guard actions.first?.isClear == true else { return false }
+        return actions.dropFirst().allSatisfy { action in
+            guard case let .text(text) = action else { return false }
+            return text.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
         }
     }
 
