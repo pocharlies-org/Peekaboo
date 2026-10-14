@@ -15,12 +15,9 @@ extension MoveTool {
             throw CoordinateParseError(message: "Invalid \(parameterName). Both x and y must be valid numbers")
         }
 
-        guard x >= 0, y >= 0 else {
-            throw CoordinateParseError(message: "Invalid \(parameterName). Both x and y must be non-negative")
-        }
-
-        guard x <= 20000, y <= 20000 else {
-            throw CoordinateParseError(message: "Invalid \(parameterName). Both x and y must be 20000 or less")
+        guard (-20000...20000).contains(x), (-20000...20000).contains(y) else {
+            throw CoordinateParseError(
+                message: "Invalid \(parameterName). Both x and y must be between -20000 and 20000")
         }
 
         return CGPoint(x: x, y: y)
@@ -42,7 +39,7 @@ extension MoveTool {
         let durationOverride = try arguments.validatedInt("duration")
         let stepsOverride = try arguments.validatedInt("steps")
 
-        if smooth, profile == .linear {
+        if smooth {
             let durationToValidate = durationOverride ?? 500
             let stepsToValidate = stepsOverride ?? 10
             try self.validateSmoothParameters(duration: durationToValidate, steps: stepsToValidate)

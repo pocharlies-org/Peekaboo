@@ -189,14 +189,29 @@ extension PeekabooBridgeClient {
     }
 
     private func requireNegotiatedInputCapabilities(for request: PeekabooBridgeRequest) throws {
-        if case let .desktopObservation(observation) = request.unwrappedOperationRequest,
-           observation.output.includeImageData, !self.desktopObservationInlinePixelsEnabled
-        {
-            throw PeekabooBridgeErrorEnvelope(
-                code: .operationNotSupported,
-                message: "Bridge host does not advertise desktopObservationInlinePixels. " +
-                    "Update and relaunch Peekaboo on the selected host before requesting inline capture pixels.")
+        if request.requiresScopedMenuBarActions {
+            try self.requireScopedMenuBarActions()
         }
+        if request.requiresExactFileDialogExecution {
+            try self.requireExactFileDialogExecution()
+        }
+        if request.requiresPreparedClipboardGuardedExactWindowHotkey,
+           !self.preparedClipboardGuardedExactWindowHotkeysEnabled
+        {
+            throw DesktopActionFailure.preDispatchRefusal(
+                route: .bridge,
+                reason: .runtimeIncompatible,
+                message: "The selected Bridge session cannot prepare a background window for clipboard-guarded paste.",
+                hint: "Update and relaunch the selected host before writing a temporary clipboard payload.")
+        }
+        if request.requiresClipboardGuardedExactWindowHotkey, !self.clipboardGuardedExactWindowHotkeysEnabled {
+            throw DesktopActionFailure.preDispatchRefusal(
+                route: .bridge,
+                reason: .runtimeIncompatible,
+                message: "The selected Bridge session cannot fence exact-window paste with a retained clipboard claim.",
+                hint: "Update and relaunch Peekaboo on the selected host before writing a temporary clipboard payload.")
+        }
+        try self.requireObservationCapabilities(for: request)
         if request.requiresBrowserConnectionHandoff, !self.browserConnectionHandoffEnabled {
             throw PeekabooBridgeErrorEnvelope(
                 code: .operationNotSupported,
@@ -218,22 +233,7 @@ extension PeekabooBridgeClient {
                 message: "This Bridge host cannot honor an explicit accessibility-value click policy.",
                 hint: "Update and relaunch Peekaboo before retrying the snapshot-backed click.")
         }
-        if case let .targetedScroll(payload) = request.unwrappedOperationRequest {
-            guard payload.request.expectedWindow != nil else {
-                throw DesktopActionFailure.preDispatchRefusal(
-                    route: .bridge,
-                    reason: .targetUnavailable,
-                    message: "Background scroll has no complete capture-owned exact-window receipt.",
-                    hint: "Capture the exact window again and retry with its fresh snapshot.")
-            }
-            guard self.requestPinnedExactWindowScrollReceiptEnabled else {
-                throw DesktopActionFailure.preDispatchRefusal(
-                    route: .bridge,
-                    reason: .runtimeIncompatible,
-                    message: "This Bridge host cannot preserve an exact-window scroll receipt.",
-                    hint: "Update and relaunch Peekaboo before retrying background scroll.")
-            }
-        }
+        try self.requireScrollCapabilities(for: request)
         if request.requiresCompositeTypeDeliverySupport,
            !self.compositeTypeDeliveryEnabled
         {
@@ -252,24 +252,7 @@ extension PeekabooBridgeClient {
                 message: "This Bridge host cannot lease modifier-click snapshots at the execution leaf.",
                 hint: "Update and relaunch Peekaboo before retrying modifier-click.")
         }
-        if request.unwrappedOperationRequest.operation == .setValue,
-           !self.setValueResultTargetBindingEnabled
-        {
-            throw DesktopActionFailure.preDispatchRefusal(
-                route: .bridge,
-                reason: .runtimeIncompatible,
-                message: "This Bridge host cannot return a verifiable set-value result.",
-                hint: "Update and relaunch Peekaboo before retrying set-value.")
-        }
-        if [.setValue, .performAction].contains(request.unwrappedOperationRequest.operation),
-           !self.processGenerationBoundElementMutationsEnabled
-        {
-            throw DesktopActionFailure.preDispatchRefusal(
-                route: .bridge,
-                reason: .runtimeIncompatible,
-                message: "This Bridge host cannot bind element mutations to one process generation.",
-                hint: "Update and relaunch Peekaboo before retrying action or set-value.")
-        }
+        try self.requireElementMutationCapabilities(for: request.unwrappedOperationRequest.operation)
         if request.unwrappedOperationRequest.operation == .observeProcessGeneration,
            !self.processGenerationObservationEnabled
         {
@@ -319,6 +302,13 @@ extension PeekabooBridgeClient {
                 message: "Bridge protocol 1.30 exact-window held-pointer support is unavailable.",
                 hint: "Update or relaunch the Peekaboo Bridge host before retrying.")
         }
+        if request.unwrappedOperationRequest.operation == .exactWindowDrag, !self.exactWindowDragEnabled {
+            throw DesktopActionFailure.preDispatchRefusal(
+                route: .bridge,
+                reason: .runtimeIncompatible,
+                message: "Bridge protocol 1.39 exact-window drag support is unavailable.",
+                hint: "Update the selected host; no foreground fallback was attempted.")
+        }
         if request.requiresExactWindowHeldPointerTerminalSupport,
            !self.exactWindowHeldPointerTerminalCleanupEnabled
         {
@@ -327,6 +317,75 @@ extension PeekabooBridgeClient {
                 reason: .runtimeIncompatible,
                 message: "Bridge protocol 1.30 exact-window held-pointer cleanup is unavailable.",
                 hint: "Reconnect to the Bridge host that owns the active hold before retrying.")
+        }
+    }
+
+    private func requireScrollCapabilities(for request: PeekabooBridgeRequest) throws {
+        if case let .targetedScroll(payload) = request.unwrappedOperationRequest {
+            try payload.request.validatePointSelector()
+            if payload.request.point != nil, !self.backgroundCoordinateScrollEnabled {
+                throw DesktopActionFailure.preDispatchRefusal(
+                    route: .bridge,
+                    reason: .runtimeIncompatible,
+                    message: "This Bridge host does not support background coordinate scroll.",
+                    hint: "Update and relaunch Peekaboo before retrying coordinate scroll.")
+            }
+            guard payload.request.expectedWindow != nil else {
+                throw DesktopActionFailure.preDispatchRefusal(
+                    route: .bridge,
+                    reason: .targetUnavailable,
+                    message: "Background scroll has no complete capture-owned exact-window receipt.",
+                    hint: "Capture the exact window again and retry with its fresh snapshot.")
+            }
+            guard self.requestPinnedExactWindowScrollReceiptEnabled else {
+                throw DesktopActionFailure.preDispatchRefusal(
+                    route: .bridge,
+                    reason: .runtimeIncompatible,
+                    message: "This Bridge host cannot preserve an exact-window scroll receipt.",
+                    hint: "Update and relaunch Peekaboo before retrying background scroll.")
+            }
+        }
+    }
+
+    private func requireObservationCapabilities(for request: PeekabooBridgeRequest) throws {
+        guard case let .desktopObservation(observation) = request.unwrappedOperationRequest else { return }
+        if observation.detection.requiresFreshAccessibilityTree, !self.desktopObservationFreshAccessibilityTreeEnabled {
+            throw PeekabooBridgeErrorEnvelope(
+                code: .operationNotSupported,
+                message: "Bridge host does not advertise desktopObservationFreshAccessibilityTree. " +
+                    "Update and relaunch the host before requesting a fresh observation.")
+        }
+        if observation.output.includeImageData, !self.desktopObservationInlinePixelsEnabled {
+            throw PeekabooBridgeErrorEnvelope(
+                code: .operationNotSupported,
+                message: "Bridge host does not advertise desktopObservationInlinePixels. " +
+                    "Update and relaunch Peekaboo on the selected host before requesting inline capture pixels.")
+        }
+    }
+
+    private func requireElementMutationCapabilities(for operation: PeekabooBridgeOperation) throws {
+        if operation == .setValue, !self.setValueResultTargetBindingEnabled {
+            throw DesktopActionFailure.preDispatchRefusal(
+                route: .bridge,
+                reason: .runtimeIncompatible,
+                message: "This Bridge host cannot return a verifiable set-value result.",
+                hint: "Update and relaunch Peekaboo before retrying set-value.")
+        }
+        if operation == .selectText, !self.textSelectionEnabled {
+            throw DesktopActionFailure.preDispatchRefusal(
+                route: .bridge,
+                reason: .runtimeIncompatible,
+                message: "This Bridge host does not support receipted text selection.",
+                hint: "Update and relaunch Peekaboo before retrying select-text.")
+        }
+        if [.setValue, .selectText, .performAction].contains(operation),
+           !self.processGenerationBoundElementMutationsEnabled
+        {
+            throw DesktopActionFailure.preDispatchRefusal(
+                route: .bridge,
+                reason: .runtimeIncompatible,
+                message: "This Bridge host cannot bind element mutations to one process generation.",
+                hint: "Update and relaunch Peekaboo before retrying this element mutation.")
         }
     }
 
@@ -869,17 +928,22 @@ extension PeekabooBridgeClient {
             let connectedHost: PeekabooBridgeConnectedHostIdentity?
             if request.expectedHost != nil || request.authenticatesInitialListener {
                 let liveIdentity = try request.hostAuthentication.liveIdentity(fd)
-                let signingIdentity: PeekabooBridgeHost.PeerSigningIdentity? = if
+                var signingIdentity: PeekabooBridgeHost.PeerSigningIdentity?
+                var signingIdentityFailure: PeekabooBridgeCodeSignatureIdentity.SigningValidationFailure?
+                if
                     request.authenticatesInitialListener || request.expectedHost?.requiresSigningIdentity == true,
                     let auditIdentity = liveIdentity.auditIdentity
                 {
-                    request.hostAuthentication.signingIdentity(auditIdentity)
-                } else {
-                    nil
+                    do {
+                        signingIdentity = try request.hostAuthentication.signingIdentity(auditIdentity)
+                    } catch let failure as PeekabooBridgeCodeSignatureIdentity.SigningValidationFailure {
+                        signingIdentityFailure = failure
+                    }
                 }
                 connectedHost = .init(
                     liveIdentity: liveIdentity,
-                    signingIdentity: signingIdentity)
+                    signingIdentity: signingIdentity,
+                    signingIdentityFailure: signingIdentityFailure)
             } else {
                 connectedHost = nil
             }

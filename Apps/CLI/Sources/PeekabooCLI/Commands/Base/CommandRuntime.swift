@@ -45,6 +45,7 @@ struct CommandRuntimeOptions {
     /// `accessibilityAndOCR` is additive inside protocol 1.22. Require a raw host capability so
     /// an older 1.22 host cannot try to decode the enum case before the client can fail safely.
     var requiresDesktopObservationOCR = false
+    var requiresDesktopObservationFreshAccessibilityTree = false
     var inputStrategy: UIInputStrategy?
     var preferRemote = true
     var remoteIsolationRequested = false
@@ -108,6 +109,7 @@ struct CommandRuntimeOptions {
     /// Pixel-focus typing is host-atomic and must not fall back to ordinary targeted typing.
     var requiresExactWindowPixelFocusTyping = false
     var requiresTargetedScroll = false
+    var requiresBackgroundCoordinateScroll = false
     var requiresPostEventPermission = false
     var requiresAccessibilityPermission = false
     var requiresLongPressClick = false

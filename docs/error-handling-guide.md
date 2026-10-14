@@ -17,6 +17,11 @@ The error handling system has three main pieces:
 2. **`StandardErrorCode`** — stable codes exposed by `StandardizedError`.
 3. **CLI mapping** — `ErrorHandlingCommand` maps service errors to the CLI's JSON `ErrorCode` values.
 
+For desktop mutations, `DesktopActionFailure` owns the canonical outcome, execution route, reported target receipt,
+hint, and cause. Snapshot mutation coordination passes these typed failures through unchanged. The shared CLI renderer
+already maps standardized codes such as `snapshotStale` to `SNAPSHOT_STALE`; rebuilding a local error solely to select
+that code would discard the original Bridge provenance.
+
 ## Error Types
 
 ### Standard Error Codes
@@ -65,7 +70,7 @@ throw PeekabooError.ambiguousAppIdentifier(
 
 ### Standardizing Other Errors
 
-`ErrorStandardizer.standardize(_:)` preserves errors that already conform to `StandardizedError`, converts missing-file Cocoa errors to `PeekabooError.fileIOError`, and wraps other errors as `PeekabooError.operationError`.
+`ErrorStandardizer.standardize(_:)` preserves errors that already conform to `StandardizedError`, maps cooperative `CancellationError` and `NSURLErrorDomain` errors with code `NSURLErrorCancelled` to `.cancelled` (`CANCELLED`), converts missing-file Cocoa errors to `PeekabooError.fileIOError`, and wraps other errors as `PeekabooError.operationError`.
 
 ```swift
 let standardized = ErrorStandardizer.standardize(error)
