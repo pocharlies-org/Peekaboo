@@ -1,9 +1,11 @@
 import Commander
 import PeekabooAgentRuntime
+import PeekabooAgentRuntimeTestSupport
 import Testing
 @testable import PeekabooCLI
 
-@Suite(.tags(.safe))
+@Suite(.tags(.safe), AuthorityTestIsolation())
+@MainActor
 struct AgentDesktopContextOptionsTests {
     @Test(arguments: [false, true])
     func `all execution modes bind the desktop context choice`(disabled: Bool) throws {
@@ -22,8 +24,7 @@ struct AgentDesktopContextOptionsTests {
         for command in commands {
             #expect(command.noDesktopContext == disabled)
             #expect(command.enhancementOptions.contextAware == !disabled)
-            #expect(command.newSessionToolExecutionPolicy == .backgroundOnly)
-            #expect(command.requestedResumeToolExecutionPolicy == .backgroundOnly)
+            #expect(command.toolExecutionAuthority == .backgroundOnly)
             Self.expectOtherDefaults(command.enhancementOptions)
         }
     }
@@ -32,8 +33,7 @@ struct AgentDesktopContextOptionsTests {
     func `context opt out does not grant or revoke foreground authority`() throws {
         let command = try AgentCommand.parse(["--no-desktop-context", "--allow-foreground"])
         #expect(command.enhancementOptions.contextAware == false)
-        #expect(command.newSessionToolExecutionPolicy == .foregroundAllowed)
-        #expect(command.requestedResumeToolExecutionPolicy == .foregroundAllowed)
+        #expect(command.toolExecutionAuthority.basePolicy == .foregroundAllowed)
         Self.expectOtherDefaults(command.enhancementOptions)
     }
 

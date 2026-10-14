@@ -85,6 +85,11 @@ All actions are logged using Apple's OSLog framework with the subsystem `boo.pee
 
 ## Building and Running
 
+Follow the [building guide](../../docs/building.md) for Swift workspace setup before a direct Xcode build.
+For background qualification, use the [signed fixture workflow](../../docs/testing/background-computer-use.md), which
+records source identity and separates unsigned compilation from signing. Do not launch an unsigned/ad-hoc build against
+an existing trusted installation's permissions or Keychain state.
+
 ```bash
 # From the repository root, build the app with its Xcode project
 xcodebuild -project Apps/Playground/Playground.xcodeproj \
@@ -93,9 +98,13 @@ xcodebuild -project Apps/Playground/Playground.xcodeproj \
   -derivedDataPath Apps/Playground/.build \
   build
 
-# Run the app
-open Apps/Playground/.build/Build/Products/Release/Playground.app
+# After signing and verifying the intended artifact, request a background launch.
+open -g -n Apps/Playground/.build/Build/Products/Release/Playground.app
 ```
+
+Confirm the newly launched process generation before treating it as task-owned. A background launch request alone does
+not prove noninterference. See the [testing methodology](../../docs/playground-testing.md) for fresh exact-window
+observations, result readback, and cleanup; preserve existing user instances and earlier test artifacts.
 
 ## Using with Peekaboo
 
@@ -131,22 +140,33 @@ This app is designed to work with Peekaboo's automation features. Each UI elemen
 - Export logs to file
 
 ### Using playground-log.sh (Recommended)
-```bash
-# From project root
-../scripts/playground-log.sh
 
-# Or directly
+Run these commands from the repository root:
+
+```bash
+# Use the forwarding wrapper
 ./scripts/playground-log.sh
 
+# Or directly
+./Apps/Playground/scripts/playground-log.sh
+
 # Stream logs in real-time
-../scripts/playground-log.sh -f
+./scripts/playground-log.sh -f
 
 # Show specific category
-../scripts/playground-log.sh -c Click
+./scripts/playground-log.sh -c Click
 
 # Search for specific actions
-../scripts/playground-log.sh -s "button"
+./scripts/playground-log.sh -s "button"
 ```
+
+Category and search values are literal text, not shell commands or predicate expressions. Missing option values
+exit with status 2 before reading logs; supplied empty or dash-prefixed values are not missing arguments.
+`--lines` limits completed text queries only. `--json` preserves the producer's framing, and `--follow` forwards
+events without waiting for the stream to finish; neither uses the line limit. Live JSON need not be one document.
+Historical `--errors` queries use the native `logType` severity. Failed queries, invalid line limits and output-file
+errors remain nonzero, and a failed export never prints a save confirmation. Text output retains category colors
+without interpreting backslash escapes inside log messages.
 
 ### Using pblog (if available)
 ```bash
