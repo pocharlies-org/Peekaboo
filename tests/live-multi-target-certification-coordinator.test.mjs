@@ -102,7 +102,62 @@ function fakeCatalog() {
   };
 }
 
-const fakeMonitorSource = String.raw`#!/usr/bin/env node
+// The coordinator bounds each monitor one-shot with a fixed 15 s spawnSync. On a busy host a cold Node start, and
+// above all rename(2), can stall past it, so one-shots stay in sh and publish with one create (the coordinator reads
+// after exit). Only the polled, long-lived watch mode runs in Node. Shell `${...}` would be template interpolation.
+function fakeMonitorScript(nodeExecutable, watchModulePath) {
+  const shellQuote = (value) => `'${value.replaceAll(/'/g, String.raw`'\''`)}'`;
+  return String.raw`#!/bin/sh
+set -ef
+umask 077
+[ "$#" -gt 0 ] || exit 2
+case "$1" in
+  watch) exec ${shellQuote(nodeExecutable)} ${shellQuote(watchModulePath)} "$@" ;;
+  sample|process-identity|process-executable) mode=$1; shift ;;
+  *) exit 2 ;;
+esac
+pid=''
+output=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --pid) [ "$#" -ge 2 ] || exit 2; pid=$2; shift 2 ;;
+    --output) [ "$#" -ge 2 ] || exit 2; output=$2; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+[ -n "$output" ] || exit 2
+case "$mode" in
+  sample)
+    {
+      printf '{"timestamp":%s,"frontmostPID":%s,"frontmostBundleIdentifier":"test.sentinel",' \
+        "$(date +%s)" "$FAKE_SENTINEL_PID"
+      printf '"frontmostWindowID":%s,"cursor":{"x":1,"y":2},"clipboardChangeCount":7,' "$FAKE_SENTINEL_WINDOW"
+      printf '"clipboardDigest":"${'7'.repeat(64)}","peekabooWindowIDs":[],'
+      printf '"visibleScreenFramesTopLeft":[{"x":0,"y":0,"width":1000,"height":700}]}\n'
+    } > "$output"
+    ;;
+  process-identity)
+    [ -n "$pid" ] || exit 2
+    startIdentity="$pid"00
+    if [ "$pid" = "$FAKE_SENTINEL_PID" ] && [ -n "$FAKE_FINAL_SENTINEL_START_IDENTITY" ]; then
+      case "$output" in
+        *final-sentinel*) startIdentity=$FAKE_FINAL_SENTINEL_START_IDENTITY ;;
+      esac
+    fi
+    printf '{"pid":%s,"startIdentity":"%s"}\n' "$pid" "$startIdentity" > "$output"
+    ;;
+  process-executable)
+    [ -n "$pid" ] || exit 2
+    # Native digest; "<hex> *<path>" is split without globbing (set -f).
+    digest=$(/usr/bin/openssl dgst -sha256 -r "$0")
+    set -- $digest
+    printf '{"pid":%s,"startIdentity":"%s00","path":"%s","sha256":"%s"}\n' "$pid" "$pid" "$0" "$1" > "$output"
+    ;;
+esac
+`;
+}
+
+const fakeMonitorWatchSource = String.raw`
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -110,7 +165,7 @@ import process from 'node:process';
 
 process.umask(0o077);
 const args = process.argv.slice(2);
-const mode = args[0];
+if (args[0] !== 'watch') process.exit(2);
 const arg = (name) => args[args.indexOf(name) + 1];
 const write = (file, value) => {
   const temporary = file + '.tmp';
@@ -127,46 +182,6 @@ const aggregate = (domain, value) => createHash('sha256').update(Buffer.concat([
   Buffer.from('peekaboo.multi-target-certification.' + domain + '.v2\0'),
   Buffer.from(JSON.stringify(canonical(value))),
 ])).digest('hex');
-const fileSHA = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-if (mode === 'sample') {
-  write(arg('--output'), {
-    timestamp: Date.now() / 1000,
-    frontmostPID: Number(process.env.FAKE_SENTINEL_PID),
-    frontmostBundleIdentifier: 'test.sentinel',
-    frontmostWindowID: Number(process.env.FAKE_SENTINEL_WINDOW),
-    cursor: { x: 1, y: 2 },
-    clipboardChangeCount: 7,
-    clipboardDigest: '7'.repeat(64),
-    peekabooWindowIDs: [],
-    visibleScreenFramesTopLeft: [{ x: 0, y: 0, width: 1000, height: 700 }],
-  });
-  process.exit(0);
-}
-if (mode === 'process-identity') {
-  const pid = Number(arg('--pid'));
-  const outputPath = arg('--output');
-  const useFinalSentinelDrift = pid === Number(process.env.FAKE_SENTINEL_PID)
-    && outputPath.includes('final-sentinel')
-    && typeof process.env.FAKE_FINAL_SENTINEL_START_IDENTITY === 'string';
-  write(outputPath, {
-    pid,
-    startIdentity: useFinalSentinelDrift
-      ? process.env.FAKE_FINAL_SENTINEL_START_IDENTITY
-      : String(pid) + '00',
-  });
-  process.exit(0);
-}
-if (mode === 'process-executable') {
-  const pid = Number(arg('--pid'));
-  write(arg('--output'), {
-    pid,
-    startIdentity: String(pid) + '00',
-    path: process.argv[1],
-    sha256: fileSHA(process.argv[1]),
-  });
-  process.exit(0);
-}
-if (mode !== 'watch') process.exit(2);
 const output = arg('--output');
 const contamination = arg('--contamination-output');
 const ready = arg('--ready');
@@ -210,6 +225,9 @@ server.listen(socketPath, () => {
 });
 const tick = () => {
   if (sealed) return;
+  const preMutationPath = process.env.FAKE_PRE_MUTATION_HEARTBEAT_PATH;
+  // Observe the grant before sampling: a phase read after publication can retain grant-stable itself.
+  const runningAtStart = preMutationPath && fs.readFileSync(arg('--phase'), 'utf8').trim() === 'running';
   const producer = JSON.parse(fs.readFileSync(producersPath));
   sequence += 1;
   epoch += 1;
@@ -217,7 +235,7 @@ const tick = () => {
   // The fake external producer acts only after the owner emits the perform window.
   const activity = producer.revision === 2
     && (process.env.FAKE_EARLY_ACTIVITY === '1' || fs.existsSync(process.env.FAKE_FOREGROUND_ACTIVITY_PATH)) ? 3 : 0;
-  write(heartbeatPath, {
+  const heartbeat = {
     sequence,
     monotonicMicroseconds: Number(process.hrtime.bigint() / 1000n),
     wallClockMilliseconds: Date.now() + (process.env.FAKE_CLOCK_DRIFT === '1' ? sequence * 3000 : 0),
@@ -241,12 +259,11 @@ const tick = () => {
     executionNonce: nonce,
     monitorInstanceID: monitorID,
     historyCommitmentSHA256: fs.readFileSync(historyPath, 'utf8').trim(),
-  });
-  const preMutationPath = process.env.FAKE_PRE_MUTATION_HEARTBEAT_PATH;
-  if (preMutationPath && !fs.existsSync(preMutationPath)
-      && fs.readFileSync(arg('--phase'), 'utf8').trim() === 'running') {
+  };
+  write(heartbeatPath, heartbeat);
+  if (runningAtStart && !fs.existsSync(preMutationPath)) {
     if (!preMutationHeartbeat) {
-      preMutationHeartbeat = JSON.parse(fs.readFileSync(heartbeatPath));
+      preMutationHeartbeat = heartbeat;
     } else if (Date.now() > preMutationHeartbeat.wallClockMilliseconds) {
       // Release the fake controllers on a later tick so the stale sample is unambiguous.
       write(preMutationPath, preMutationHeartbeat);
@@ -290,8 +307,8 @@ const write = (file, value) => {
   const temporary = file + '.' + process.pid + '.' + randomUUID() + '.tmp';
   const descriptor = fs.openSync(temporary, 'wx', 0o600);
   try {
+    // Fake receipts need atomic publication, not crash durability or a disk flush per marker.
     fs.writeFileSync(descriptor, JSON.stringify(canonical(value), null, 2) + '\n');
-    fs.fsyncSync(descriptor);
   } finally {
     fs.closeSync(descriptor);
   }
@@ -343,6 +360,13 @@ if (args[0] === '--attest-monitor') {
   });
 } else if (args[0] === '--plan') {
   const plan = read(args[1]);
+  const releaseTestTarget = process.env.FAKE_RELEASE_TEST_TARGET === plan.controller_id;
+  if (releaseTestTarget && process.env.FAKE_IGNORE_TERM === '1') {
+    process.on('SIGTERM', () => {
+      fs.appendFileSync(process.env.FAKE_RELEASE_TEST_LOG,
+        JSON.stringify({ event: 'term', pid: process.pid }) + '\n');
+    });
+  }
   const root = plan.artifacts_directory;
   fs.mkdirSync(root + '/bundles', { mode: 0o700 });
   fs.mkdirSync(root + '/observations', { mode: 0o700 });
@@ -387,6 +411,11 @@ if (args[0] === '--attest-monitor') {
   } else {
     // Default fixtures model overlap by ownership; explicit delays still exercise timing failures.
     await wait(process.env.FAKE_EXTERNAL_RESTORE_STARTED_PATH);
+    const restored = read(process.env.FAKE_EXTERNAL_RESTORE_STARTED_PATH);
+    // Preserve strict timestamp ordering even if the owner handoff fits within one millisecond.
+    while (Date.now() <= restored.timestamp_milliseconds) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
   }
   write(root + '/mutation-completed.json', {
     version: 1, phase: 'mutation-completed', execution_nonce: plan.execution_nonce,
@@ -453,6 +482,15 @@ if (args[0] === '--attest-monitor') {
     slots: slots.map((slot) => ({ slot_id: plan.controller_id + '-' + slot })),
   });
   await wait(plan.release_path);
+  if (releaseTestTarget) {
+    if (process.env.FAKE_RELEASE_TEST_LOG) {
+      fs.appendFileSync(process.env.FAKE_RELEASE_TEST_LOG,
+        JSON.stringify({ event: 'released', pid: process.pid }) + '\n');
+    }
+    const releaseDelay = Number(process.env.FAKE_RELEASE_DELAY_MILLISECONDS ?? 0);
+    if (releaseDelay > 0) await new Promise((resolve) => setTimeout(resolve, releaseDelay));
+    if (process.env.FAKE_RELEASE_EXIT_CODE) process.exit(Number(process.env.FAKE_RELEASE_EXIT_CODE));
+  }
   process.stdout.write(JSON.stringify({ result: 'passed', receipt: root + '/' + plan.controller_id + '-receipt.json' }) + '\n');
   process.exit(0);
 } else if (args[0] === '--observe-only-plan') {
@@ -593,7 +631,8 @@ function fixture() {
   const crashes = path.join(root, 'crashes');
   fs.mkdirSync(runs, { mode: 0o700 });
   fs.mkdirSync(crashes, { mode: 0o700 });
-  const monitor = path.join(root, 'fake-monitor.mjs');
+  const monitor = path.join(root, 'fake-monitor.sh');
+  const monitorWatch = path.join(root, 'fake-monitor-watch.mjs');
   const controllerExecutable = path.join(root, 'fake-controller.mjs');
   const finalizer = path.join(root, 'fake-finalizer.mjs');
   const peekaboo = path.join(root, 'fake-peekaboo');
@@ -601,7 +640,8 @@ function fixture() {
   const finalizerLog = path.join(root, 'finalizer.log');
   const foregroundActivity = path.join(root, 'foreground-activity.json');
   const externalRestoreStarted = path.join(root, 'external-restore-started.json');
-  writeExecutable(monitor, fakeMonitorSource);
+  fs.writeFileSync(monitorWatch, fakeMonitorWatchSource, { mode: 0o600 });
+  writeExecutable(monitor, fakeMonitorScript(process.execPath, monitorWatch));
   writeExecutable(controllerExecutable, fakeControllerSource);
   writeExecutable(finalizer, fakeFinalizerSource);
   writeExecutable(peekaboo, '#!/bin/sh\nexit 0\n');
@@ -647,8 +687,10 @@ function fixture() {
       interval_milliseconds: 10,
       code_signature_hash: 'a'.repeat(40),
     },
-    external_foreground_timeout_seconds: 5,
-    operation_timeout_seconds: 65,
+    // Live runs make this test process the external operator. The 5-second product minimum is measured from the
+    // monitor fence and a nice'd release preflight overran it, so only window-free tests use that minimum.
+    external_foreground_timeout_seconds: 30,
+    operation_timeout_seconds: 140,
     test_runtime: {
       catalog_path: catalogPath,
       finalizer_path: finalizer,
@@ -686,6 +728,7 @@ async function runInteractive(fix, {
   let stdout = '';
   let stderr = '';
   const events = [];
+  const markerTimers = new Set();
   let buffered = '';
   child.stdout.on('data', (chunk) => {
     stdout += chunk;
@@ -715,16 +758,26 @@ async function runInteractive(fix, {
           phase,
         });
         const delay = markerDelayMilliseconds[window.phase] ?? 0;
-        if (delay > 0) setTimeout(publish, delay);
-        else publish();
+        if (delay > 0) {
+          const timer = setTimeout(() => {
+            markerTimers.delete(timer);
+            publish();
+          }, delay);
+          markerTimers.add(timer);
+        } else publish();
       }
     }
   });
   child.stderr.on('data', (chunk) => { stderr += chunk; });
-  const result = await new Promise((resolve, reject) => {
-    child.once('error', reject);
-    child.once('close', (code, signal) => resolve({ code, signal }));
-  });
+  let result;
+  try {
+    result = await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) => resolve({ code, signal }));
+    });
+  } finally {
+    for (const timer of markerTimers) clearTimeout(timer);
+  }
   return { ...result, stdout, stderr, events };
 }
 
@@ -955,6 +1008,7 @@ test('duplicate exact physical targets fail before child launch', () => {
 test('operation timeout covers typing, both external windows, and lifecycle overhead', () => {
   const fix = fixture();
   try {
+    fix.plan.external_foreground_timeout_seconds = 5;
     fix.plan.operation_timeout_seconds = 64;
     writePrivate(fix.planPath, fix.plan);
     const run = spawnSync(process.execPath, [coordinator, '--plan', fix.planPath], {
@@ -1068,9 +1122,8 @@ test('greater-than-20-second asymmetric external window retains the bounded cont
       env: {
         // Cross the former 450 ms activity timer before operations-start, without input.
         FAKE_CONTROLLER_START_DELAY_MILLISECONDS: '600',
-        FAKE_CONTROLLER_MUTATION_DELAY_MILLISECONDS: '24000',
       },
-      markerDelayMilliseconds: { perform: performDelayMilliseconds, restore: 25 },
+      markerDelayMilliseconds: { perform: performDelayMilliseconds },
     });
     assert.equal(run.code, 0, run.stderr);
     assert.ok(Date.now() - startedAt > 20_000);
@@ -1173,11 +1226,69 @@ test('semantic discriminator rejects empty, oversized, and NUL values before lau
 test('sorted-key fake lifecycle reaches ineligible test completion with bounded typing', async () => {
   const fix = fixture();
   try {
+    const idlePath = path.join(fix.root, 'completion-resources.json');
+    const preload = path.join(fix.root, 'completion-resources.mjs');
+    writeExecutable(preload, String.raw`
+import assert from 'node:assert/strict';
+import { createHook } from 'node:async_hooks';
+import childProcess from 'node:child_process';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { fileURLToPath } from 'node:url';
+
+const stdout = process.stdout;
+void process.stderr;
+const stdioResources = process.getActiveResourcesInfo().filter((type) => type === 'PipeWrap').sort();
+const processDestructions = [];
+const destroying = new Map();
+createHook({
+  init(id, type) {
+    if (type === 'PROCESSWRAP') {
+      processDestructions.push(new Promise((resolve) => destroying.set(id, resolve)));
+    }
+  },
+  destroy(id) {
+    destroying.get(id)?.();
+    destroying.delete(id);
+  },
+}).enable();
+const spawn = childProcess.spawn;
+const children = [];
+const closedChildren = [];
+childProcess.spawn = (...args) => {
+  const child = spawn(...args);
+  children.push(child);
+  closedChildren.push(new Promise((resolve) => child.once('close', resolve)));
+  return child;
+};
+syncBuiltinESMExports();
+const write = stdout.write.bind(stdout);
+stdout.write = (chunk, ...args) => {
+  const result = write(chunk, ...args);
+  if (String(chunk).includes('"event":"test-runtime-complete"')) {
+    assert.ok(children.every((child) => child.exitCode !== null || child.signalCode !== null),
+      'coordinator completed with a live child');
+    // A ProcessWrap can outlive close; await destruction and the owner's finally microtasks too.
+    Promise.all([...closedChildren, ...processDestructions]).then(() => setImmediate(() => {
+      const activeResources = process.getActiveResourcesInfo().sort();
+      fs.writeFileSync(fileURLToPath(new URL('completion-resources.json', import.meta.url)), JSON.stringify({
+        activeResources, stdioResources,
+      }), { flag: 'wx', mode: 0o600 });
+      // Fail inside the child so even a leaked interval cannot hang the test waiting for exit.
+      assert.deepEqual(activeResources, stdioResources, 'coordinator retained resources after completion');
+    }));
+  }
+  return result;
+};
+`);
     const run = await runInteractive(fix, {
       // Exceed the former 900 ms fake mutation lifetime before operations-complete.
       env: { FAKE_OBSERVER_READBACK_DELAY_MILLISECONDS: '1000' },
+      nodeArguments: ['--import', preload],
     });
     assert.equal(run.code, 0, run.stderr);
+    const { activeResources, stdioResources } = JSON.parse(fs.readFileSync(idlePath));
+    assert.deepEqual(activeResources, stdioResources);
     assert.deepEqual(run.events.filter((event) => event.event === 'external-foreground-window')
       .map((event) => event.phase), ['perform', 'restore']);
     const completion = run.events.at(-1);
@@ -1203,11 +1314,50 @@ test('sorted-key fake lifecycle reaches ineligible test completion with bounded 
       )));
       const characterCount = [...controllerPlan.type_text].length;
       const typingDurationMilliseconds = characterCount * controllerPlan.typing_delay_milliseconds;
+      assert.equal(characterCount, 1000);
+      assert.equal(Buffer.byteLength(controllerPlan.type_text, 'utf8'), 1000);
+      assert.equal(controllerPlan.typing_delay_milliseconds, 50);
+      assert.ok(controllerPlan.type_text.startsWith(
+        `peekaboo-certification-background:${completion.execution_nonce}:${controllerID}:`,
+      ));
+      assert.equal(typingDurationMilliseconds, 50_000);
+      assert.equal(
+        fix.plan.operation_timeout_seconds * 1000,
+        typingDurationMilliseconds
+          + (2 * fix.plan.external_foreground_timeout_seconds * 1000)
+          + 30_000,
+      );
+    }
+  } finally {
+    fs.rmSync(fix.root, { recursive: true, force: true });
+  }
+});
+
+test('minimum 5-second external windows accept the exact operation budget with bounded typing', async () => {
+  const fix = fixture();
+  try {
+    fix.plan.external_foreground_timeout_seconds = 5;
+    fix.plan.operation_timeout_seconds = 65;
+    // Stop at the baseline sentinel: controller plans exist, but no live window can race host scheduling.
+    fix.plan.monitor.sentinel.start_identity = `${SENTINEL_PID}99`;
+    writePrivate(fix.planPath, fix.plan);
+    const run = await runInteractive(fix);
+    assert.notEqual(run.code, 0);
+    assert.match(run.stderr, /baseline sentinel process generation differs from the exact plan/);
+    assert.equal(run.events.some((event) => event.event === 'external-foreground-window'), false);
+    const failed = run.events.at(-1);
+    assert.equal(failed.event, 'failed');
+    for (const controllerID of ['controller-a', 'controller-b']) {
+      const controllerPlan = JSON.parse(fs.readFileSync(path.join(
+        failed.run_root, 'controllers', controllerID, 'plan.json',
+      )));
+      const characterCount = [...controllerPlan.type_text].length;
+      const typingDurationMilliseconds = characterCount * controllerPlan.typing_delay_milliseconds;
       assert.equal(characterCount, 500);
       assert.equal(Buffer.byteLength(controllerPlan.type_text, 'utf8'), 500);
       assert.equal(controllerPlan.typing_delay_milliseconds, 50);
       assert.ok(controllerPlan.type_text.startsWith(
-        `peekaboo-certification-background:${completion.execution_nonce}:${controllerID}:`,
+        `peekaboo-certification-background:${failed.execution_nonce}:${controllerID}:`,
       ));
       assert.equal(typingDurationMilliseconds, 25_000);
       assert.equal(
@@ -1408,6 +1558,58 @@ test('controller exit before owner release aborts the live run', async () => {
     assert.notEqual(run.code, 0);
     assert.match(run.stderr, /controller-a exited before its owner release/);
     assert.equal(fs.readFileSync(fix.finalizerLog, 'utf8'), '');
+  } finally {
+    fs.rmSync(fix.root, { recursive: true, force: true });
+  }
+});
+
+test('release cleanup waits for a delayed successful child close', async () => {
+  const fix = fixture();
+  try {
+    const log = path.join(fix.root, 'release-test.jsonl');
+    const run = await runInteractive(fix, { env: {
+      FAKE_RELEASE_TEST_TARGET: 'controller-a',
+      FAKE_RELEASE_DELAY_MILLISECONDS: '300',
+      FAKE_RELEASE_TEST_LOG: log,
+    } });
+    assert.equal(run.code, 0, run.stderr);
+    assert.equal(run.events.at(-1).event, 'test-runtime-complete');
+    assert.deepEqual(fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse).map((x) => x.event),
+      ['released']);
+  } finally {
+    fs.rmSync(fix.root, { recursive: true, force: true });
+  }
+});
+
+test('release cleanup retains nonzero child status failure', async () => {
+  const fix = fixture();
+  try {
+    const run = await runInteractive(fix, { env: {
+      FAKE_RELEASE_TEST_TARGET: 'controller-a', FAKE_RELEASE_EXIT_CODE: '9',
+    } });
+    assert.notEqual(run.code, 0);
+    assert.match(run.stderr, /controller-a exited with status 9/);
+    assert.equal(run.events.at(-1).event, 'failed');
+  } finally {
+    fs.rmSync(fix.root, { recursive: true, force: true });
+  }
+});
+
+test('release cleanup keeps the timeout and TERM to KILL escalation', async () => {
+  const fix = fixture();
+  try {
+    const log = path.join(fix.root, 'release-test.jsonl');
+    const run = await runInteractive(fix, { env: {
+      FAKE_RELEASE_TEST_TARGET: 'controller-a', FAKE_RELEASE_DELAY_MILLISECONDS: '30000',
+      FAKE_IGNORE_TERM: '1', FAKE_RELEASE_TEST_LOG: log,
+    } });
+    assert.notEqual(run.code, 0);
+    assert.match(run.stderr, /controller-a did not exit after release/);
+    assert.equal(run.events.at(-1).event, 'failed');
+    const events = fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.deepEqual(events.map((x) => x.event), ['released', 'term']);
+    assert.equal(events[0].pid, events[1].pid);
+    assert.throws(() => process.kill(events[0].pid, 0), { code: 'ESRCH' });
   } finally {
     fs.rmSync(fix.root, { recursive: true, force: true });
   }

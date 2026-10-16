@@ -33,6 +33,7 @@ Action-oriented UI tools include:
 
 - `click`, `scroll`, `type`, and `press` for the background-safe interaction surface.
 - `set_value` for direct accessibility value mutation on settable fields and controls.
+- `select_text` for literal text selection or caret placement without changing the text value.
 - `action` for invoking a named accessibility action such as `AXPress`, `AXShowMenu`, or `AXIncrement`.
 
 Inventory is exposed on the nouns: use `app` with `action: "list"` for running applications and `window` with
@@ -47,7 +48,7 @@ duplicate `server_status` view are not exposed. `menu` supports only application
 status items use the dedicated menubar surface. MCP retains `sleep` because an MCP client may not have shell access.
 
 Call `see` first and pass actionable element IDs through these tools when possible. Element-targeted calls preserve action-first routing; coordinate calls always use the synthetic path. OCR-only text is semantic evidence, not an element-action target.
-The same action tools are available to CLI users as `peekaboo set-value` and `peekaboo action`.
+The same action tools are available to CLI users as `peekaboo set-value`, `peekaboo select-text`, and `peekaboo action`.
 `set_value` and `action` are exposed only when their resolved input strategy enables action invocation
 (`actionFirst` or `actionOnly`). They are hidden under `synthFirst` or `synthOnly`, because these operations do not
 have a synthetic-input equivalent.
@@ -199,6 +200,17 @@ For an explicit `window_id`, `inspect_ui` rejects an empty Accessibility result 
 metadata, returning `ACCESSIBILITY_INCOMPLETE` in that case. Existing timeout and truncation diagnostics take precedence.
 App and frontmost inspections may still return a successful empty list, even when the host reports the window it inspected.
 
+Both `see` and `inspect_ui` accept `fresh: true` to require a new, uncached Accessibility traversal. The default is
+`false`, preserving normal cache behavior. Cached, unknown, or unacknowledged fresh results are refused before a
+usable snapshot is published. Screenshot-backed `see` requires the additive `desktopObservationFreshAccessibilityTree`
+Bridge capability; update and relaunch older hosts rather than falling back to cached evidence. Freshness is not
+available for pixel-only tools or menu-bar capture, and it does not imply a complete tree or atomic screenshot/AX
+acquisition. Partial observations keep their existing authority restrictions; selection readback remains focused-field-only.
+
+Public `_meta.used_cache` reports `true` for a known AX cache hit and `false` for a known uncached traversal on both
+observation tools. Omission means unknown or not applicable, not a cache miss. For example, call `inspect_ui` with
+`{"app_target":"TextEdit","fresh":true}` for a fresh AX-only read, or add the same `fresh` flag to `see` for pixels too.
+
 `see` also accepts the closed `capture_engine` values `auto` (default), `modern`, and `classic`. The choice is carried
 in that observation request to the selected host; incapable hosts refuse it before capture. `classic` never enters
 ScreenCaptureKit, so it is the safe request-local recovery path when the selected host proves classic but blocks auto/modern
@@ -251,6 +263,12 @@ proven focused text field. Offsets and lengths use UTF-16 code units, not user-p
 means a caret and absence means unknown. This is independent of `is_selected`/`AXSelected` and the `selected`
 verification predicate. Both `see` and `inspect_ui` also include a short `Text selection <id>: UTF-16 location …,
 length …` line in their normal text output when available, including native Agent calls without `include_elements`.
+
+Use `select_text` with `on`, nonempty literal `text`, optional adjacent `prefix`/`suffix`, and
+`selection_type: text|cursor_before|cursor_after` to mutate a selection. It requires a fresh exact-window snapshot
+and a settable native selection, not a writable value or prior field focus. It never focuses, types, or uses the
+clipboard. Missing/ambiguous text refuses; accepted but unverified writes require a new observation before retry.
+See [select-text](commands/select-text.md) for native capability limits and UTF-16 result fields.
 
 This optional probe reads no selected-text content, performs no focus change, and grants no input authority. The
 same native receiver must retain identity, focus, and readable nonsecure metadata across the range read. Cached,
@@ -308,7 +326,7 @@ The `click` and `paste` tools publish flat object schemas without root-level `on
 can forward them to providers such as Anthropic without schema rewriting. Peekaboo enforces cross-field constraints
 at runtime before dispatch; the flat catalog does not relax target, receipt, or foreground-consent requirements.
 
-Snapshot-backed `click`, `action`, `set_value`, `scroll`, `type`, and `press` reserve mutation authority in the snapshot's
+Snapshot-backed `click`, `action`, `set_value`, `select_text`, `scroll`, `type`, and `press` reserve mutation authority in the snapshot's
 producer store before focus or input. Pending or consumed snapshots are refused before dispatch. Outcomes requiring
 fresh observation, missing canonical outcomes, and unknown completion prevent replay; explicit historical reads remain
 available. Confirmed outcomes that do not require fresh observation release the reservation. Modifier-click and
@@ -382,7 +400,11 @@ count, `characters_typed` reports that lower bound. Rich/binary and current-clip
 exact-window capability before clipboard mutation or Cmd+V dispatch, then return the normal retry-unsafe
 may-have-pasted result because macOS does not acknowledge receiver consumption.
 
-Pointer tools use an explicit interruption policy. `scroll` is background-safe only when `on` identifies an Accessibility-scrollable element or a pixel-backed opaque group in a fresh exact-window snapshot of a visible WebKit-linked app. The latter uses PID-routed wheel events, reports an unverifiable retry-unsafe effect, and refuses Electron/Chromium/Catalyst or stale targets instead of falling back to the shared cursor. Set `foreground: true` for targetless, smooth, or delayed scrolling. `move` and `drag` always manipulate the shared physical cursor, require explicit foreground consent, and abort if a requested target cannot be focused. Default background-only MCP and Agent catalogs omit both tools entirely; use their direct CLI commands when foreground interaction is intentional.
+Pointer tools use an explicit interruption policy. Background `scroll` accepts an element `on` or an exact-window `coords` point. Coordinates require a fresh pixel-backed reference and prefer the hit's nearest proven AX scroll owner. Documented unavailable hit testing or verified ancestry without an exposed owner may instead use that independent pixel authority for the existing visible native-WebKit wheel route, retaining the requested point without claiming an AX receiver. Positive ownership conflicts and native lookup failures refuse. Coordinates never search arbitrary descendants or siblings, move the shared cursor, or imply foreground permission. Wheel delivery remains unverifiable and retry-unsafe; Electron/Chromium/Catalyst and stale targets do not gain a new fallback. Set `foreground: true` only for existing element/targetless, smooth, or delayed scrolling—not coordinates.
+
+MCP scroll coordinates match click: global display points by default, with `coordinate_space: "image_pixels"` or `"normalized"` mapped through the delivered image scale and ROI using `coordinate_reference`. A supplied `snapshot` must match the reference. CLI `scroll --at` deliberately defaults to window-relative logical points; `--global` selects the global basis. Coordinate scroll requires protocol 1.43 plus `backgroundCoordinateScroll`; older or capability-missing execution hosts refuse before dispatch.
+
+The default catalog includes `drag` only in its background-safe form: an explicit fresh `snapshot`, two finite endpoints inside its exact window, a linear path, 1–10000 ms duration, and 1–96 samples. Coordinates are global logical points. This separate protocol-1.39 operation retains one held-pointer owner and exact-window lane through cleanup; it never activates, moves the shared cursor, or falls back to foreground. Its `dispatchedUnverified` result counts primer, down, samples, and up (`steps + 3`), retains the target receipt, and is retry-unsafe until independently observed. Cross-window/app drops, modifiers, and human profiles need explicit foreground authority. `move` remains excluded from background-only MCP/Agent catalogs and requires foreground consent.
 
 Background process mutations resolve application selectors through the complete mutation inventory before rewriting them to a generation-pinned PID. Exact case-insensitive names, exact bundle IDs, and explicit PIDs are accepted; fuzzy partial application names are refused before the tool leaf runs. Read-only application/window discovery keeps its fuzzy compatibility behavior.
 

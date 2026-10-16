@@ -219,7 +219,9 @@ run_restart() {
   if (($# > 0)); then
     shift
   fi
-  "${command_args[@]}" "${ROOT_DIR}/scripts/restart-peekaboo.sh" --deployment "$@" >"${case_dir}/stdout"
+  # shellcheck disable=SC2016
+  "${command_args[@]}" /bin/bash -c 'printf "%s\n" "$$" >"$1/installer-pid"; shift; exec "$@"' \
+    fixture "${case_dir}" "${ROOT_DIR}/scripts/restart-peekaboo.sh" --deployment "$@" >"${case_dir}/stdout"
 }
 
 run_dev_restart() {
@@ -649,6 +651,9 @@ if [[ -f "${state_dir}/mutate-staged-native" ]]; then
   printf '%s\n' 'tell application "System Events" to keystroke "x"' \
     >"${candidate}/Contents/Resources/Injected.txt"
 fi
+if [[ -f "${state_dir}/mutate-staged-directory" ]]; then
+  chmod 0500 "${candidate}/Contents"
+fi
 EOF
 
 cat >"${TEMPLATE_BIN}/nm" <<'EOF'
@@ -746,6 +751,10 @@ if [[ -f "${state_dir}/fail-new-open" && "${build_id}" == "new" ]]; then
   exit 71
 fi
 printf '%s\n' "${bundle}" >"${state_dir}/running-path"
+process_start_identity=123456
+[[ ! -f "${state_dir}/health-adjacent-large-start" ]] || process_start_identity=9007199254740993
+[[ ! -f "${state_dir}/current-start" ]] || process_start_identity="$(<"${state_dir}/current-start")"
+printf '%s\n' "$((process_start_identity + 1))" >"${state_dir}/current-start"
 if [[ -f "${state_dir}/transient-new-process" && "${build_id}" == "new" ]]; then
   printf '%s\n' '0' >"${state_dir}/pgrep-count"
 fi
@@ -758,7 +767,88 @@ cat >"${TEMPLATE_BIN}/peekaboo-health" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 state_dir="$(cd "$(dirname "$0")/.." && pwd)"
+process_start_identity=123456
+[[ ! -f "${state_dir}/health-adjacent-large-start" ]] || process_start_identity=9007199254740993
+[[ ! -f "${state_dir}/current-start" ]] || process_start_identity="$(<"${state_dir}/current-start")"
 if [[ "${1:-}" == "app" ]]; then
+  if [[ "${3:-}" == "--help" && "$#" -eq 3 ]]; then
+    case "${2:-}" in
+      launch)
+        [[ ! -f "${state_dir}/legacy-launch-contract" ]] || exit 0
+        printf '%s\n' 'Without --foreground, this command is a read-only exact no-op.' ;;
+      quit)
+        [[ ! -f "${state_dir}/legacy-quit-contract" ]] || exit 0
+        printf '%s\n' '--expected-process-start-identity <identity>' ;;
+      *) exit 72 ;;
+    esac
+    exit 0
+  fi
+  if [[ "${2:-}" == "launch" ]]; then
+    [[ "$#" -eq 5 && "${4:-}" == '--no-remote' && "${5:-}" == '--json' ]] || exit 72
+    [[ -f "${state_dir}/running-path" ]] || exit 71
+    if [[ -f "${state_dir}/recycle-before-path-query" ]]; then
+      cp "${state_dir}/replacement-path" "${state_dir}/running-path"
+      printf '%s\n' 654321 >"${state_dir}/current-start"
+    fi
+    bundle="$(<"${state_dir}/running-path")"
+    [[ "$3" == "${bundle}" ]] || exit 71
+    printf '%s\n' 'verify-path' >>"${state_dir}/events"
+    [[ ! -f "${state_dir}/path-query-failure" ]] || exit 71
+    query_count=0
+    [[ ! -f "${state_dir}/path-query-count" ]] || query_count="$(<"${state_dir}/path-query-count")"
+    query_count=$((query_count + 1))
+    printf '%s\n' "${query_count}" >"${state_dir}/path-query-count"
+    if [[ -f "${state_dir}/recycle-before-stop" && "${query_count}" -ge 2 ]]; then
+      process_start_identity=654321
+      printf '%s\n' "${process_start_identity}" >"${state_dir}/current-start"
+    fi
+    pid=4242
+    [[ ! -f "${state_dir}/path-wrong-pid" ]] || pid=4343
+    [[ ! -f "${state_dir}/path-zero-generation" ]] || process_start_identity=0
+    [[ ! -f "${state_dir}/path-invalid-generation" ]] || process_start_identity=unknown
+    [[ ! -f "${state_dir}/path-missing-generation" ]] || process_start_identity=''
+    outcome=confirmed_no_change
+    [[ ! -f "${state_dir}/path-mutating-outcome" ]] || outcome=confirmed_change
+    printf '{"success":true,"outcome":{"state":"%s","mutation_dispatched":false,"dispatch_state":"none","evidence":"verified_no_change","route":"local"},"data":{"action":"launch","bundle_id":"%s","pid":%s,"process_start_identity_decimal":"%s","new_instance":false}}\n' \
+      "${outcome}" "$(<"${bundle}/.bundle-id")" "${pid}" "${process_start_identity}"
+    if [[ -f "${state_dir}/recycle-after-path-query" ]]; then
+      printf '%s\n' 654321 >"${state_dir}/current-start"
+    fi
+    [[ ! -f "${state_dir}/pgrep-error-on-path-query" ]] || touch "${state_dir}/pgrep-error"
+    exit 0
+  fi
+  if [[ "${2:-}" == "quit" ]]; then
+    [[ "$#" -eq 8 && "$3" == '--pid' && "$4" == 4242 && \
+      "$5" == '--expected-process-start-identity' && "$7" == '--no-remote' && "$8" == '--json' ]] || exit 72
+    printf 'quit:%s:%s\n' "$4" "$6" >>"${state_dir}/events"
+    if [[ -f "${state_dir}/recycle-before-quit" ]]; then
+      process_start_identity=654321
+      printf '%s\n' "${process_start_identity}" >"${state_dir}/current-start"
+    fi
+    [[ "$6" == "${process_start_identity}" ]] || exit 71
+    [[ ! -f "${state_dir}/refuse-stop" ]] || exit 70
+    if [[ -f "${state_dir}/refuse-new-stop" && -f "${state_dir}/running-path" ]]; then
+      running_path="$(<"${state_dir}/running-path")"
+      [[ "$(<"${running_path}/build-id")" != "new" ]] || exit 70
+    fi
+    if [[ -f "${state_dir}/quit-false-success" ]]; then
+      printf '%s\n' '{"success":false}'
+      exit 0
+    fi
+    printf '%s\n' 'stop' >>"${state_dir}/events"
+    if [[ -f "${state_dir}/recycle-after-quit" || -f "${state_dir}/quit-still-running" ]]; then
+      [[ ! -f "${state_dir}/recycle-after-quit" ]] || printf '%s\n' 654321 >"${state_dir}/current-start"
+    else
+      rm -f "${state_dir}/running-path"
+    fi
+    [[ ! -f "${state_dir}/quit-wrong-generation" ]] || process_start_identity=654321
+    printf '{"success":true,"data":{"action":"quit","force":false,"results":[{"success":true,"pid":4242,"process_start_identity_decimal":"%s"}]}}\n' "${process_start_identity}"
+    if [[ -f "${state_dir}/interrupt-during-stop" ]]; then
+      /bin/kill -TERM "$(<"${state_dir}/installer-pid")"
+    fi
+    [[ ! -f "${state_dir}/quit-nonzero-success" ]] || exit 71
+    exit 0
+  fi
   [[ "${2:-}" == "list" && "${3:-}" == "--include-hidden" && \
     "${4:-}" == "--include-background" && "${5:-}" == "--no-remote" && \
     "${6:-}" == "--json" && "$#" -eq 6 ]] || exit 72
@@ -775,11 +865,6 @@ if [[ "${1:-}" == "app" ]]; then
     printf '%s\n' '{"success":true,"data":{"count":0,"apps":[],"schema_capabilities":["processStartIdentityDecimal"]}}'
     exit 0
   fi
-  process_start_identity=123456
-  if [[ -f "${state_dir}/health-start-drift" && "${query_count}" -ge 3 ]]; then
-    process_start_identity=654321
-  fi
-  [[ ! -f "${state_dir}/health-adjacent-large-start" ]] || process_start_identity=9007199254740993
   if [[ -f "${state_dir}/legacy-health-contract" ]]; then
     printf '{"success":true,"data":{"count":1,"apps":[{"name":"Peekaboo","bundle_id":"%s","pid":4242,"process_start_identity":%s,"is_active":false,"is_hidden":false}]}}\n' \
       "${bundle_id}" "${process_start_identity}"
@@ -806,8 +891,8 @@ if [[ "${build_id}" == "old" && ! -f "${state_dir}/modern-restored-host" ]]; the
 fi
 code_hash="$(<"${bundle}/.cdhash")"
 host_pid=4242
-host_process_start_identity=123456
-host_process_start_identity_decimal=123456
+host_process_start_identity="${process_start_identity}"
+host_process_start_identity_decimal="${process_start_identity}"
 capabilities='["backgroundBridgeHost","hostGenerationIdentity","codeSignatureBuildIdentity"]'
 [[ ! -f "${state_dir}/health-wrong-pid" ]] || host_pid=9999
 [[ ! -f "${state_dir}/health-wrong-start" ]] || host_process_start_identity=999999
@@ -831,12 +916,19 @@ printf '{"success":true,"data":{"selected":{"source":"remote","socketPath":"%s",
   "${state_dir}/bridge.sock" "${host_pid}" "${host_process_start_identity}" \
   "${host_process_start_identity_decimal}" "${bundle_id}" \
   "${short_version}" "${bundle_version}" "${code_hash}" "${capabilities}"
+if [[ -f "${state_dir}/health-start-drift" && "${build_id}" == new ]]; then
+  printf '%s\n' 654321 >"${state_dir}/current-start"
+fi
 EOF
 
 cat >"${TEMPLATE_BIN}/pgrep" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 state_dir="$(cd "$(dirname "$0")/.." && pwd)"
+[[ ! -f "${state_dir}/pgrep-error" ]] || exit 2
+if [[ -f "${state_dir}/pgrep-error-after-quit" ]] && grep -q '^quit:' "${state_dir}/events" 2>/dev/null; then
+  exit 3
+fi
 [[ -f "${state_dir}/running-path" ]] || exit 1
 running_path="$(<"${state_dir}/running-path")"
 if [[ -f "${state_dir}/pgrep-count" ]]; then
@@ -857,23 +949,17 @@ case "${1:-}" in
     ;;
 esac
 printf '%s\n' '4242'
+[[ ! -f "${state_dir}/ambiguous-processes" ]] || printf '%s\n' '4343'
 EOF
 
+# Retain a fail-closed baseline override: an older installer must never reach real /bin/kill
+# when this fixture is used for a red comparison with synthetic PIDs.
 cat >"${TEMPLATE_BIN}/kill" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 state_dir="$(cd "$(dirname "$0")/.." && pwd)"
-[[ "${1:-}" == "-TERM" && "${2:-}" == "4242" && "$#" -eq 2 ]] || exit 2
-[[ ! -f "${state_dir}/refuse-stop" ]] || exit 70
-if [[ -f "${state_dir}/refuse-new-stop" && -f "${state_dir}/running-path" ]]; then
-  running_path="$(<"${state_dir}/running-path")"
-  [[ "$(<"${running_path}/build-id")" != "new" ]] || exit 70
-fi
-printf '%s\n' 'stop' >>"${state_dir}/events"
-rm -f "${state_dir}/running-path"
-if [[ -f "${state_dir}/interrupt-during-stop" ]]; then
-  /bin/kill -TERM "${PPID}"
-fi
+printf '%s\n' 'raw-kill-refused' >>"${state_dir}/events"
+exit 79
 EOF
 
 cat >"${TEMPLATE_BIN}/lsof" <<'EOF'
@@ -1321,7 +1407,7 @@ ${launch_target}|old"
 assert_text "${launch_dir}/open-log" "${expected_launch_log}"
 assert_text "${launch_dir}/running-path" "${launch_target}"
 
-# Interruption after TERM but before the stop result is recorded must relaunch the unchanged app.
+# Interruption after a pinned quit but before its result is recorded relaunches the unchanged app.
 stop_interrupt_dir="$(new_case interrupted-during-stop)"
 stop_interrupt_target="${stop_interrupt_dir}/Applications/Peekaboo.app"
 mkdir -p "$(dirname "${stop_interrupt_target}")"
@@ -1339,7 +1425,7 @@ assert_text "${stop_interrupt_dir}/open-log" "${stop_interrupt_target}|old"
 
 # A process is not committed until the explicit GUI Bridge identifies that PID, build, and launch mode.
 for health_case in \
-  fail-health health-wrong-pid health-wrong-start health-start-drift health-adjacent-large-start \
+  fail-health health-wrong-pid health-wrong-start health-adjacent-large-start \
   health-wrong-hash health-missing-capability; do
   health_dir="$(new_case ${health_case}-rollback)"
   health_target="${health_dir}/Applications/Peekaboo.app"
@@ -1357,6 +1443,19 @@ ${health_target}|old"
   [[ ! -e "$(dirname "${health_target}")/.Peekaboo.install.journal" ]] || \
     fail "${health_case} rollback left a completed journal"
 done
+
+# A replacement generation observed after launch must never be adopted for rollback quit.
+drift_dir="$(new_case health-start-drift-rollback-refusal)"
+drift_target="${drift_dir}/Applications/Peekaboo.app"
+make_bundle "${drift_target}" old
+printf '%s\n' "${drift_target}" >"${drift_dir}/running-path"
+touch "${drift_dir}/health-start-drift"
+if run_restart "${drift_dir}"; then
+  fail 'expected candidate-generation drift to refuse rollback termination'
+fi
+assert_text "${drift_target}/build-id" new
+[[ "$(grep -c '^quit:' "${drift_dir}/events")" == 1 ]] || fail 'rollback quit a replacement generation'
+[[ -f "${drift_dir}/Applications/.Peekaboo.install.journal" ]] || fail 'generation drift lost recovery journal'
 
 # A restored PID is not enough: keep recovery durable when the previous generation never owns its Bridge.
 restored_health_dir="$(new_case restored-bridge-readiness-refusal)"
@@ -1534,6 +1633,90 @@ grep -Eq '^Artifact SHA-256: [0-9a-f]{64}$' "${artifact_dir}/stdout" || \
   fail 'exact-source artifact mode did not report its digest'
 grep -Eq '^OK: .*\(SHA-256 [0-9a-f]{64}\)\.$' "${artifact_dir}/stdout" || \
   fail 'exact-source artifact mode did not report the installed digest'
+
+# Reject physical directory access failures before staging or interrupted-install recovery.
+for directory_case in root nested unsearchable unreadable; do
+  directory_dir="$(new_case "source-directory-${directory_case}-refusal")"
+  directory_source="${directory_dir}/Source/Peekaboo.app"
+  directory_target="${directory_dir}/Applications/Peekaboo.app"
+  make_bundle "${directory_source}" artifact
+  make_bundle "${directory_target}" old
+  mkdir -p "${directory_source}/Contents/Resources"
+  printf '%s\n' "${directory_target}" >"${directory_dir}/running-path"
+  inaccessible_directory="${directory_source}/Contents/Resources"
+  directory_mode=0500
+  case "${directory_case}" in
+    root)
+      inaccessible_directory="${directory_source}"
+      directory_recovery="${directory_dir}/Applications/.Peekaboo.install.permission-existing"
+      make_bundle "${directory_recovery}/previous.app" previous
+      write_journal "${directory_dir}/Applications" "${directory_target}" "${directory_recovery}" installed 1 1
+      directory_journal="$(<"${directory_dir}/Applications/.Peekaboo.install.journal")"
+      ;;
+    unsearchable) directory_mode=0600 ;;
+    unreadable) directory_mode=0300 ;;
+  esac
+  chmod "${directory_mode}" "${inaccessible_directory}"
+  directory_exit=0
+  run_restart "${directory_dir}" -- --source-app "${directory_source}" \
+    2>"${directory_dir}/stderr" || directory_exit=$?
+  observed_directory_mode="$(stat -f %Lp "${inaccessible_directory}")"
+  # Restore only this synthetic fixture directory so the harness can clean up even after a failed assertion.
+  chmod u+rwx "${inaccessible_directory}"
+  ((directory_exit != 0)) || fail "${directory_case} directory permissions were accepted"
+  [[ "${observed_directory_mode}" == "${directory_mode#0}" ]] || fail 'source directory permissions were rewritten'
+  grep -Eq 'App directory is not writable and searchable|Could not inspect physical app directory permissions' \
+    "${directory_dir}/stderr" || fail 'directory refusal lacked a permissions diagnosis'
+  assert_text "${directory_target}/build-id" old
+  assert_text "${directory_dir}/running-path" "${directory_target}"
+  [[ ! -f "${directory_dir}/events" ]] || fail 'source directory refusal reached lifecycle, build, signing or moves'
+  [[ ! -f "${directory_dir}/move-count" ]] || fail 'source directory refusal moved an app'
+  if [[ "${directory_case}" == root ]]; then
+    assert_text "${directory_dir}/Applications/.Peekaboo.install.journal" "${directory_journal}"
+    assert_text "${directory_recovery}/previous.app/build-id" previous
+  fi
+done
+
+# Directory access is required; regular resources and executable files do not need write permission.
+readonly_files_dir="$(new_case install-readonly-files)"
+readonly_files_source="${readonly_files_dir}/Source/Peekaboo.app"
+readonly_files_target="${readonly_files_dir}/Applications/Peekaboo.app"
+make_bundle "${readonly_files_source}" readonly-files
+make_bundle "${readonly_files_target}" old
+mkdir -p "${readonly_files_source}/Contents/Resources/Physical"
+printf '%s\n' 'read-only resource' >"${readonly_files_source}/Contents/Resources/Physical/ReadOnly.dat"
+ln -s Physical "${readonly_files_source}/Contents/Resources/Alias"
+chmod 0400 "${readonly_files_source}/Contents/Resources/Physical/ReadOnly.dat"
+chmod 0500 "${readonly_files_source}/Contents/MacOS/Peekaboo"
+printf '%s\n' "${readonly_files_target}" >"${readonly_files_dir}/running-path"
+run_restart "${readonly_files_dir}" -- --source-app "${readonly_files_source}"
+[[ "$(stat -f %Lp "${readonly_files_target}/Contents/Resources/Physical/ReadOnly.dat")" == 400 ]] || \
+  fail 'installer changed read-only resource permissions'
+[[ "$(stat -f %Lp "${readonly_files_target}/Contents/MacOS/Peekaboo")" == 500 ]] || \
+  fail 'installer changed read-only executable permissions'
+[[ "$(readlink "${readonly_files_target}/Contents/Resources/Alias")" == Physical ]] || fail 'directory symlink changed'
+assert_text "${readonly_files_target}/build-id" readonly-files
+
+# Recheck the exact staged copy before stopping the old app, even if copying changes directory modes.
+staged_permissions_dir="$(new_case staged-directory-refusal)"
+staged_permissions_source="${staged_permissions_dir}/Source/Peekaboo.app"
+staged_permissions_target="${staged_permissions_dir}/Applications/Peekaboo.app"
+make_bundle "${staged_permissions_source}" artifact
+make_bundle "${staged_permissions_target}" old
+printf '%s\n' "${staged_permissions_target}" >"${staged_permissions_dir}/running-path"
+touch "${staged_permissions_dir}/mutate-staged-directory"
+staged_permissions_exit=0
+run_restart "${staged_permissions_dir}" -- --source-app "${staged_permissions_source}" \
+  2>"${staged_permissions_dir}/stderr" || staged_permissions_exit=$?
+while IFS= read -r -d '' staged_permissions_copy; do
+  chmod u+w "${staged_permissions_copy}/Contents"
+done < <(find "${staged_permissions_dir}/Applications" -mindepth 2 -maxdepth 2 -type d -name candidate.app -print0)
+((staged_permissions_exit != 0)) || fail 'staged directory access failure was accepted'
+grep -Fq 'App directory is not writable and searchable' "${staged_permissions_dir}/stderr" || \
+  fail 'staged directory refusal lacked a permissions diagnosis'
+assert_text "${staged_permissions_target}/build-id" old
+assert_text "${staged_permissions_dir}/running-path" "${staged_permissions_target}"
+[[ ! -f "${staged_permissions_dir}/events" ]] || fail 'staged directory refusal stopped or moved the old app'
 
 # --no-build can reuse an explicit already-signed build output without touching it.
 no_build_dir="$(new_case no-build-artifact)"
@@ -1781,5 +1964,94 @@ assert_text "${adhoc_target}/build-id" old
 if [[ -f "${adhoc_dir}/open-log" ]] || grep -q '^stop$' "${adhoc_dir}/events"; then
   fail 'ad-hoc refusal stopped or launched the app'
 fi
+
+# Static CLI-contract inspection precedes even interrupted-journal recovery.
+for contract in legacy-launch-contract legacy-quit-contract; do
+  contract_dir="$(new_case "${contract}-journal-refusal")"
+  contract_parent="${contract_dir}/Applications"
+  contract_target="${contract_parent}/Peekaboo.app"
+  contract_root="${contract_parent}/.Peekaboo.install.STALE"
+  mkdir -p "${contract_root}"
+  make_bundle "${contract_target}" old
+  make_bundle "${contract_root}/candidate.app" pending
+  printf '%s\n' "${contract_target}" >"${contract_dir}/running-path"
+  write_journal "${contract_parent}" "${contract_target}" "${contract_root}" staged 1 1
+  touch "${contract_dir}/${contract}"
+  if run_restart "${contract_dir}"; then
+    fail "expected ${contract} to refuse before journal recovery"
+  fi
+  assert_text "${contract_target}/build-id" old
+  [[ -f "${contract_parent}/.Peekaboo.install.journal" ]] || fail 'legacy CLI consumed the journal'
+  [[ ! -e "${contract_dir}/events" ]] || fail 'legacy CLI reached lifecycle or build work'
+done
+
+# Discovery errors and unbound path/generation observations never authorize a stop or rename.
+for refusal in pgrep-error ambiguous-processes path-query-failure path-wrong-pid path-zero-generation \
+  path-invalid-generation path-missing-generation path-mutating-outcome recycle-after-path-query \
+  recycle-before-stop pgrep-error-on-path-query; do
+  refusal_dir="$(new_case "${refusal}-stop-refusal")"
+  refusal_target="${refusal_dir}/Applications/Peekaboo.app"
+  make_bundle "${refusal_target}" old
+  printf '%s\n' "${refusal_target}" >"${refusal_dir}/running-path"
+  touch "${refusal_dir}/${refusal}"
+  if run_restart "${refusal_dir}"; then
+    fail "expected ${refusal} to refuse before stopping"
+  fi
+  assert_text "${refusal_target}/build-id" old
+  if grep -Eq '^(quit:|stop$|open:|move:|raw-kill)' "${refusal_dir}/events"; then
+    fail "${refusal} reached a lifecycle mutation"
+  fi
+done
+
+# Reuse before path verification cannot turn a same-bundle-ID decoy into the stop target.
+reused_dir="$(new_case recycled-pid-before-exact-path-lookup)"
+reused_target="${reused_dir}/Applications/Peekaboo.app"
+reused_decoy="${reused_dir}/Other/Peekaboo.app"
+make_bundle "${reused_target}" old
+make_bundle "${reused_decoy}" unrelated
+printf '%s\n' "${reused_target}" >"${reused_dir}/running-path"
+printf '%s\n' "${reused_decoy}" >"${reused_dir}/replacement-path"
+touch "${reused_dir}/recycle-before-path-query"
+if run_restart "${reused_dir}"; then
+  fail 'expected recycled PID to fail exact bundle-path verification'
+fi
+assert_text "${reused_target}/build-id" old
+assert_text "${reused_decoy}/build-id" unrelated
+assert_text "${reused_dir}/running-path" "${reused_decoy}"
+if grep -Eq '^(quit:|stop$|open:|move:|raw-kill)' "${reused_dir}/events"; then
+  fail 'recycled PID caused an unrelated lifecycle mutation'
+fi
+
+# Failed or uncertain quit receipts are not replayed, including during rollback cleanup.
+for quit_case in recycle-before-quit quit-false-success quit-nonzero-success quit-wrong-generation \
+  quit-still-running recycle-after-quit pgrep-error-after-quit; do
+  quit_dir="$(new_case "${quit_case}-no-replay")"
+  quit_target="${quit_dir}/Applications/Peekaboo.app"
+  make_bundle "${quit_target}" old
+  printf '%s\n' "${quit_target}" >"${quit_dir}/running-path"
+  touch "${quit_dir}/${quit_case}"
+  if run_restart "${quit_dir}"; then
+    fail "expected ${quit_case} to refuse installation"
+  fi
+  assert_text "${quit_target}/build-id" old
+  [[ "$(grep -c '^quit:' "${quit_dir}/events")" == 1 ]] || fail "${quit_case} replayed a quit"
+  if grep -Eq '^(move:|raw-kill)' "${quit_dir}/events"; then
+    fail "${quit_case} reached installation or raw signalling"
+  fi
+  if [[ "${quit_case}" == recycle-before-quit || "${quit_case}" == recycle-after-quit || \
+        "${quit_case}" == quit-still-running || "${quit_case}" == pgrep-error-after-quit ]]; then
+    [[ -f "${quit_dir}/Applications/.Peekaboo.install.journal" ]] || fail "${quit_case} lost recovery"
+  fi
+done
+
+large_dir="$(new_case generation-safe-stop-above-json-number-precision)"
+large_target="${large_dir}/Applications/Peekaboo.app"
+make_bundle "${large_target}" old
+printf '%s\n' "${large_target}" >"${large_dir}/running-path"
+printf '%s\n' 9007199254740993 >"${large_dir}/current-start"
+run_restart "${large_dir}"
+assert_text "${large_target}/build-id" new
+grep -Fxq 'quit:4242:9007199254740993' "${large_dir}/events" || fail 'quit generation lost decimal precision'
+[[ "$(grep -c '^quit:' "${large_dir}/events")" == 1 ]] || fail 'successful install quit more than its pinned predecessor'
 
 FIXTURE_COMPLETE=1

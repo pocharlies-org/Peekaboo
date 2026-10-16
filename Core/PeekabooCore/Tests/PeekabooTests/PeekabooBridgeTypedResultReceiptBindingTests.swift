@@ -184,9 +184,7 @@ struct PeekabooBridgeTypedResultReceiptBindingTests {
             capturedBounds: fixture.windowIdentity.capturedBounds)
         let contradictorySelectors = [
             WindowContext(applicationName: "Other", windowID: fixture.windowIdentity.windowID),
-            WindowContext(
-                applicationName: "/Applications/Other.app",
-                windowID: fixture.windowIdentity.windowID),
+            WindowContext(applicationName: "/Applications/Other.app", windowID: fixture.windowIdentity.windowID),
             WindowContext(
                 applicationName: "/Applications/Fixture.app/Contents/MacOS/other",
                 windowID: fixture.windowIdentity.windowID),
@@ -195,6 +193,7 @@ struct PeekabooBridgeTypedResultReceiptBindingTests {
                 applicationProcessId: fixture.windowIdentity.ownerProcessIdentifier + 1,
                 windowID: fixture.windowIdentity.windowID),
             WindowContext(windowTitle: "Other", windowID: fixture.windowIdentity.windowID),
+            WindowContext(windowTitle: "", windowID: fixture.windowIdentity.windowID),
             WindowContext(windowID: fixture.windowIdentity.windowID + 1),
             WindowContext(
                 windowID: fixture.windowIdentity.windowID,
@@ -613,6 +612,37 @@ struct PeekabooBridgeTypedResultReceiptBindingTests {
 
 extension PeekabooBridgeTypedResultReceiptBindingTests {
     @Test
+    func `accessibility prefix units stay separate from requested key counts`() throws {
+        typealias Mechanism = DesktopActionOutcome.Delivery.Mechanism
+        for prefixUnits in 0...1 {
+            let rule = PeekabooBridgeOperationResultSemantics.TypeActionResultRule(
+                actions: [.key(.return)],
+                additionalAccessibilityUnits: prefixUnits)
+            #expect(rule.dispatchUnits == .exact(1 + prefixUnits))
+            for units in 1...3 {
+                for mechanism in [Mechanism.windowTargetedEvents, .accessibilityValue, .composite] {
+                    let outcome = try DesktopActionOutcome.dispatchedUnverified(
+                        delivery: .init(mechanism: mechanism, mode: .background),
+                        evidence: .deliveryAccepted,
+                        unitCount: #require(DesktopActionOutcome.DispatchUnitCount(units)))
+                    let expectedMechanism: Mechanism = prefixUnits == 0 ? .windowTargetedEvents : .composite
+                    let expected = units == 1 + prefixUnits && mechanism == expectedMechanism
+                    for specialKeyPresses: Int? in [nil, 1] {
+                        #expect(rule.accepts(
+                            keyPresses: 1,
+                            specialKeyPresses: specialKeyPresses,
+                            outcome: outcome) == expected)
+                        #expect(!rule.accepts(
+                            keyPresses: 2,
+                            specialKeyPresses: specialKeyPresses,
+                            outcome: outcome))
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     func `bounded dispatch ranges preserve enumerated count semantics`() {
         typealias Units = PeekabooBridgeOperationResultSemantics.UnitPolicy
         let counts: [DesktopActionOutcome.DispatchUnitCount?] = [nil] +
@@ -644,7 +674,7 @@ extension PeekabooBridgeTypedResultReceiptBindingTests {
         let rule = PeekabooBridgeOperationResultSemantics.TypeActionResultRule(
             actions: Array(repeating: .clear, count: 10000),
             allowsAccessibilityValueDelivery: true)
-        #expect(rule.dispatchUnits == .range(10000...20000))
+        #expect(rule.dispatchUnits == .range(0...20000))
     }
 
     @Test
@@ -662,9 +692,15 @@ extension PeekabooBridgeTypedResultReceiptBindingTests {
             expectedFocusedElement: nil))
         let request = PeekabooBridgeRequest.projectedAction(.init(request: rawRequest))
         let plan = PeekabooBridgeOperationResultSemantics.semanticPlan(for: request)
-        #expect(plan.typedResponseRule.typeActionDispatchUnits == .range(3...5))
+        #expect(plan.typedResponseRule.typeActionDispatchUnits == .range(1...5))
 
         let valid: [(TypeResult, Int, DesktopActionOutcome.Delivery.Mechanism)] = [
+            (.init(totalCharacters: 1, keyPresses: 0, specialKeyPresses: 0), 1, .accessibilityValue),
+            (.init(totalCharacters: 1, keyPresses: 1, specialKeyPresses: 0), 1, .windowTargetedEvents),
+            (.init(totalCharacters: 1, keyPresses: 0, specialKeyPresses: 0), 2, .accessibilityValue),
+            (.init(totalCharacters: 1, keyPresses: 1, specialKeyPresses: 0), 2, .composite),
+            (.init(totalCharacters: 1, keyPresses: 3, specialKeyPresses: 2), 3, .windowTargetedEvents),
+            (.init(totalCharacters: 1, keyPresses: 2, specialKeyPresses: 2), 3, .composite),
             (.init(totalCharacters: 1, keyPresses: 5, specialKeyPresses: 4), 5, .windowTargetedEvents),
             (.init(totalCharacters: 1, keyPresses: 4, specialKeyPresses: 4), 5, .composite),
             (.init(totalCharacters: 1, keyPresses: 3, specialKeyPresses: 2), 4, .composite),
@@ -779,11 +815,13 @@ extension PeekabooBridgeTypedResultReceiptBindingTests {
         }
     }
 
-    @Test
-    func `signed exact deletion admits truthful zero dispatch`() async throws {
+    @Test(arguments: [
+        [TypeAction.key(.delete)], [.key(.forwardDelete)], [.key(.leftArrow)], [.key(.rightArrow)],
+        [.key(.home)], [.key(.end)], [.clear], [.clear, .clear],
+    ])
+    func `signed exact no-op edits admit truthful zero dispatch`(_ actions: [TypeAction]) async throws {
         let fixture = try await Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
-        let actions: [TypeAction] = [.key(.delete)]
         let bounds = try #require(fixture.windowIdentity.capturedBounds)
         let rawRequest = PeekabooBridgeRequest.exactWindowTargetedTypeActions(.init(
             actions: actions,
@@ -794,7 +832,13 @@ extension PeekabooBridgeTypedResultReceiptBindingTests {
             expectedFocusedElement: nil))
         let request = PeekabooBridgeRequest.projectedAction(.init(request: rawRequest))
         let plan = PeekabooBridgeOperationResultSemantics.semanticPlan(for: request)
-        #expect(plan.typedResponseRule.typeActionDispatchUnits == .range(0...1))
+        let maximumUnits = actions.reduce(0) { total, action in
+            if case .clear = action {
+                return total + 2
+            }
+            return total + 1
+        }
+        #expect(plan.typedResponseRule.typeActionDispatchUnits == .range(0...maximumUnits))
 
         let response = Self.typeResponse(
             result: .init(totalCharacters: 0, keyPresses: 0, specialKeyPresses: 0),

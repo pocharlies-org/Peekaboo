@@ -1,13 +1,13 @@
 import Darwin
 import Foundation
 import PeekabooAutomationKit
-import PeekabooBridge
 import Testing
+@testable import PeekabooBridge
 @testable import PeekabooCLI
 
 struct DaemonLaunchPolicyTests {
     @Test
-    func `daemon readiness reserves both ScreenCaptureKit preparation boundaries`() {
+    func `daemon launch reserves the single ScreenCaptureKit publication boundary`() {
         #expect(
             PeekabooBridgeServer.defaultScreenCaptureKitOwnershipPreparationTimeoutSeconds >=
                 ScreenCaptureKitOwnerLease.defaultProcessCapabilityPreparationTimeoutSeconds + 1
@@ -137,14 +137,84 @@ struct DaemonLaunchPolicyTests {
             )
             Issue.record("Expected daemon readiness to time out")
         } catch let error as DaemonLaunchPolicy.DaemonLaunchError {
-            guard case let .timedOut(timeout, logURL) = error else {
+            guard case let .timedOut(timeout, elapsed, lastProbeError, logURL) = error else {
                 Issue.record("Expected a readiness timeout, got \(error)")
                 return
             }
             #expect(timeout == 0.05)
+            #expect(elapsed >= timeout)
+            // The shared budget can expire while a missing-socket probe waits for the executor.
+            if let lastProbeError {
+                #expect(lastProbeError == "Daemon readiness probe exceeded the remaining startup budget")
+            }
+            #expect(error.localizedDescription.contains("last probe:"))
             #expect(error.localizedDescription.contains(logURL.path))
         } catch {
             Issue.record("Unexpected daemon launch error: \(error)")
+        }
+    }
+
+    @Test(arguments: [PeekabooBridgeErrorCode.unauthorizedClient, .operationNotSupported])
+    func `readiness surfaces permanent probe failure and cleans up owned child`(
+        code: PeekabooBridgeErrorCode
+    ) async throws {
+        var expected = PeekabooBridgeErrorEnvelope(code: code, message: "synthetic trust or protocol failure")
+        expected.isLocalHostAuthenticationFailure = code == .unauthorizedClient
+        let pidURL = FileManager.default.temporaryDirectory.appendingPathComponent("pb-probe-\(UUID()).pid")
+        defer {
+            try? FileManager.default.removeItem(at: pidURL)
+            try? FileManager.default.removeItem(atPath: pidURL.path + ".tmp")
+        }
+        do {
+            _ = try await DaemonLaunchPolicy.launchDaemon(
+                socketPath: "/tmp/peekaboo-readiness-\(UUID().uuidString).sock",
+                arguments: ["-c", "\(Self.writePIDCommand(to: pidURL)); exec /bin/sleep 30"],
+                timeout: 2,
+                executableURL: URL(fileURLWithPath: "/bin/sh"),
+                logHandle: .nullDevice,
+                probe: { _ in
+                    _ = try await Self.waitForPID(at: pidURL)
+                    throw expected
+                }
+            )
+            Issue.record("Expected the original probe error")
+        } catch let error as PeekabooBridgeErrorEnvelope {
+            #expect(error.code == expected.code)
+            #expect(error.message == expected.message)
+            #expect(error.isLocalHostAuthenticationFailure == expected.isLocalHostAuthenticationFailure)
+        }
+        let stoppedPID = try #require(try await Self.waitForPID(at: pidURL))
+        #expect(kill(stoppedPID, 0) == -1)
+        #expect(errno == ESRCH)
+    }
+
+    @Test
+    func `readiness timeout includes the last transient probe failure`() async throws {
+        var observedTransientFailure = false
+        do {
+            _ = try await DaemonLaunchPolicy.launchDaemon(
+                socketPath: "/tmp/peekaboo-readiness-\(UUID().uuidString).sock",
+                arguments: ["30"],
+                timeout: 2,
+                executableURL: URL(fileURLWithPath: "/bin/sleep"),
+                logHandle: .nullDevice,
+                probe: { _ in
+                    observedTransientFailure = true
+                    throw POSIXError(.ECONNRESET)
+                }
+            )
+            Issue.record("Expected a readiness timeout")
+        } catch let error as DaemonLaunchPolicy.DaemonLaunchError {
+            guard case let .timedOut(timeout, elapsed, lastProbeError, _) = error else {
+                Issue.record("Expected timeout, got \(error)")
+                return
+            }
+            #expect(elapsed >= timeout)
+            #expect(observedTransientFailure)
+            // A later shared-budget expiry is itself the last observed probe failure.
+            #expect(lastProbeError == POSIXError(.ECONNRESET).localizedDescription ||
+                lastProbeError == "Daemon readiness probe exceeded the remaining startup budget")
+            #expect(error.localizedDescription.contains("elapsed"))
         }
     }
 

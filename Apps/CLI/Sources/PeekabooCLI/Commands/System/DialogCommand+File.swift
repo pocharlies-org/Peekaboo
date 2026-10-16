@@ -42,11 +42,20 @@ extension DialogCommand {
             let name = self.name
             let select = self.select
             let ensureExpanded = self.ensureExpanded
+            let dialogTarget = try self.target.dialogTargetSelector()
+            let fileFocus = DialogForegroundFocusPolicy(
+                autoFocus: self.focusOptions.autoFocus,
+                timeout: self.focusOptions.focusTimeout ?? 5,
+                retryCount: self.focusOptions.focusRetryCount ?? 3,
+                switchSpace: self.focusOptions.spaceSwitch,
+                bringToCurrentSpace: self.focusOptions.bringToCurrentSpace
+            )
             try await DialogCommand.execute(
                 runtime: runtime,
                 target: self.target,
-                focus: .required(self.focusOptions),
+                focus: dialogTarget.hasTarget ? .none : .required(self.focusOptions),
                 resolveWindowTitle: false,
+                resolveAppHint: !dialogTarget.hasTarget,
                 handlesPeekabooError: true,
                 validate: {
                     guard self.foreground else {
@@ -61,7 +70,17 @@ extension DialogCommand {
                         operationName: "dialog file",
                         desktopMutationWatermarkStore: DesktopMutationWatermarkStore()
                     ) {
-                        try await context.services.dialogs.handleFileDialog(
+                        if context.target.hasTarget {
+                            return try await context.services.dialogs.handleFileDialog(DialogFileExecutionRequest(
+                                target: context.target,
+                                path: path,
+                                filename: name,
+                                actionButton: select,
+                                ensureExpanded: ensureExpanded,
+                                focus: fileFocus
+                            ))
+                        }
+                        return try await context.services.dialogs.handleFileDialog(
                             path: path,
                             filename: name,
                             actionButton: select,
@@ -69,15 +88,33 @@ extension DialogCommand {
                             appName: context.appHint
                         )
                     }
-                    let outcome = result.foregroundOutcomeOrUnverified(
-                        route: context.services.dialogs.foregroundOutcomeRoute
-                    )
+                    let outcome: DesktopActionOutcome
+                    if context.target.hasTarget {
+                        guard result.success, result.action == .handleFileDialog, let reported = result.outcome else {
+                            throw DesktopActionFailure.indeterminate(
+                                route: context.services.dialogs.foregroundOutcomeRoute,
+                                evidence: .completionUnknown,
+                                message: "Exact file execution returned without its canonical result.",
+                                hint: "Observe the exact file dialog before retrying."
+                            ).attributed(
+                                to: result.targetReceipt
+                            )
+                        }
+                        outcome = reported.routed(to: context.services.dialogs.foregroundOutcomeRoute)
+                    } else {
+                        outcome = result.foregroundOutcomeOrUnverified(
+                            route: context.services.dialogs.foregroundOutcomeRoute
+                        )
+                    }
                     let targetIdentity: DesktopTargetIdentity?
                     do {
                         targetIdentity = try DialogCommand.exactResultTargetIdentity(
                             from: result,
                             matching: context.target
                         )
+                        guard !context.target.hasTarget || targetIdentity != nil else {
+                            throw DesktopTargetIdentityError.incompleteExactWindow
+                        }
                     } catch {
                         // The service already returned from the foreground leaf. Preserve that
                         // dispatch while refusing to project setup focus as the file-panel target.

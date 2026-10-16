@@ -95,6 +95,10 @@ public enum ErrorStandardizer {
             return standardized
         }
 
+        if error is CancellationError {
+            return CancelledOperationError()
+        }
+
         // Convert known error types
         switch error {
         case let peekabooError as PeekabooError:
@@ -107,6 +111,10 @@ public enum ErrorStandardizer {
     }
 
     private static func standardizeNSError(_ error: NSError) -> any StandardizedError {
+        if error.domain == NSURLErrorDomain, error.code == NSURLErrorCancelled {
+            return CancelledOperationError()
+        }
+
         // Handle common Cocoa errors
         switch error.domain {
         case NSCocoaErrorDomain:
@@ -122,17 +130,23 @@ public enum ErrorStandardizer {
     }
 }
 
+private struct CancelledOperationError: StandardizedError {
+    let code: StandardErrorCode = .cancelled
+    let userMessage = "Operation cancelled"
+    let context: [String: String] = [:]
+}
+
 // MARK: - Error Recovery Suggestions
 
 extension StandardizedError {
     public nonisolated var recoverySuggestion: String? {
         switch code {
         case .screenRecordingPermissionDenied:
-            "Grant Screen Recording permission in System Settings"
+            "Grant Screen Recording permission in \(PermissionSettingsGuidance.path(for: .screenRecording))"
         case .accessibilityPermissionDenied:
-            "Grant Accessibility permission in System Settings"
+            "Grant Accessibility permission in \(PermissionSettingsGuidance.path(for: .accessibility))"
         case .eventSynthesizingPermissionDenied:
-            "Grant event-synthesizing access in System Settings > Privacy & Security > Accessibility"
+            "Grant event-synthesizing access in \(PermissionSettingsGuidance.path(for: .eventSynthesizing))"
         case .applicationNotFound:
             "Ensure the application is installed and running"
         case .windowNotFound:

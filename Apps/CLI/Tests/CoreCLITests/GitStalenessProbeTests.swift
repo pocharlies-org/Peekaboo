@@ -9,18 +9,26 @@ struct GitStalenessProbeTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: root) }
-        _ = try #require(runGitStalenessProbe(arguments: ["init", "-q"], directory: root))
+        // Fixture git calls get room under CPU contention; an undrained pipe still deadlocks until this deadline.
+        let fixtureTimeout: TimeInterval = 60
+        _ = try #require(runGitStalenessProbe(
+            arguments: ["init", "-q"],
+            directory: root,
+            timeoutSeconds: fixtureTimeout
+        ))
         let paths = (0..<1500).map {
             root.appendingPathComponent("tracked-\($0)-" + String(repeating: "x", count: 80))
         }
         for path in paths {
             try Data("before".utf8).write(to: path)
         }
-        _ = try #require(runGitStalenessProbe(arguments: ["add", "."], directory: root))
+        _ = try #require(runGitStalenessProbe(arguments: ["add", "."], directory: root, timeoutSeconds: fixtureTimeout))
         for path in paths {
             try Data("after".utf8).write(to: path)
         }
-        let output = try #require(runGitStalenessProbe(arguments: ["status", "--porcelain=1"], directory: root))
+        let output = try #require(runGitStalenessProbe(
+            arguments: ["status", "--porcelain=1"], directory: root, timeoutSeconds: fixtureTimeout
+        ))
         #expect(output.count > 65536)
         let lines = try #require(String(data: output, encoding: .utf8)).split(separator: "\n")
         #expect(lines.count == paths.count)

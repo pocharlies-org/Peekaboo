@@ -121,13 +121,17 @@ extension RuntimeHostResolver {
     struct RemoteCandidateEvaluation {
         let validation: RemoteCandidateValidation?
         let rejection: RemoteCandidateRejection?
+        let requirementFailure: BridgeCapabilityPolicy.RemoteRequirementFailure?
 
         static func accepted(_ validation: RemoteCandidateValidation) -> Self {
-            Self(validation: validation, rejection: nil)
+            Self(validation: validation, rejection: nil, requirementFailure: nil)
         }
 
-        static func rejected(_ rejection: RemoteCandidateRejection) -> Self {
-            Self(validation: nil, rejection: rejection)
+        static func rejected(
+            _ rejection: RemoteCandidateRejection,
+            requirementFailure: BridgeCapabilityPolicy.RemoteRequirementFailure? = nil
+        ) -> Self {
+            Self(validation: nil, rejection: rejection, requirementFailure: requirementFailure)
         }
     }
 
@@ -154,6 +158,24 @@ extension RuntimeHostResolver {
 }
 
 extension RuntimeHostResolver {
+    /// Unknown grants and opposing grants preserve daemon-first ordering.
+    static func daemonIsProvablyWeaker(
+        _ daemon: PeekabooBridgeHandshakeResponse,
+        than gui: PeekabooBridgeHandshakeResponse
+    ) -> Bool {
+        guard daemon.hostKind == .onDemand, gui.hostKind == .gui,
+              let daemonPermissions = daemon.permissions, let guiPermissions = gui.permissions
+        else { return false }
+        var grants = [
+            (daemonPermissions.screenRecording, guiPermissions.screenRecording),
+            (daemonPermissions.accessibility, guiPermissions.accessibility),
+        ]
+        if daemonPermissions.reportsPostEvent, guiPermissions.reportsPostEvent {
+            grants.append((daemonPermissions.postEvent, guiPermissions.postEvent))
+        }
+        return grants.contains { !$0.0 && $0.1 } && !grants.contains { $0.0 && !$0.1 }
+    }
+
     static func evaluateRemoteCandidate(
         _ candidate: ImplicitRemoteCandidate,
         handshake: PeekabooBridgeHandshakeResponse,
@@ -177,8 +199,8 @@ extension RuntimeHostResolver {
         guard missingPermissions.isEmpty else {
             return .rejected(.missingPermissions(missingPermissions))
         }
-        guard BridgeCapabilityPolicy.supportsRemoteRequirements(for: handshake, options: options) else {
-            return .rejected(.requirementsNotMet)
+        if let failure = BridgeCapabilityPolicy.firstUnmetRemoteRequirement(for: handshake, options: options) {
+            return .rejected(.requirementsNotMet, requirementFailure: failure)
         }
 
         let requiresReusableHost = candidate.requireReusableDaemon ||
