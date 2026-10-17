@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import PeekabooAutomationKit
 import PeekabooFoundation
 import TachikomaMCP
 
@@ -43,7 +44,10 @@ enum MCPToolResponseMetadataProjector {
         "target_receipt",
     ])
 
+    private static let clipboardCleanupStatusKey = "clipboard_cleanup_status"
+
     private static let providerReservedKeys = Self.safetyKeys.union([
+        Self.clipboardCleanupStatusKey,
         "turn_boundary",
     ])
 
@@ -87,6 +91,13 @@ enum MCPToolResponseMetadataProjector {
         "snapshot_id",
     ]
 
+    private static let textSelectionKeys: Set<String> = [
+        "matched_text_range",
+        "selected_text_range",
+        "selection_type",
+        "target",
+    ]
+
     static func externalFields(from value: Value?, toolName: String?) -> [String: Value] {
         guard case let .object(fields)? = value else { return [:] }
         var allowed = Self.safetyKeys
@@ -101,6 +112,9 @@ enum MCPToolResponseMetadataProjector {
         if toolName == "clipboard" {
             allowed.insert("clipboard_access")
         }
+        if toolName == "select_text" {
+            allowed.formUnion(Self.textSelectionKeys)
+        }
         if toolName == "see" || toolName == "inspect_ui" {
             allowed.insert("focused_element")
             // The opt-in element table (`include_elements`) is observation data, not an action outcome or
@@ -114,7 +128,14 @@ enum MCPToolResponseMetadataProjector {
         if toolName == "agent" {
             allowed.insert("recordedOutcomeNotice")
         }
-        return fields.filter { allowed.contains($0.key) }
+        var projected = fields.filter { allowed.contains($0.key) }
+        if toolName == "see" || toolName == "inspect_ui", case let .bool(usedCache)? = fields["used_cache"] {
+            projected["used_cache"] = .bool(usedCache)
+        }
+        if toolName == "paste" {
+            projected[Self.clipboardCleanupStatusKey] = self.clipboardCleanupStatus(from: fields)
+        }
+        return projected
     }
 
     static func agentFields(from value: Value?) -> [String: Value] {
@@ -122,7 +143,19 @@ enum MCPToolResponseMetadataProjector {
         let allowed = Self.safetyKeys
             .union(Self.captureErrorKeys)
             .union(Self.permissionKeys)
-        return fields.filter { allowed.contains($0.key) }
+        var projected = fields.filter { allowed.contains($0.key) }
+        projected[Self.clipboardCleanupStatusKey] = self.clipboardCleanupStatus(from: fields)
+        return projected
+    }
+
+    private static func clipboardCleanupStatus(from fields: [String: Value]) -> Value? {
+        guard case let .string(rawValue)? = fields[clipboardCleanupStatusKey],
+              let cleanup = ClipboardTemporaryCleanupStatus(rawValue: rawValue)
+        else { return nil }
+        switch cleanup {
+        case .restored, .preservedNewerContents, .notNeeded:
+            return .string(cleanup.rawValue)
+        }
     }
 
     /// Keeps untrusted provider diagnostics available without allowing them to assert

@@ -274,6 +274,7 @@ extension PeekabooBridgeClient {
     public func scrollWithOutcome(
         _ request: ScrollRequest) async throws -> UIAutomationActionResult<Void>
     {
+        try request.validatePointSelector()
         let payload = PeekabooBridgeScrollRequest(request: request)
         let requiresAttestedTarget = !request.foreground
         return try await self.actionResult(
@@ -370,6 +371,31 @@ extension PeekabooBridgeClient {
             expectedResponse: "focused exact-window hotkey")
     }
 
+    public func hotkeyWithOutcome(
+        keys: String,
+        holdDuration: Int,
+        target: UIAutomationTarget.ExactWindow,
+        clipboardClaim: GeneralPasteboardWriteClaim,
+        preparation: BackgroundWindowKeyboardPreparationMode? = nil) async throws -> UIAutomationActionResult<Void>
+    {
+        try await self.actionResult(
+            for: .exactWindowTargetedHotkey(.init(
+                keys: keys,
+                holdDuration: holdDuration,
+                expectedWindowIdentity: target.identity,
+                expectedWindowBounds: target.bounds,
+                expectedFocusedElement: target.focusedElement,
+                clipboardClaim: clipboardClaim,
+                backgroundPreparation: preparation)),
+            expectedResponse: "clipboard-guarded exact-window paste",
+            requiresTargetIdentity: true,
+            operationReceiptRequirement: .required)
+        { response in
+            guard case .ok = response else { return nil }
+            return ()
+        }
+    }
+
     public func setValueWithOutcome(
         target: String,
         value: UIElementValue,
@@ -384,6 +410,33 @@ extension PeekabooBridgeClient {
             guard case let .elementActionResult(result) = response else { return nil }
             return result
         }
+    }
+
+    public func selectText(
+        target: String,
+        request: TextSelectionRequest,
+        snapshotId: String?) async throws -> UIAutomationActionResult<ElementActionResult>
+    {
+        let result: UIAutomationActionResult<ElementActionResult> = try await self.actionResult(
+            for: .selectText(.init(target: target, request: request, snapshotId: snapshotId)),
+            expectedResponse: "selectText",
+            requiresTargetIdentity: true,
+            operationReceiptRequirement: .required)
+        { response in
+            guard case let .elementActionResult(result) = response else { return nil }
+            return result
+        }
+        guard result.targetIdentity?.exactWindow != nil else {
+            throw DesktopActionFailure.indeterminate(
+                route: .bridge,
+                delivery: result.outcome?.delivery,
+                evidence: .completionUnknown,
+                unitCount: result.outcome?.dispatchState.unitCount ?? .one,
+                message: "The selection host returned no exact-window target receipt.",
+                hint: "Observe the target before retrying.")
+                .attributed(to: result.targetIdentity?.actionTargetReceipt)
+        }
+        return result
     }
 
     public func performActionWithOutcome(

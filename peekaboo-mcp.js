@@ -14,21 +14,33 @@ const MAX_RESTARTS = 5;
 const RESTART_WINDOW_MS = 60_000;
 const INITIAL_DELAY_MS = 1000;
 const MAX_DELAY_MS = 30_000;
+const SHUTDOWN_TIMEOUT_MS = 5000;
 
 export class PeekabooMCPWrapper {
   constructor(options = {}) {
     this.binaryPath = options.binaryPath || defaultBinaryPath;
-    this.initialDelayMs = options.initialDelayMs || INITIAL_DELAY_MS;
-    this.maxDelayMs = options.maxDelayMs || MAX_DELAY_MS;
+    this.initialDelayMs = options.initialDelayMs ?? INITIAL_DELAY_MS;
+    this.maxDelayMs = options.maxDelayMs ?? MAX_DELAY_MS;
+    this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? SHUTDOWN_TIMEOUT_MS;
+    for (const [name, value] of Object.entries({
+      initialDelayMs: this.initialDelayMs,
+      maxDelayMs: this.maxDelayMs,
+      shutdownTimeoutMs: this.shutdownTimeoutMs
+    })) {
+      if (!Number.isFinite(value) || value < 0 || value > 2_147_483_647) {
+        throw new RangeError(`${name} must be a finite nonnegative timer duration`);
+      }
+    }
     this.restartTimestamps = [];
     this.delay = this.initialDelayMs;
     this.child = null;
     this.restartTimer = null;
+    this.shutdownTimer = null;
     this.shuttingDown = false;
   }
 
   start() {
-    if (this.shuttingDown) return;
+    if (this.shuttingDown || this.child || this.restartTimer) return;
 
     if (!existsSync(this.binaryPath)) {
       console.error(`[Peekaboo MCP] Binary not found at ${this.binaryPath}`);
@@ -52,8 +64,9 @@ export class PeekabooMCPWrapper {
     });
 
     this.child.on('exit', (code, signal) => {
+      this.clearShutdownTimer();
       this.child = null;
-      if (this.shuttingDown) return process.exit(code || 0);
+      if (this.shuttingDown) return process.exit(code || process.exitCode || 0);
 
       if (code === 0 || signal === 'SIGINT' || signal === 'SIGTERM') {
         console.error('[Peekaboo MCP] Server exited cleanly');
@@ -64,6 +77,7 @@ export class PeekabooMCPWrapper {
     });
 
     this.child.on('error', (err) => {
+      this.clearShutdownTimer();
       this.child = null;
       console.error('[Peekaboo MCP] Failed to launch:', err.message);
       if (err.code === 'EACCES') {
@@ -96,10 +110,23 @@ export class PeekabooMCPWrapper {
   }
 
   shutdown() {
+    if (this.shuttingDown) return;
     this.shuttingDown = true;
     this.clearRestartTimer();
     if (this.child && !this.child.killed) {
-      this.child.kill('SIGTERM');
+      const child = this.child;
+      child.kill('SIGTERM');
+      this.shutdownTimer = setTimeout(() => {
+        this.shutdownTimer = null;
+        if (this.child === child) child.kill('SIGKILL');
+      }, this.shutdownTimeoutMs);
+    }
+  }
+
+  clearShutdownTimer() {
+    if (this.shutdownTimer) {
+      clearTimeout(this.shutdownTimer);
+      this.shutdownTimer = null;
     }
   }
 
@@ -127,20 +154,38 @@ if (isMainModule()) {
 
   process.on('uncaughtException', (err) => {
     console.error('[Peekaboo MCP] Uncaught exception:', err);
+    process.exitCode = 1;
     wrapper.shutdown();
+    if (!wrapper.child) process.exit(1);
   });
 
   process.on('unhandledRejection', (reason) => {
     console.error('[Peekaboo MCP] Unhandled rejection:', reason);
+    process.exitCode = 1;
+    wrapper.shutdown();
+    if (!wrapper.child) process.exit(1);
   });
 }
 
 function isMainModule() {
   const entry = process.argv[1];
-  if (entry === undefined) return false;
+  if (entry === undefined || entry === '-') return false;
+
+  // Eval arguments can name this file without making it the entrypoint. Keep Node 22.0 compatibility.
+  if (process.execArgv.some(argument =>
+    argument === '-e' || argument === '--eval' || argument.startsWith('--eval=') ||
+    argument === '-p' || argument === '--print' || argument.startsWith('--print=') || argument === '-pe')) {
+    return false;
+  }
 
   const entryUrl = pathToFileURL(entry).href;
   if (import.meta.url === entryUrl) return true;
 
-  return pathToFileURL(realpathSync(modulePath)).href === pathToFileURL(realpathSync(entry)).href;
+  try {
+    return pathToFileURL(modulePath).href === pathToFileURL(realpathSync(entry)).href;
+  } catch (error) {
+    // Eval and stdin consumers can have a program argument here instead of a script.
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return false;
+    throw error;
+  }
 }

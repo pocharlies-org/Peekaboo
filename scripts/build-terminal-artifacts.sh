@@ -92,6 +92,7 @@ COMMAND="${1:-}"
 [[ -z "$COMMAND" ]] || shift
 STAGE_DIR=""
 OUTPUT_DIR=""
+NOTARY_TRANSPORT=auto
 
 builtin unset owned_op_service_token_file owned_molty_op_service_token_file 2>/dev/null || builtin exit 1
 owned_op_service_token_file=""
@@ -169,6 +170,7 @@ Commands:
 Options:
   --stage PATH   New or existing source-addressed stage.
   --output PATH  New final artifact directory for publish/all.
+  --notary-transport auto|notarytool|api  API-key transport for all (default: auto).
 
 Notary submission is deliberately owned only by notarize-terminal-artifact.sh.
 This workflow never tags, uploads, edits appcast.xml, or publishes npm.
@@ -183,10 +185,13 @@ while (($# > 0)); do
   case "$1" in
     --stage) STAGE_DIR="$2"; shift 2 ;;
     --output) OUTPUT_DIR="$2"; shift 2 ;;
+    --notary-transport) NOTARY_TRANSPORT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; fail "unknown argument: $1" ;;
   esac
 done
+[[ "$NOTARY_TRANSPORT" == auto || "$NOTARY_TRANSPORT" == notarytool || "$NOTARY_TRANSPORT" == api ]] || \
+  fail 'invalid --notary-transport'
 case "$COMMAND" in
   build|sign-code|build-dmg|sign-dmg|publish|check-helper|all) ;;
   *) usage >&2; fail 'invalid command' ;;
@@ -525,6 +530,7 @@ build_phase() {
     "$ROOT_DIR/Apps/CLI" x86_64 release peekaboo-certification-controller)"
   /usr/bin/lipo -create -output "$UNSIGNED_CONTROLLER" "$controller_arm" "$controller_x64"
   /usr/bin/strip -Sxu "$UNSIGNED_CONTROLLER"
+  "$ROOT_DIR/scripts/strip-toolchain-rpaths.sh" "$UNSIGNED_CONTROLLER"
   [[ " $(/usr/bin/lipo -archs "$UNSIGNED_CONTROLLER") " == *' arm64 '* && \
     " $(/usr/bin/lipo -archs "$UNSIGNED_CONTROLLER") " == *' x86_64 '* ]] || fail 'controller is not universal'
 
@@ -830,6 +836,7 @@ sign_code_phase() {
   while IFS= read -r -d '' candidate; do
     file_description="$(/usr/bin/file -b "$candidate")" || fail "could not classify signed payload: $candidate"
     [[ "$file_description" == *Mach-O* ]] || continue
+    "$ROOT_DIR/scripts/verify-swift-runtime-libraries.sh" --rpaths-only "$candidate"
     candidate_architectures="$(/usr/bin/lipo -archs "$candidate")" || \
       fail "could not inspect signed Mach-O architectures: $candidate"
     [[ -n "$candidate_architectures" ]] || fail "signed Mach-O has no architectures: $candidate"
@@ -1334,7 +1341,7 @@ run_notary_only() {
     -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS -u CDPATH -u GLOBIGNORE \
     -u MAC_RELEASE_CODESIGN_KEYCHAIN -u MAC_RELEASE_CODESIGN_KEYCHAIN_PASSWORD -u CODESIGN_KEYCHAIN \
     PATH=/usr/bin:/bin /bin/bash --noprofile --norc -p -c 'exec "$@"' peekaboo-notary-phase \
-    "$ROOT_DIR/scripts/notarize-terminal-artifact.sh" "$@"
+    "$ROOT_DIR/scripts/notarize-terminal-artifact.sh" --notary-transport "$NOTARY_TRANSPORT" "$@"
   command_result=$?
   set -e
   hide_service_tokens

@@ -51,9 +51,9 @@ peekaboo see --app Finder --json
 
 That is the core loop: observe the current screen, choose an element from the result, and act on it.
 
-## What's new in 4.7.0
+## What's new in 4.9.5
 
-Peekaboo 4.7.0 fixes the 4.6.0 CLI startup failure on Macs without the macOS 27 runtime and adds GPT-6 Astra, Sol, and Luna plus GPT-6.1 Sol model selection. Unattended clipboard reads no longer trigger macOS privacy prompts, and paste cleanup preserves newer clipboard contents. MCP clients can request structured element tables with `include_elements`, CLI JSON and observations report focused text selection and visible display bounds, and compatible-provider Agent streams keep fragmented tool arguments intact. CLI clipboard reads that previously prompted now refuse; see the changelog Compatibility notes for `clipboard status` and `--allow-prompt`.
+Peekaboo 4.9.5 is a fix release. Unsigned source builds, such as Homebrew core's `peekaboo` formula, now run commands in-process immediately instead of waiting on or aborting at a daemon they cannot trust, and developers can opt in to trusting their own exact-binary daemon with `PEEKABOO_ALLOW_UNSIGNED_DAEMON=1`. Commands no longer start an on-demand daemon that a granted Peekaboo.app would outrank, `see` stops flagging complete Accessibility reads as incomplete, and released CLI binaries no longer carry the build machine's toolchain path. See the changelog for details.
 
 ## Automate an app
 

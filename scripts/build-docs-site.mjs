@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { css, faviconSvg, js } from "./docs-site-assets.mjs";
-import { renderedHeadingText } from "./docs-site-toc.mjs";
+import { decodeRenderedEntities, renderedHeadingText } from "./docs-site-toc.mjs";
 
 const root = process.cwd();
 const docsDir = path.join(root, "docs");
@@ -141,14 +141,13 @@ const allPages = allMarkdown(docsDir).map((file) => {
   const rel = path.relative(docsDir, file).replaceAll(path.sep, "/");
   const raw = fs.readFileSync(file, "utf8");
   const { frontmatter, body } = parseFrontmatter(raw);
-  const cleaned = stripStrayDirectives(body);
-  const title = frontmatter.title || firstHeading(cleaned) || titleize(path.basename(rel, ".md"));
+  const title = frontmatter.title || firstHeading(body) || titleize(path.basename(rel, ".md"));
   return {
     file,
     rel,
     title,
     outRel: outPath(rel, frontmatter),
-    markdown: cleaned,
+    markdown: body,
     frontmatter,
   };
 });
@@ -221,6 +220,7 @@ function copyTree(src, dest) {
 }
 
 function parseFrontmatter(raw) {
+  raw = raw.replace(/\r\n/g, "\n");
   const match = raw.match(/^---\n([\s\S]*?)\n---\n?/);
   if (!match) return { frontmatter: {}, body: raw };
   const fm = {};
@@ -234,15 +234,6 @@ function parseFrontmatter(raw) {
     fm[m[1]] = value;
   }
   return { frontmatter: fm, body: raw.slice(match[0].length) };
-}
-
-function stripStrayDirectives(body) {
-  return body
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .filter((line) => !/^\s*\{:\s*[^}]*\}\s*$/.test(line))
-    .map((line) => line.replace(/\s*\{:\s*[^}]*\}\s*$/, ""))
-    .join("\n");
 }
 
 function allMarkdown(dir) {
@@ -273,11 +264,11 @@ function titleize(input) {
   return input.replaceAll("-", " ").replace(/\b\w/g, (m) => m.toUpperCase());
 }
 
-function markdownToHtml(markdown, currentRel) {
+function markdownToHtml(markdown, currentRel, nested = false) {
   const lines = markdown.replace(/\r\n/g, "\n").split("\n");
   const html = [];
   let paragraph = [];
-  let list = null;
+  const lists = []; // open lists, outermost first: { tag, indent, itemOpen, itemAt, itemText }
   let fence = null;
   let blockquote = [];
 
@@ -286,14 +277,27 @@ function markdownToHtml(markdown, currentRel) {
     html.push(`<p>${inline(paragraph.join(" "), currentRel)}</p>`);
     paragraph = [];
   };
+  // an item with no nested content closes on its own line: <li>text</li>
+  const closeItem = (list) => {
+    if (html.length - 1 === list.itemAt) html[list.itemAt] += "</li>";
+    else html.push("</li>");
+  };
+  const closeInnermostList = () => {
+    const list = lists.pop();
+    if (list.itemOpen) closeItem(list);
+    html.push(`</${list.tag}>`);
+  };
   const closeList = () => {
-    if (!list) return;
-    html.push(`</${list}>`);
-    list = null;
+    while (lists.length) closeInnermostList();
+  };
+  const nextNonBlank = (from) => {
+    let at = from;
+    while (at < lines.length && !lines[at].trim()) at += 1;
+    return lines[at];
   };
   const flushBlockquote = () => {
     if (!blockquote.length) return;
-    const inner = markdownToHtml(blockquote.join("\n"), currentRel);
+    const inner = markdownToHtml(blockquote.join("\n"), currentRel, true);
     html.push(`<blockquote>${inner}</blockquote>`);
     blockquote = [];
   };
@@ -338,22 +342,29 @@ function markdownToHtml(markdown, currentRel) {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const fenceMatch = line.match(/^\s{0,3}```([\w+-]+)?\s*$/);
-    if (fenceMatch) {
-      flushParagraph();
-      closeList();
-      flushBlockquote();
-      if (fence) {
+    const fenceMatch = line.match(/^(\s{0,3})(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (fenceMatch && fenceMatch[2][0] === fence.marker[0] &&
+          fenceMatch[2].length >= fence.marker.length && !fenceMatch[3].trim()) {
         const body = highlightCode(fence.lines.join("\n"), fence.lang);
         html.push(`<pre><code class="language-${escapeAttr(fence.lang)}">${body}</code></pre>`);
         fence = null;
       } else {
-        fence = { lang: fenceMatch[1] || "text", lines: [] };
+        // an indented fence strips up to its own indentation from the content lines
+        fence.lines.push(line.replace(new RegExp(`^ {0,${fence.indent}}`), ""));
       }
       continue;
     }
-    if (fence) {
-      fence.lines.push(line);
+    if (fenceMatch && !(fenceMatch[2][0] === "`" && fenceMatch[3].includes("`"))) {
+      flushParagraph();
+      closeList();
+      flushBlockquote();
+      fence = {
+        marker: fenceMatch[2],
+        indent: fenceMatch[1].length,
+        lang: fenceMatch[3].trim().split(/\s+/)[0] || "text",
+        lines: [],
+      };
       continue;
     }
     if (/^>\s?/.test(line)) {
@@ -365,7 +376,9 @@ function markdownToHtml(markdown, currentRel) {
     flushBlockquote();
     if (!line.trim()) {
       flushParagraph();
-      closeList();
+      // a blank line inside a list (between items, or before an indented continuation) keeps it open
+      const following = nextNonBlank(i + 1);
+      if (!/^\s*(-|\d+\.)\s+\S/.test(following ?? "") && !/^ {2,}\S/.test(following ?? "")) closeList();
       continue;
     }
     if (/^\s*---+\s*$/.test(line)) {
@@ -424,50 +437,111 @@ function markdownToHtml(markdown, currentRel) {
       continue;
     }
     const bullet = line.match(/^\s*-\s+(.+)$/);
-    const numbered = line.match(/^\s*\d+\.\s+(.+)$/);
+    const numbered = line.match(/^\s*(\d+)\.\s+(.+)$/);
     if (bullet || numbered) {
       flushParagraph();
       const tag = bullet ? "ul" : "ol";
-      if (list && list !== tag) closeList();
-      if (!list) {
-        list = tag;
-        html.push(`<${tag}>`);
+      const indent = line.match(/^\s*/)[0].replaceAll("\t", "    ").length;
+      while (lists.length && indent < lists.at(-1).indent) closeInnermostList();
+      const current = lists.at(-1);
+      if (current && indent === current.indent && current.tag !== tag) closeInnermostList();
+      const sibling = lists.at(-1);
+      if (sibling && indent === sibling.indent) {
+        if (sibling.itemOpen) closeItem(sibling);
+      } else {
+        // a deeper marker opens a nested list inside the still-open parent item
+        const start = numbered && numbered[1] !== "1" ? ` start="${numbered[1]}"` : "";
+        html.push(`<${tag}${start}>`);
+        lists.push({ tag, indent, itemOpen: false, itemAt: -1, itemText: "" });
       }
-      html.push(`<li>${inline((bullet || numbered)[1], currentRel)}</li>`);
+      const itemText = bullet ? bullet[1] : numbered[2];
+      html.push(`<li>${inline(itemText, currentRel)}`);
+      Object.assign(lists.at(-1), { itemOpen: true, itemAt: html.length - 1, itemText });
+      continue;
+    }
+    // After a blank line, a paragraph at the parent's content indentation
+    // leaves nested children. Without a blank, preserve lazy continuation.
+    const continuationIndent = line.match(/^\s*/)[0].replaceAll("\t", "    ").length;
+    if (i > 0 && !lines[i - 1].trim()) {
+      while (lists.length > 1 && continuationIndent <= lists.at(-1).indent) closeInnermostList();
+    }
+    const owner = lists.at(-1);
+    if (owner?.itemOpen && !paragraph.length && html.length - 1 === owner.itemAt) {
+      // the next line of an item's own text, not a new paragraph
+      owner.itemText += ` ${line.trim()}`;
+      html[owner.itemAt] = `<li>${inline(owner.itemText, currentRel)}`;
       continue;
     }
     paragraph.push(line.trim());
   }
+  if (fence) {
+    const body = highlightCode(fence.lines.join("\n"), fence.lang);
+    html.push(`<pre><code class="language-${escapeAttr(fence.lang)}">${body}</code></pre>`);
+  }
   flushParagraph();
   closeList();
   flushBlockquote();
-  return html.join("\n");
+  const rendered = html.join("\n");
+  return nested ? rendered : uniqueHeadingIDs(rendered);
 }
 
-function inline(text, currentRel) {
-  const stash = [];
-  let out = text.replace(/`([^`]+)`/g, (_, code) => {
-    stash.push(`<code>${escapeHtml(code)}</code>`);
-    return ` ${stash.length - 1} `;
+function uniqueHeadingIDs(html) {
+  // Reserve natural slugs before allocating duplicate suffixes, including headings
+  // rendered inside blockquotes. Existing incoming anchors must keep their owner.
+  const naturalIDs = new Set([...html.matchAll(/<h[1-4] id="([^"]*)">/g)].map((match) => match[1]));
+  const used = new Set();
+  const nextSuffix = new Map();
+  return html.replace(/<h([1-4]) id="([^"]*)">([\s\S]*?)<\/h\1>/g, (_, level, original, body) => {
+    const base = original || "section";
+    let id = base;
+    if (used.has(id) || (!original && naturalIDs.has(id))) {
+      let suffix = nextSuffix.get(base) || 1;
+      for (; ; suffix += 1) {
+        id = `${base}-${suffix}`;
+        if (!used.has(id) && !naturalIDs.has(id)) break;
+      }
+      nextSuffix.set(base, suffix + 1);
+    }
+    used.add(id);
+    const inner = body.replace(/^<a class="anchor" href="#[^"]*"/, () => `<a class="anchor" href="#${id}"`);
+    return `<h${level} id="${id}">${inner}</h${level}>`;
+  });
+}
+
+function inline(text, currentRel, inheritedStash = []) {
+  const stash = [...inheritedStash];
+  let out = text.replace(/`([^`]+)`/g, (raw, code) => {
+    stash.push({ html: `<code>${escapeHtml(code)}</code>`, raw });
+    return `\u0000${stash.length - 1}\u0000`;
+  });
+  out = out.replace(/\[([^\]]+)\]\(((?:[^()]|\([^()]*\))+)\)/g, (raw, label, href) => {
+    const destination = href
+      .replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)].raw)
+      .replace(/\\\|/g, "|");
+    stash.push({ html: `<a href="${escapeAttr(rewriteHref(destination, currentRel))}">${inline(label, currentRel, stash)}</a>`, raw });
+    return `\u0000${stash.length - 1}\u0000`;
+  });
+  out = out.replace(/<(https?:\/\/[^\s<>]+)>/g, (raw, href) => {
+    const destination = href
+      .replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)].raw)
+      .replace(/\\\|/g, "|");
+    stash.push({ html: `<a href="${escapeAttr(destination)}">${escapeHtml(destination)}</a>`, raw });
+    return `\u0000${stash.length - 1}\u0000`;
   });
   out = escapeHtml(out)
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, "$1<em>$2</em>")
-    .replace(/(^|[^_])_([^_\s][^_]*?)_(?!_)/g, "$1<em>$2</em>")
-    .replace(
-      /\[([^\]]+)\]\(([^)]+)\)/g,
-      (_, label, href) => `<a href="${escapeAttr(rewriteHref(href, currentRel))}">${label}</a>`,
-    )
-    .replace(/&lt;(https?:\/\/[^\s<>]+)&gt;/g, '<a href="$1">$1</a>');
+    .replace(/(^|[^_])_([^_\s][^_]*?)_(?!_)/g, "$1<em>$2</em>");
   out = out.replace(/\\\|/g, "|");
   out = out.replace(/&lt;br&gt;/g, "<br>");
-  return out.replace(/ (\d+) /g, (_, i) => stash[Number(i)]);
+  return out.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)].html);
 }
 
 function rewriteHref(href, currentRel) {
   if (/^(https?:|mailto:|tel:|#)/.test(href)) return href;
-  const [raw, hash = ""] = href.split("#");
-  if (!raw) return hash ? `#${hash}` : "";
+  const suffixStart = href.search(/[?#]/);
+  const raw = suffixStart < 0 ? href : href.slice(0, suffixStart);
+  const suffix = suffixStart < 0 ? "" : href.slice(suffixStart);
   if (raw.startsWith("/")) return href;
   if (!raw.endsWith(".md")) return href;
   const from = path.posix.dirname(currentRel);
@@ -475,7 +549,7 @@ function rewriteHref(href, currentRel) {
   let rewritten = pageMap.get(target)?.outRel || outPath(target);
   const currentOut = pageMap.get(currentRel)?.outRel || outPath(currentRel);
   rewritten = hrefToOutRel(rewritten, currentOut);
-  return `${rewritten}${hash ? `#${hash}` : ""}`;
+  return `${rewritten}${suffix}`;
 }
 
 function tocFromHtml(html) {
@@ -724,28 +798,35 @@ function highlightCode(code, lang) {
   return escapeHtml(code);
 }
 
-function stashToken(idx) {
-  return String.fromCharCode(0xe000 + idx);
-}
-
-function restoreStashTokens(value, stash) {
-  return value.replace(/[-]/g, (token) => {
-    const idx = token.charCodeAt(0) - 0xe000;
-    return stash[idx] ?? "";
+// Keep highlighted fragments separate from source text so code never doubles
+// as an internal placeholder, and the number of matches is unbounded.
+function highlightFragments(fragments, pattern, renderMatch) {
+  return fragments.flatMap((fragment) => {
+    if (typeof fragment !== "string") return [fragment];
+    const result = [];
+    let previous = 0;
+    fragment.replace(pattern, (...args) => {
+      const match = args[0];
+      const offset = args.at(-2);
+      result.push(fragment.slice(previous, offset), { html: renderMatch(...args) });
+      previous = offset + match.length;
+      return match;
+    });
+    result.push(fragment.slice(previous));
+    return result;
   });
 }
 
-function withStash(code, patterns) {
-  const stash = [];
-  let working = code;
-  for (const [re, cls] of patterns) {
-    working = working.replace(re, (match) => {
-      const idx = stash.length;
-      stash.push(`<span class="${cls}">${escapeHtml(match)}</span>`);
-      return stashToken(idx);
-    });
+function renderFragments(fragments) {
+  return fragments.map((fragment) => typeof fragment === "string" ? escapeHtml(fragment) : fragment.html).join("");
+}
+
+function highlightWithPatterns(code, patterns) {
+  let fragments = [code];
+  for (const [pattern, cls] of patterns) {
+    fragments = highlightFragments(fragments, pattern, (match) => `<span class="${cls}">${escapeHtml(match)}</span>`);
   }
-  return restoreStashTokens(escapeHtml(working), stash);
+  return renderFragments(fragments);
 }
 
 function highlightShell(code) {
@@ -764,26 +845,21 @@ function highlightShell(code) {
 }
 
 function highlightShellLine(line) {
-  const stash = [];
-  const stashAdd = (match, cls) => {
-    const idx = stash.length;
-    stash.push(`<span class="${cls}">${escapeHtml(match)}</span>`);
-    return stashToken(idx);
-  };
-  let working = line;
-  working = working.replace(/(?:'[^']*'|"[^"]*")/g, (m) => stashAdd(m, "hl-s"));
-  working = working.replace(/\s#.*$/g, (m) => stashAdd(m, "hl-c"));
-  working = working.replace(/(^|\s)(--?[A-Za-z][A-Za-z0-9-]*)/g, (_, lead, flag) => `${escapeHtml(lead)}${stashAdd(flag, "hl-f")}`);
-  working = working.replace(
+  const span = (match, cls) => `<span class="${cls}">${escapeHtml(match)}</span>`;
+  let fragments = [line];
+  fragments = highlightFragments(fragments, /(?:'[^']*'|"[^"]*")/g, (match) => span(match, "hl-s"));
+  fragments = highlightFragments(fragments, /\s#.*$/g, (match) => span(match, "hl-c"));
+  fragments = highlightFragments(fragments, /(^|\s)(--?[A-Za-z][A-Za-z0-9-]*)/g,
+    (_, lead, flag) => `${escapeHtml(lead)}${span(flag, "hl-f")}`);
+  fragments = highlightFragments(fragments,
     /\b(peekaboo|brew|npx|npm|pnpm|yarn|node|swift|git|gh|make|sudo|cd|export|cat|curl|jq|ls|mv|cp|rm|mkdir|docker|tail)\b/g,
-    (m) => stashAdd(m, "hl-cmd"),
-  );
-  working = working.replace(/\b(\d+(?:\.\d+)?)\b/g, (m) => stashAdd(m, "hl-n"));
-  return restoreStashTokens(escapeHtml(working), stash);
+    (match) => span(match, "hl-cmd"));
+  fragments = highlightFragments(fragments, /\b(\d+(?:\.\d+)?)\b/g, (match) => span(match, "hl-n"));
+  return renderFragments(fragments);
 }
 
 function highlightJson(code) {
-  return withStash(code, [
+  return highlightWithPatterns(code, [
     [/"(?:\\.|[^"\\])*"\s*:/g, "hl-k"],
     [/"(?:\\.|[^"\\])*"/g, "hl-s"],
     [/\b(true|false|null)\b/g, "hl-m"],
@@ -792,7 +868,7 @@ function highlightJson(code) {
 }
 
 function highlightJs(code) {
-  return withStash(code, [
+  return highlightWithPatterns(code, [
     [/\/\/[^\n]*/g, "hl-c"],
     [/\/\*[\s\S]*?\*\//g, "hl-c"],
     [/`(?:\\.|[^`\\])*`/g, "hl-s"],
@@ -807,7 +883,7 @@ function highlightJs(code) {
 }
 
 function highlightSwift(code) {
-  return withStash(code, [
+  return highlightWithPatterns(code, [
     [/\/\/[^\n]*/g, "hl-c"],
     [/\/\*[\s\S]*?\*\//g, "hl-c"],
     [/"(?:\\.|[^"\\])*"/g, "hl-s"],
@@ -856,10 +932,12 @@ function validateLinks(outputDir) {
   for (const file of allHtml(outputDir)) {
     const html = fs.readFileSync(file, "utf8");
     for (const match of html.matchAll(/href="([^"]+)"/g)) {
-      const href = match[1];
+      const href = decodeRenderedEntities(match[1]);
       if (/^(#|https?:|mailto:|tel:|javascript:)/.test(href)) continue;
       if (placeholderHrefs.test(href)) continue;
-      const [rawPath, anchor = ""] = href.split("#");
+      const [rawPath] = href.split(/[?#]/, 1);
+      const hashStart = href.indexOf("#");
+      const anchor = hashStart < 0 ? "" : href.slice(hashStart + 1);
       const targetPath = rawPath
         ? rawPath.startsWith("/")
           ? path.join(outputDir, rawPath.slice(1))
