@@ -96,6 +96,7 @@ public struct DesktopActionSequenceAccumulator: Sendable {
     private var allReportedOutcomesAreConfirmed = true
     private var allReportedOutcomesAreSuspectedNoop = true
     private var hasReportedResponseLoss = false
+    private var hasReportedRunningOperation = false
     private var singleReportedOutcome: DesktopActionOutcome?
     private var dispatchedRoute = HomogeneousValue<DesktopActionOutcome.Route>()
     private var dispatchedDelivery = CompatibleDeliveryValue()
@@ -219,8 +220,9 @@ public struct DesktopActionSequenceAccumulator: Sendable {
 
     /// Resolves the completed prefix of a batch that stopped before every planned target finished.
     ///
-    /// A complete prefix cannot remain a confirmed outcome for the whole batch. Definite, homogeneous
-    /// delivery becomes partial; stronger uncertainty remains authoritative. If cancellation interrupted
+    /// A confirmed change cannot stay confirmed for the unfinished batch, so it becomes partial.
+    /// A suspected no-op stays a no-op: partial means the primary change was verified.
+    /// Stronger uncertainty remains authoritative. If cancellation interrupted
     /// an in-flight attempt, that attempt may have dispatched and the aggregate becomes indeterminate.
     /// Receiptless prefixes continue to omit the additive outcome only when cancellation happened
     /// between targets; an in-flight interruption must retain possible-dispatch uncertainty.
@@ -258,7 +260,7 @@ public struct DesktopActionSequenceAccumulator: Sendable {
                 outcome: .indeterminate(
                     route: completedOutcome?.route ?? fallbackRoute,
                     delivery: nil,
-                    evidence: .completionUnknown,
+                    evidence: sequence.hasReportedResponseLoss ? .responseLost : .completionUnknown,
                     unitCount: sequence.mutationDisposition.unitCount),
                 fallbackEffect: .unverifiable)
         }
@@ -284,7 +286,7 @@ public struct DesktopActionSequenceAccumulator: Sendable {
             return InterruptedBatchResult(outcome: nil, fallbackEffect: fallbackEffect)
         }
         switch completedOutcome.state {
-        case .confirmedChange, .suspectedNoop:
+        case .confirmedChange:
             guard let delivery = completedOutcome.delivery else { return nil }
             return InterruptedBatchResult(
                 outcome: .partial(
@@ -292,6 +294,8 @@ public struct DesktopActionSequenceAccumulator: Sendable {
                     delivery: delivery,
                     unitCount: completedOutcome.dispatchState.unitCount),
                 fallbackEffect: .partial)
+        case .suspectedNoop:
+            return InterruptedBatchResult(outcome: completedOutcome, fallbackEffect: .suspectedNoop)
         case .confirmedNoChange:
             return InterruptedBatchResult(outcome: nil, fallbackEffect: .suspectedNoop)
         case .refused:
@@ -364,7 +368,7 @@ public struct DesktopActionSequenceAccumulator: Sendable {
                 .dispatchedUnverified(
                     route: route,
                     delivery: delivery,
-                    evidence: .deliveryAccepted,
+                    evidence: self.hasReportedRunningOperation ? .operationStillRunning : .deliveryAccepted,
                     unitCount: unitCount)
             } else {
                 nil
@@ -413,7 +417,7 @@ public struct DesktopActionSequenceAccumulator: Sendable {
                     unitCount: unitCount,
                     message: message,
                     hint: hint ?? leafFailure.hint,
-                    causeDescription: causeDescription ?? leafFailure.causeDescription)
+                    causeDescription: causeDescription ?? leafFailure.causeDescription ?? leafFailure.message)
                     .selectingLeaves(leafFailure.selectedLeafEvidence)
             }
 
@@ -426,7 +430,7 @@ public struct DesktopActionSequenceAccumulator: Sendable {
                 unitCount: unitCount,
                 message: message,
                 hint: hint ?? leafFailure.hint,
-                causeDescription: causeDescription ?? leafFailure.causeDescription)
+                causeDescription: causeDescription ?? leafFailure.causeDescription ?? leafFailure.message)
                 .selectingLeaves(leafFailure.selectedLeafEvidence)
         }
         return leafFailure
@@ -444,7 +448,7 @@ public struct DesktopActionSequenceAccumulator: Sendable {
         return .indeterminate(
             route: self.dispatchedRoute.value ?? fallbackRoute,
             delivery: self.dispatchedRoute.value == nil ? nil : self.dispatchedDelivery.value,
-            evidence: .completionUnknown,
+            evidence: self.hasReportedResponseLoss ? .responseLost : .completionUnknown,
             unitCount: self.mutationDisposition.unitCount,
             message: message,
             hint: hint,
@@ -464,6 +468,8 @@ public struct DesktopActionSequenceAccumulator: Sendable {
         self.allReportedOutcomesAreSuspectedNoop = self.allReportedOutcomesAreSuspectedNoop &&
             outcome.state == .suspectedNoop
         self.hasReportedResponseLoss = self.hasReportedResponseLoss || outcome.evidence == .responseLost
+        self.hasReportedRunningOperation = self.hasReportedRunningOperation ||
+            outcome.evidence == .operationStillRunning
         self.allReportedOutcomesAreConfirmedNoChange = self.allReportedOutcomesAreConfirmedNoChange &&
             outcome.state == .confirmedNoChange
         let disposition: DesktopActionMutationDisposition = switch outcome.dispatchState {

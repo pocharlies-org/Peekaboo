@@ -139,7 +139,8 @@ public nonisolated enum PeekabooError: LocalizedError, StandardizedError, Peekab
             return "Authentication failed: \(message)"
         case let .rateLimited(retryAfter, message):
             if let retryAfter {
-                return "Rate limited (retry after \(Int(retryAfter))s): \(message)"
+                let duration = Int(exactly: retryAfter.rounded(.towardZero)).map(String.init) ?? String(retryAfter)
+                return "Rate limited (retry after \(duration)s): \(message)"
             }
             return "Rate limited: \(message)"
         case let .serverError(message):
@@ -359,11 +360,11 @@ public nonisolated enum PeekabooError: LocalizedError, StandardizedError, Peekab
     public var suggestedAction: String? {
         switch self {
         case .permissionDeniedScreenRecording:
-            "Grant Screen Recording permission in System Settings → Privacy & Security → Screen Recording"
+            "Grant Screen Recording permission in \(PermissionSettingsGuidance.path(for: .screenRecording))"
         case .permissionDeniedAccessibility:
-            "Grant Accessibility permission in System Settings → Privacy & Security → Accessibility"
+            "Grant Accessibility permission in \(PermissionSettingsGuidance.path(for: .accessibility))"
         case .permissionDeniedEventSynthesizing:
-            "Grant event-synthesizing access in System Settings → Privacy & Security → Accessibility"
+            "Grant event-synthesizing access in \(PermissionSettingsGuidance.path(for: .eventSynthesizing))"
         case let .ambiguousAppIdentifier(_, suggestions):
             "Try one of: \(suggestions.joined(separator: ", "))"
         case .snapshotNotAvailable:
@@ -397,7 +398,14 @@ extension PeekabooError {
 
     /// Create a timeout error
     public static func timeout(operation: String, duration: TimeInterval) -> PeekabooError {
-        .timeout("Operation '\(operation)' timed out after \(Int(duration)) seconds")
+        let formattedDuration = if duration.isFinite, duration > 0, duration < 1 {
+            "\(max(1, Int((duration * 1000).rounded()))) milliseconds"
+        } else if let wholeSeconds = Int(exactly: duration) {
+            "\(wholeSeconds) seconds"
+        } else {
+            "\(duration) seconds"
+        }
+        return .timeout("Operation '\(operation)' timed out after \(formattedDuration)")
     }
 
     /// Create an ambiguous app identifier error
