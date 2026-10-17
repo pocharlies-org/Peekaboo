@@ -36,4 +36,20 @@ permissions:
 jobs:
   duplicados:
     uses: pocharlies-org/k8s-gitops-pocharlies/.github/workflows/reusable-duplicados.yml@main
+    with:
+      # Este repo es espejo de openclaw/Peekaboo: todo lo que no es `pocharlies/`
+      # es codigo de upstream, que el vigilante (update-watch, peekaboo-fork-update)
+      # entra tag a tag y NUNCA edita aqui (INFRA-388: ni auto-resuelve ni auto-fusiona).
+      # La duplicacion que upstream introduce en su propio arbol no es culpa de quien
+      # la sincroniza y el fork no puede arreglarla sin divergir del espejo: SC-2560
+      # dejo v4.9.3 y v4.9.4 dos dias bloqueados por una copia que upstream hizo de
+      # su propio scripts/pblog.sh (Apps/Playground/scripts/playground-log.sh) y por
+      # bloques repetidos dentro de sus tests. Se excluyen los directorios de
+      # upstream; el codigo propio del fork (`pocharlies/`) sigue vigilado, salvo
+      # `pocharlies/tests/`: jscpd casa los globs a cualquier profundidad y
+      # `tests/**` se lleva por delante tambien los tests del fork (los .py de la
+      # raiz de `pocharlies/`, que es el proxy, si siguen escaneandose). Si upstream
+      # anade un directorio de codigo nuevo y el check vuelve a ponerse en rojo por
+      # codigo de upstream, anadirlo a esta lista.
+      ignorar: "Apps/**,scripts/**,tests/**,Core/**,Helpers/**,Commander/**,AXorcist/**,Swiftdansi/**,Tachikoma/**,TauTUI/**,assets/**,docs/**,experiments/**,release/**,skills/**,homebrew/**,.agents/**"
     secrets: inherit
