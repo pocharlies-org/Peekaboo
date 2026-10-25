@@ -183,10 +183,11 @@ struct MCPToolRegistryIntegrationTests {
             filters: noToolFilters)
         let names = Set(tools.map(\.name))
 
-        #expect(tools.count == 24)
+        #expect(tools.count == 26)
         #expect(names.contains("clipboard"))
         #expect(names.contains("paste"))
         #expect(names.contains("set_value"))
+        #expect(names.contains("select_text"))
         #expect(names.contains("action"))
         #expect(names.contains("press"))
         #expect(!names.contains("hotkey"))
@@ -195,7 +196,8 @@ struct MCPToolRegistryIntegrationTests {
         #expect(names.contains("verify_state"))
         #expect(names.contains("capture"))
         #expect(!names.contains("shell"))
-        #expect(names.isDisjoint(with: ["drag", "move"]))
+        #expect(names.contains("drag"))
+        #expect(!names.contains("move"))
 
         let foregroundContext = MCPToolContext(services: services, executionPolicy: .foregroundAllowed)
         let foregroundNames = Set(MCPToolCatalog.tools(
@@ -217,7 +219,7 @@ struct MCPToolRegistryIntegrationTests {
             filters: noToolFilters))
 
         let tools = registry.allTools()
-        #expect(tools.count == 24)
+        #expect(tools.count == 26)
 
         // Verify some key tools are present
         let imageToolExists = registry.tool(named: "image") != nil
@@ -226,6 +228,7 @@ struct MCPToolRegistryIntegrationTests {
         let clipboardToolExists = registry.tool(named: "clipboard") != nil
         let inspectUIToolExists = registry.tool(named: "inspect_ui") != nil
         let captureToolExists = registry.tool(named: "capture") != nil
+        let selectTextToolExists = registry.tool(named: "select_text") != nil
 
         #expect(imageToolExists)
         #expect(clickToolExists)
@@ -233,6 +236,7 @@ struct MCPToolRegistryIntegrationTests {
         #expect(clipboardToolExists)
         #expect(inspectUIToolExists)
         #expect(captureToolExists)
+        #expect(selectTextToolExists)
     }
 
     @Test

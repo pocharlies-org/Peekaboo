@@ -29,6 +29,18 @@ extension PeekabooBridgeRequest {
     }
 
     var minimumNegotiatedProtocolVersion: PeekabooBridgeProtocolVersion? {
+        if self.requiresBackgroundCoordinateScroll {
+            return PeekabooBridgeConstants.backgroundCoordinateScrollVersion
+        }
+        if self.requiresPreparedClipboardGuardedExactWindowHotkey {
+            return PeekabooBridgeConstants.preparedClipboardGuardedExactWindowHotkeyVersion
+        }
+        if self.requiresClipboardGuardedExactWindowHotkey {
+            return PeekabooBridgeConstants.clipboardGuardedExactWindowHotkeyVersion
+        }
+        if self.unwrappedOperationRequest.operation == .exactWindowDrag {
+            return PeekabooBridgeConstants.exactWindowDragVersion
+        }
         if self.requiresNativeBrowserConnectionBinding {
             return PeekabooBridgeConstants.nativeBrowserConnectionBindingVersion
         }
@@ -69,6 +81,16 @@ extension PeekabooBridgeRequest {
         }
     }
 
+    var requiresClipboardGuardedExactWindowHotkey: Bool {
+        guard case let .exactWindowTargetedHotkey(payload) = self.unwrappedOperationRequest else { return false }
+        return payload.clipboardClaim != nil
+    }
+
+    var requiresPreparedClipboardGuardedExactWindowHotkey: Bool {
+        guard case let .exactWindowTargetedHotkey(payload) = self.unwrappedOperationRequest else { return false }
+        return payload.backgroundPreparation != nil
+    }
+
     /// Current clients must not create or publish snapshot state through a host that did not
     /// negotiate producer-bound references. This client-side predicate intentionally stays
     /// separate from the server's ownership-probe gate: an already-shipped 1.34 client treats the
@@ -100,7 +122,7 @@ extension PeekabooBridgeRequest {
 
     var requiresProcessGenerationBoundElementMutations: Bool {
         switch self.unwrappedOperationRequest.operation {
-        case .setValue, .performAction:
+        case .setValue, .selectText, .performAction:
             true
         default:
             false
@@ -135,6 +157,33 @@ extension PeekabooBridgeRequest {
 
     var requiresRequestPinnedExactWindowScrollReceipt: Bool {
         self.unwrappedOperationRequest.operation == .targetedScroll
+    }
+
+    var requiresBackgroundCoordinateScroll: Bool {
+        guard case let .targetedScroll(payload) = self.unwrappedOperationRequest else { return false }
+        return payload.request.point != nil
+    }
+
+    func validateScrollDeliveryMode() throws {
+        switch self.unwrappedOperationRequest {
+        case let .scroll(payload):
+            try payload.request.validatePointSelector()
+            guard payload.request.foreground else {
+                throw PeekabooBridgeErrorEnvelope(
+                    code: .invalidRequest,
+                    message: "The scroll operation requires foreground=true; " +
+                        "use targetedScroll for background AX input")
+            }
+        case let .targetedScroll(payload):
+            try payload.request.validatePointSelector()
+            guard !payload.request.foreground else {
+                throw PeekabooBridgeErrorEnvelope(
+                    code: .invalidRequest,
+                    message: "The targetedScroll operation requires foreground=false")
+            }
+        default:
+            break
+        }
     }
 
     var requiresCompositeTypeDeliverySupport: Bool {

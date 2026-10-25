@@ -787,9 +787,11 @@ ensure_github_release_tag() {
 }
 
 verify_github_release_assets() {
+    GITHUB_RELEASE_REPAIR_ASSETS=()
     local npm_metadata_path="${1:-}" allow_body_mismatch="${2:-false}"
     local allow_asset_repair="${3:-false}"
     local expected_assets_json expected_body_json release_json release_api_path tag_commit
+    local repair_assets repair_name
 
     echo -e "\n${BLUE}Verifying GitHub release assets...${NC}"
     assert_publication_receipt "$npm_metadata_path"
@@ -808,10 +810,16 @@ process.stdout.write(JSON.stringify(receipt.assets));
 
     release_api_path=$(github_release_api_path) || fail "Could not locate the GitHub release draft"
     release_json=$(gh api --hostname "$GITHUB_HOST" "$release_api_path")
-    printf '{"release":%s,"version":"%s","sourceCommit":"%s","tagCommit":"%s","expectedAssets":%s,"expectedBody":%s,"expectDraft":true,"allowAssetRepair":%s}\n' \
+    # Repair mode prints the expected assets that are missing or differ, one per line; strict mode prints nothing.
+    repair_assets=$(printf '{"release":%s,"version":"%s","sourceCommit":"%s","tagCommit":"%s","expectedAssets":%s,"expectedBody":%s,"expectDraft":true,"allowAssetRepair":%s}\n' \
         "$release_json" "$VERSION" "$RELEASE_SOURCE_COMMIT" "$tag_commit" "$expected_assets_json" \
         "$expected_body_json" "$allow_asset_repair" |
-        node "$RELEASE_CONTRACT" github-release
+        node "$RELEASE_CONTRACT" github-release) || fail "GitHub release verification failed"
+    while IFS= read -r repair_name; do
+        if [[ -n "$repair_name" ]]; then
+            GITHUB_RELEASE_REPAIR_ASSETS+=("$repair_name")
+        fi
+    done <<< "$repair_assets"
     echo -e "${GREEN}✅ GitHub release assets verified${NC}"
 }
 
@@ -974,6 +982,32 @@ prepare_release_assets() {
     RELEASE_ASSETS+=("$RELEASE_DIR/checksums.txt")
 }
 
+select_release_asset_uploads() {
+    local repair_name asset_path matches
+    RELEASE_ASSET_UPLOADS=()
+    # Bash 3.2 treats an empty "${array[@]}" as unbound under set -u.
+    [[ ${#GITHUB_RELEASE_REPAIR_ASSETS[@]} -gt 0 ]] || return 0
+    [[ ${#RELEASE_ASSETS[@]} -gt 0 ]] || fail "GitHub repair assets have no local release assets"
+    for repair_name in "${GITHUB_RELEASE_REPAIR_ASSETS[@]}"; do
+        matches=0
+        for asset_path in "${RELEASE_ASSETS[@]}"; do
+            if [[ "${asset_path##*/}" == "$repair_name" ]]; then
+                matches=$((matches + 1))
+            fi
+        done
+        [[ "$matches" -eq 1 ]] ||
+            fail "GitHub repair asset $repair_name matches $matches local release assets; expected exactly one"
+    done
+    for asset_path in "${RELEASE_ASSETS[@]}"; do
+        for repair_name in "${GITHUB_RELEASE_REPAIR_ASSETS[@]}"; do
+            if [[ "${asset_path##*/}" == "$repair_name" ]]; then
+                RELEASE_ASSET_UPLOADS+=("$asset_path")
+                break
+            fi
+        done
+    done
+}
+
 github_release_api_path() {
     local error_path result api_url release_id
     error_path=$(mktemp "${TMPDIR:-/tmp}/peekaboo-gh-release-view.XXXXXX")
@@ -1098,8 +1132,14 @@ resume_publication() {
         else
             verify_github_release_assets "" true true
         fi
-        gh release upload "v${VERSION}" "${RELEASE_ASSETS[@]}" \
-          --repo "$GITHUB_REPOSITORY" --clobber
+        select_release_asset_uploads
+        if [[ ${#RELEASE_ASSET_UPLOADS[@]} -gt 0 ]]; then
+            echo -e "${BLUE}Re-uploading ${#RELEASE_ASSET_UPLOADS[@]} of ${#RELEASE_ASSETS[@]} draft assets: ${GITHUB_RELEASE_REPAIR_ASSETS[*]}${NC}"
+            gh release upload "v${VERSION}" "${RELEASE_ASSET_UPLOADS[@]}" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+        else
+            echo -e "${GREEN}All ${#RELEASE_ASSETS[@]} draft assets match the frozen receipt; upload skipped${NC}"
+        fi
     else
         if [[ "$npm_already_published" == true ]]; then
             create_github_release_draft "$RELEASE_DIR/npm-publication.json"
@@ -1135,6 +1175,7 @@ INCLUDE_MAC_APP=true
 MAC_APP_NOTARIZE=true
 MAC_APP_APPCAST=true
 REUSE_BUILT_CLI=false
+RELEASE_FROM_BRANCH=false
 EXPECTED_REUSE_SOURCE_COMMIT=""
 RELEASE_PROOF_FILE=""
 
@@ -1162,6 +1203,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --reuse-built-cli)
             REUSE_BUILT_CLI=true
+            shift
+            ;;
+        --release-branch)
+            RELEASE_FROM_BRANCH=true
             shift
             ;;
         --proof-file)
@@ -1198,6 +1243,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --resume-publication   Resume a partial public release from retained verified artifacts"
             echo "  --retry-npm-publish    With resume, explicitly retry an attempted npm publish still returning E404"
             echo "  --reuse-built-cli      Reuse an exact-HEAD signed/notarized CLI after full verification"
+            echo "  --release-branch       Publish from the checked-out release/<version> branch instead of main"
             echo "  --proof-file PATH      CI/test proof appended to the source-bound GitHub release body"
             echo "  --arm64-only           Build arm64-only binary"
             echo "  --universal            Build universal (arm64+x86_64) binary (default)"
@@ -1243,16 +1289,21 @@ if [[ -n "$RELEASE_PROOF_FILE" ]]; then
 fi
 
 validate_publication_options
-RELEASE_OPTION_FINGERPRINT="$SKIP_CHECKS|$CREATE_GITHUB_RELEASE|$PUBLISH_NPM|$RESUME_PUBLICATION|$RETRY_NPM_PUBLISH|$UNIVERSAL|$INCLUDE_MAC_APP|$MAC_APP_NOTARIZE|$MAC_APP_APPCAST|$REUSE_BUILT_CLI|$RELEASE_PROOF_FILE|$RELEASE_PROOF_SHA256|$BUILD_DIR|$RELEASE_DIR"
+RELEASE_OPTION_FINGERPRINT="$SKIP_CHECKS|$CREATE_GITHUB_RELEASE|$PUBLISH_NPM|$RESUME_PUBLICATION|$RETRY_NPM_PUBLISH|$UNIVERSAL|$INCLUDE_MAC_APP|$MAC_APP_NOTARIZE|$MAC_APP_APPCAST|$REUSE_BUILT_CLI|$RELEASE_FROM_BRANCH|$RELEASE_PROOF_FILE|$RELEASE_PROOF_SHA256|$BUILD_DIR|$RELEASE_DIR"
 
 if [ -f "$MAC_RELEASE_MANIFEST" ]; then
     # shellcheck source=/Users/steipete/Projects/Peekaboo/.mac-release.env
     source "$MAC_RELEASE_MANIFEST"
 fi
-OBSERVED_RELEASE_OPTION_FINGERPRINT="$SKIP_CHECKS|$CREATE_GITHUB_RELEASE|$PUBLISH_NPM|$RESUME_PUBLICATION|$RETRY_NPM_PUBLISH|$UNIVERSAL|$INCLUDE_MAC_APP|$MAC_APP_NOTARIZE|$MAC_APP_APPCAST|$REUSE_BUILT_CLI|$RELEASE_PROOF_FILE|$RELEASE_PROOF_SHA256|$BUILD_DIR|$RELEASE_DIR"
+OBSERVED_RELEASE_OPTION_FINGERPRINT="$SKIP_CHECKS|$CREATE_GITHUB_RELEASE|$PUBLISH_NPM|$RESUME_PUBLICATION|$RETRY_NPM_PUBLISH|$UNIVERSAL|$INCLUDE_MAC_APP|$MAC_APP_NOTARIZE|$MAC_APP_APPCAST|$REUSE_BUILT_CLI|$RELEASE_FROM_BRANCH|$RELEASE_PROOF_FILE|$RELEASE_PROOF_SHA256|$BUILD_DIR|$RELEASE_DIR"
 [[ "$RELEASE_OPTION_FINGERPRINT" == "$OBSERVED_RELEASE_OPTION_FINGERPRINT" ]] ||
     fail "Release manifest changed command-line publication authority"
 validate_publication_options
+# The manifest's MAC_RELEASE_OP_ENV_REFS reaches only helper children, never this
+# shell; without this check a missing token surfaces after the full build.
+if [[ "$PUBLISH_NPM" == true && -z "${NPM_TOKEN:-}" ]]; then
+    fail "NPM_TOKEN is required for --publish-npm and must be set before the build starts; add the NPM_TOKEN op:// reference from MAC_RELEASE_OP_ENV_REFS in .mac-release.env to the op run env file"
+fi
 # This inventory also owns retained-publication verification and upload.
 CLI_ARCHITECTURES=(arm64)
 if [ "$UNIVERSAL" = true ]; then
@@ -1267,6 +1318,10 @@ export NOTARYTOOL_PROFILE
 require_command git
 require_command node
 VERSION=$(node -p "require('$PROJECT_ROOT/package.json').version")
+if [[ "$RELEASE_FROM_BRANCH" == true &&
+      "$(git -C "$PROJECT_ROOT" branch --show-current)" != "release/$VERSION" ]]; then
+    fail "--release-branch requires the release/$VERSION branch to be checked out"
+fi
 if [[ "$RESUME_PUBLICATION" == true ]]; then
     resume_publication
     exit 0
@@ -1303,6 +1358,10 @@ if [ "$SKIP_CHECKS" = false ]; then
         PREPARE_COMMAND=(node scripts/prepare-release.js --no-build --bin "$PROJECT_ROOT/peekaboo")
     else
         PREPARE_COMMAND=(node scripts/prepare-release.js)
+    fi
+    # The preflight still requires the release branch to contain origin/main.
+    if [[ "$RELEASE_FROM_BRANCH" == true ]]; then
+        PREPARE_COMMAND+=(--force)
     fi
     # Keep package credentials and the managed codesign PATH shim out of the
     # complete gate. Keychain paths survive for its later signed CLI build.
@@ -1358,9 +1417,12 @@ else
     else
         BUILD_COMMAND=("$PROJECT_ROOT/scripts/mac-release" codesign-run -- pnpm run "$BUILD_SCRIPT")
     fi
+    # scripts/mac-release narrows PATH to /usr/bin:/bin before the pinned helper
+    # records it as the child PATH, which hides pnpm. Use the preflight tool PATH.
     if ! MAC_RELEASE_EXPECTED_HELPER_COMMIT="$RELEASE_HELPER_COMMIT" \
         MAC_RELEASE_EXPECTED_HELPER_EXECUTABLE_SHA256="$RELEASE_HELPER_EXECUTABLE_SHA256" \
         MAC_RELEASE_EXPECTED_HELPER_LIBRARY_SHA256="$RELEASE_HELPER_LIBRARY_SHA256" \
+        MAC_RELEASE_CALLER_PATH="${MAC_RELEASE_CALLER_PATH:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin}" \
         MAC_RELEASE_CODESIGN_IDENTITY="$CLI_SIGN_IDENTITY" "${BUILD_COMMAND[@]}"; then
         echo -e "${RED}❌ Swift build failed!${NC}"
         exit 1

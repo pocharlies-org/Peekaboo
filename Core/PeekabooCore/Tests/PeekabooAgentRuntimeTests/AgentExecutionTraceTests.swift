@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import PeekabooAgentRuntimeTestSupport
 import PeekabooCore
 import Tachikoma
 import TachikomaMCP
@@ -9,8 +10,33 @@ import Testing
 @MainActor
 struct AgentExecutionTraceTests {
     @Test
+    func `selection without dispatch evidence is a possible mutation in traces`() throws {
+        let call = AgentToolCall(id: "selection", name: "select_text", arguments: [:])
+        let result = AgentExecutionResult(
+            content: "",
+            messages: [
+                ModelMessage(role: .assistant, content: [.toolCall(call)]),
+                ModelMessage(role: .tool, content: [.toolResult(AgentToolResult(
+                    toolCallId: call.id,
+                    result: AnyAgentToolValue(object: ["success": AnyAgentToolValue(bool: true)]),
+                    isError: false))]),
+            ],
+            metadata: AgentMetadata(
+                executionTime: 0,
+                toolCallCount: 1,
+                modelName: "test",
+                startTime: Date(),
+                endTime: Date()))
+        #expect(try #require(result.executionTrace().entries.first).mutationDispatch == .possiblyDispatched)
+    }
+
+    init() throws {
+        try AuthorityTestSupport.prepare()
+    }
+
+    @Test
     func `Trace distinguishes dispatched mutations from boundary skips until fresh see`() async throws {
-        let service = try PeekabooAgentService(services: PeekabooServices())
+        let service = try AuthorityTestSupport.agent(services: AuthorityTestSupport.services())
         let recorder = AgentExecutionTraceRecorder()
         let tools = ["see", "click", "type", "set_value"].map { name in
             AgentTool(
@@ -27,7 +53,7 @@ struct AgentExecutionTraceTests {
             tools: tools,
             eventHandler: nil,
             sessionId: "trace-test",
-            executionPolicy: .unrestricted)
+            executionAuthority: .init(basePolicy: .unrestricted))
         var messages: [ModelMessage] = []
 
         _ = try await service.handleToolCalls(

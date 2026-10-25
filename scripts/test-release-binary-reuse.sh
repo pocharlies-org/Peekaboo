@@ -40,6 +40,14 @@ printf '%s\n' \
 HELPER
 chmod +x "$FIXTURE_ROOT/scripts/build-terminal-artifacts.sh"
 
+# Records the non-reuse CLI build's credential-runner request, then stops the release.
+cat >"$FIXTURE_ROOT/scripts/mac-release" <<'MAC_RELEASE'
+#!/usr/bin/env bash
+printf 'mac-release %s caller-path=%s\n' "$*" "${MAC_RELEASE_CALLER_PATH:-unset}" >>"${PEEKABOO_REUSE_TEST_LOG:?}"
+exit 1
+MAC_RELEASE
+chmod +x "$FIXTURE_ROOT/scripts/mac-release"
+
 cat >"$FIXTURE_ROOT/package.json" <<'JSON'
 {"name":"peekaboo-release-reuse-fixture","version":"9.9.9"}
 JSON
@@ -371,8 +379,11 @@ done
 # Functions and their variables are loaded from the exact driver under test.
 # shellcheck disable=SC1091,SC2034,SC2329
 (
+  set -euo pipefail
   fail() { echo "$*" >&2; exit 1; }
-  for function_name in sha256_file verify_checksums_file expected_release_assets_json prepare_release_assets; do
+  node() { "$REAL_NODE" "$@"; }
+  for function_name in sha256_file verify_checksums_file expected_release_assets_json prepare_release_assets \
+    select_release_asset_uploads verify_github_release_assets; do
     sed -n "/^$function_name() {$/,/^}$/p" "$FIXTURE_ROOT/scripts/release-binaries.sh" >> "$TEST_ROOT/driver-consumers.sh"
   done
   source "$TEST_ROOT/driver-consumers.sh"
@@ -405,6 +416,187 @@ ASSETS
   fi
   grep -F 'missing peekaboo-macos-x86_64.tar.gz' "$TEST_ROOT/missing-thin-checksum.out" >/dev/null
   cp "$TEST_ROOT/checksums-original" "$RELEASE_DIR/checksums.txt"
+
+  GITHUB_RELEASE_REPAIR_ASSETS=(checksums.txt peekaboo-macos-arm64.tar.gz)
+  select_release_asset_uploads
+  [[ ${#RELEASE_ASSET_UPLOADS[@]} -eq 2 ]]
+  [[ "${RELEASE_ASSET_UPLOADS[0]}" == "$RELEASE_DIR/peekaboo-macos-arm64.tar.gz" ]]
+  [[ "${RELEASE_ASSET_UPLOADS[1]}" == "$RELEASE_DIR/checksums.txt" ]]
+  GITHUB_RELEASE_REPAIR_ASSETS=()
+  select_release_asset_uploads
+  [[ ${#RELEASE_ASSET_UPLOADS[@]} -eq 0 ]]
+  GITHUB_RELEASE_REPAIR_ASSETS=(unknown.tar.gz)
+  if (select_release_asset_uploads) > "$TEST_ROOT/unknown-repair.out" 2>&1; then
+    fail 'release accepted an unknown repair asset'
+  fi
+  grep -Fq 'unknown.tar.gz matches 0 local release assets' "$TEST_ROOT/unknown-repair.out"
+  GITHUB_RELEASE_REPAIR_ASSETS=(checksums.txt)
+  RELEASE_ASSETS+=("$TEST_ROOT/checksums.txt")
+  if (select_release_asset_uploads) > "$TEST_ROOT/ambiguous-repair.out" 2>&1; then
+    fail 'release accepted an ambiguous repair asset'
+  fi
+  grep -Fq 'checksums.txt matches 2 local release assets' "$TEST_ROOT/ambiguous-repair.out"
+  prepare_release_assets
+
+  BLUE='' GREEN='' NC=''
+  VERSION=9.9.9
+  GITHUB_HOST=github.com
+  RELEASE_SOURCE_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  RELEASE_CONTRACT="$FIXTURE_ROOT/scripts/release-driver-contract.mjs"
+  PUBLICATION_RECEIPT_PATH="$TEST_ROOT/repair-receipt.json"
+  assert_publication_receipt() { :; }
+  github_tag_commit() { printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; }
+  github_release_api_path() { printf '%s\n' repos/openclaw/Peekaboo/releases/1; }
+  gh() {
+    [[ $# -eq 4 && "$1" == api && "$2" == --hostname && "$3" == github.com &&
+      "$4" == repos/openclaw/Peekaboo/releases/1 ]] || fail 'unexpected GitHub API arguments'
+    cat "$TEST_ROOT/repair-release.json"
+  }
+  node --input-type=module - "$TEST_ROOT/assets.json" "$PUBLICATION_RECEIPT_PATH" \
+    "$TEST_ROOT/repair-release.json" <<'REPAIR'
+import fs from 'node:fs';
+const assets = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+fs.writeFileSync(process.argv[3], JSON.stringify({ assets }));
+fs.writeFileSync(process.argv[4], JSON.stringify({
+  tag_name: 'v9.9.9', draft: true,
+  assets: Object.entries(assets).map(([name, asset]) => ({ name, size: asset.size, digest: `sha256:${asset.sha256}` })),
+}));
+REPAIR
+  verify_github_release_assets '' true true
+  [[ ${#GITHUB_RELEASE_REPAIR_ASSETS[@]} -eq 0 ]]
+  cp "$TEST_ROOT/repair-release.json" "$TEST_ROOT/intact-release.json"
+  node --input-type=module - "$TEST_ROOT/repair-release.json" <<'REPAIR'
+import fs from 'node:fs';
+const file = process.argv[2];
+const release = JSON.parse(fs.readFileSync(file, 'utf8'));
+release.assets = release.assets.filter(asset => asset.name !== 'peekaboo-macos-arm64.tar.gz');
+release.assets.find(asset => asset.name === 'checksums.txt').digest = 'sha256:wrong';
+fs.writeFileSync(file, JSON.stringify(release));
+REPAIR
+  verify_github_release_assets '' true true
+  [[ ${#GITHUB_RELEASE_REPAIR_ASSETS[@]} -eq 2 ]]
+  [[ "${GITHUB_RELEASE_REPAIR_ASSETS[0]}" == checksums.txt ]]
+  [[ "${GITHUB_RELEASE_REPAIR_ASSETS[1]}" == peekaboo-macos-arm64.tar.gz ]]
+  # Run outside an `if` so errexit remains active inside the strict verifier.
+  set +e
+  (set -euo pipefail; verify_github_release_assets '' true) > "$TEST_ROOT/strict-repair.out" 2>&1
+  strict_result=$?
+  set -e
+  [[ "$strict_result" -ne 0 ]] || fail 'strict verification accepted mismatching assets'
+  grep -Fq 'GitHub release asset inventory differs' "$TEST_ROOT/strict-repair.out"
+  cp "$TEST_ROOT/intact-release.json" "$TEST_ROOT/repair-release.json"
+  verify_github_release_assets '' true
+  [[ ${#GITHUB_RELEASE_REPAIR_ASSETS[@]} -eq 0 ]]
+  node -e '
+const fs = require("fs"), file = process.argv[1], release = JSON.parse(fs.readFileSync(file));
+release.assets.push(release.assets[0]);
+fs.writeFileSync(file, JSON.stringify(release));
+' "$TEST_ROOT/repair-release.json"
+  if (verify_github_release_assets '' true true) > "$TEST_ROOT/invalid-repair.out" 2>&1; then
+    fail 'repair verification accepted duplicate assets'
+  fi
+  grep -Fq 'GitHub release contains an unexpected asset that cannot be repaired' "$TEST_ROOT/invalid-repair.out"
+  grep -Fq 'GitHub release verification failed' "$TEST_ROOT/invalid-repair.out"
+  printf 'draft asset repair: exact selection, empty arrays, strict verification, and fail-closed checks passed\n'
+)
+
+# Exercise resume itself while all publication actions remain logged stubs.
+# shellcheck disable=SC1091,SC2034,SC2329
+(
+  set -euo pipefail
+  node() { "$REAL_NODE" "$@"; }
+  fail() { echo "$*" >&2; exit 1; }
+  for function_name in resume_publication prepare_release_assets select_release_asset_uploads; do
+    sed -n "/^$function_name() {$/,/^}$/p" "$FIXTURE_ROOT/scripts/release-binaries.sh" >> "$TEST_ROOT/resume-functions.sh"
+  done
+  source "$TEST_ROOT/resume-functions.sh"
+  RELEASE_DIR="$FIXTURE_ROOT/build/release"
+  CLI_ARCHITECTURES=(universal arm64 x86_64)
+  NPM_PACKAGE_PATH="$RELEASE_DIR/peekaboo-release-reuse-fixture-9.9.9.tgz"
+  RELEASE_PROOF_SHA256='' MAC_APP_ZIP_PATH=''
+  BLUE='' GREEN='' NC=''
+  VERSION=9.9.9
+  GITHUB_REPOSITORY=github.com/openclaw/Peekaboo
+  RETRY_NPM_PUBLISH=false
+  log() {
+    printf '%s' "$1" >> "$RESUME_LOG"
+    shift
+    if [[ $# -gt 0 ]]; then printf ' <%s>' "$@" >> "$RESUME_LOG"; fi
+    printf '\n' >> "$RESUME_LOG"
+  }
+  require_command() { log require_command "$@"; }
+  load_retained_release_state() { log load_retained_release_state "$@"; }
+  npm_publication_exists() { log npm_publication_exists "$@"; [[ "$npm_exists" == true ]]; }
+  verify_npm_publication() { log verify_npm_publication "$@"; }
+  compose_github_body() { log compose_github_body "$@"; }
+  freeze_publication_receipt() { log freeze_publication_receipt "$@"; }
+  assert_publication_receipt() { log assert_publication_receipt "$@"; }
+  github_release_exists() { log github_release_exists "$@"; return 0; }
+  validate_npm_publish_attempt() { log validate_npm_publish_attempt "$@"; return 1; }
+  activate_retained_pending_receipt() { log activate_retained_pending_receipt "$@"; }
+  configure_npm_publication() { log configure_npm_publication "$@"; }
+  confirm_npm_publication() { log confirm_npm_publication "$@"; }
+  publish_frozen_npm_package() { log publish_frozen_npm_package "$@"; }
+  gh() { log gh "$@"; }
+  verify_github_release_assets() {
+    log verify_github_release_assets "$@"
+    GITHUB_RELEASE_REPAIR_ASSETS=()
+    if [[ "${3:-}" == true && ${#test_repair_names[@]} -gt 0 ]]; then
+      GITHUB_RELEASE_REPAIR_ASSETS=("${test_repair_names[@]}")
+    fi
+  }
+  for npm_exists in true false; do
+    for repair_case in intact partial; do
+      RESUME_LOG="$TEST_ROOT/resume-$npm_exists-$repair_case.log"
+      test_repair_names=()
+      if [[ "$repair_case" == partial ]]; then
+        test_repair_names=(checksums.txt peekaboo-macos-arm64.tar.gz)
+      fi
+      resume_publication > "$TEST_ROOT/resume-$npm_exists-$repair_case.out"
+      if [[ "$repair_case" == intact ]]; then
+        grep -Fq 'All 6 draft assets match the frozen receipt; upload skipped' "$TEST_ROOT/resume-$npm_exists-$repair_case.out"
+      else
+        grep -Fq 'Re-uploading 2 of 6 draft assets: checksums.txt peekaboo-macos-arm64.tar.gz' \
+          "$TEST_ROOT/resume-$npm_exists-$repair_case.out"
+      fi
+    done
+  done
+  node --input-type=module - "$TEST_ROOT" "$RELEASE_DIR" <<'RESUME'
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+const [root, dir] = process.argv.slice(2);
+const call = (name, ...args) => name + args.map(arg => ` <${arg}>`).join('');
+const metadata = `${dir}/npm-publication.json`;
+for (const published of [true, false]) {
+  for (const repair of ['intact', 'partial']) {
+    const lines = fs.readFileSync(`${root}/resume-${published}-${repair}.log`, 'utf8').trim().split('\n');
+    const expected = [call('require_command', 'gh'), 'load_retained_release_state', 'npm_publication_exists'];
+    if (published) {
+      expected.push('verify_npm_publication', call('compose_github_body', metadata),
+        call('freeze_publication_receipt', metadata));
+    } else {
+      expected.push('validate_npm_publish_attempt', 'compose_github_body', 'activate_retained_pending_receipt',
+        'configure_npm_publication', 'confirm_npm_publication');
+    }
+    expected.push('github_release_exists', call('verify_github_release_assets', published ? metadata : '', 'true', 'true'));
+    if (repair === 'partial') {
+      expected.push(call('gh', 'release', 'upload', 'v9.9.9', `${dir}/peekaboo-macos-arm64.tar.gz`,
+        `${dir}/checksums.txt`, '--repo', 'github.com/openclaw/Peekaboo', '--clobber'));
+    }
+    expected.push(call('verify_github_release_assets', published ? metadata : '', 'true'));
+    if (!published) {
+      expected.push('publish_frozen_npm_package', 'verify_npm_publication', call('compose_github_body', metadata),
+        call('freeze_publication_receipt', metadata));
+    }
+    expected.push(call('assert_publication_receipt', metadata),
+      call('gh', 'release', 'edit', 'v9.9.9', '--repo', 'github.com/openclaw/Peekaboo',
+        '--notes-file', `${dir}/github-release-body.md`),
+      call('assert_publication_receipt', metadata), call('verify_github_release_assets', metadata));
+    assert.deepEqual(lines, expected, `${published}/${repair}`);
+  }
+}
+RESUME
+  printf 'resume publication: intact and partial drafts passed with npm published and pending\n'
 )
 
 first_candidate=$(grep -n -m1 '^candidate-executed$' "$VERIFY_LOG" | cut -d: -f1)
@@ -428,6 +620,34 @@ if grep -Eq 'pnpm run build:swift|build-swift-(arm|universal)' "$VERIFY_LOG"; th
   echo 'reuse lane rebuilt the CLI' >&2
   exit 1
 fi
+if grep '^prepare-release ' "$VERIFY_LOG" | grep -Fq -- '--force'; then
+  echo 'default preflight allowed a non-main branch' >&2
+  exit 1
+fi
+
+: >"$VERIFY_LOG"
+if run_release "$FIXTURE_COMMIT" safe 'x86_64 arm64' 0 single --release-branch \
+  >"$TEST_ROOT/release-branch-mismatch.out" 2>&1; then
+  echo 'release-branch mode accepted a branch other than release/<version>' >&2
+  exit 1
+fi
+grep -Fq -- '--release-branch requires the release/9.9.9 branch' "$TEST_ROOT/release-branch-mismatch.out"
+if grep -q '^prepare-release ' "$VERIFY_LOG"; then
+  echo 'release-branch mismatch reached the preflight' >&2
+  exit 1
+fi
+fixture_branch=$(git -C "$FIXTURE_ROOT" branch --show-current)
+git -C "$FIXTURE_ROOT" switch -q -c release/9.9.9
+: >"$VERIFY_LOG"
+if ! run_release "$FIXTURE_COMMIT" safe 'x86_64 arm64' 0 single --release-branch \
+  >"$TEST_ROOT/release-branch.out" 2>&1; then
+  cat "$TEST_ROOT/release-branch.out" >&2
+  echo 'release-branch mode rejected release/9.9.9' >&2
+  exit 1
+fi
+grep -Fq "prepare-release scripts/prepare-release.js --no-build --bin $FIXTURE_ROOT/peekaboo --force" "$VERIFY_LOG"
+git -C "$FIXTURE_ROOT" switch -q "$fixture_branch"
+git -C "$FIXTURE_ROOT" branch -q -D release/9.9.9
 
 if ! run_release "$FIXTURE_COMMIT" safe arm64 0 single --arm64-only >"$TEST_ROOT/arm64-only.out" 2>&1; then
   echo 'local arm64-only packaging rejected an already-thin CLI' >&2
@@ -487,6 +707,58 @@ for public_action in --create-github-release --publish-npm; do
   fi
   grep -Fq -- '--proof-file' "$TEST_ROOT/missing-proof.out"
   [[ ! -s "$VERIFY_LOG" ]]
+done
+
+printf 'reviewed proof\n' > "$TEST_ROOT/public-proof.md"
+run_public_release() {
+  (
+    cd "$FIXTURE_ROOT"
+    /usr/bin/env -u NPM_TOKEN -u CODESIGN_KEYCHAIN -u MAC_RELEASE_CALLER_PATH "$@" \
+      PATH="$FAKE_BIN:$PATH" PEEKABOO_REUSE_REAL_NODE="$REAL_NODE" \
+      PEEKABOO_REUSE_NODE_LOG="$NODE_LOG" PEEKABOO_REUSE_TEST_LOG="$VERIFY_LOG" \
+      ./scripts/release-binaries.sh --create-github-release --publish-npm \
+      --proof-file "$TEST_ROOT/public-proof.md"
+  )
+}
+
+# npm publication happens after the full build; its token must be checked first.
+: >"$VERIFY_LOG"
+: >"$NODE_LOG"
+if run_public_release >"$TEST_ROOT/missing-npm-token.out" 2>&1; then
+  echo 'public release accepted a missing NPM_TOKEN' >&2
+  exit 1
+fi
+grep -Fq 'NPM_TOKEN is required for --publish-npm' "$TEST_ROOT/missing-npm-token.out"
+[[ ! -s "$VERIFY_LOG" ]]
+if grep -Fq 'prepare-release.js' "$NODE_LOG"; then
+  echo 'missing NPM_TOKEN reached the release preflight' >&2
+  exit 1
+fi
+
+# scripts/mac-release narrows PATH before the helper records the child PATH.
+for caller_path in default /fixture/bin:/usr/bin:/bin; do
+  : >"$VERIFY_LOG"
+  caller_env=()
+  expected_caller_path=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+  if [[ "$caller_path" != default ]]; then
+    caller_env=("MAC_RELEASE_CALLER_PATH=$caller_path")
+    expected_caller_path=$caller_path
+  fi
+  if run_public_release NPM_TOKEN=fixture-token ${caller_env[@]+"${caller_env[@]}"} \
+    >"$TEST_ROOT/npm-token.out" 2>&1; then
+    echo 'fixture public release unexpectedly passed the stubbed CLI build' >&2
+    exit 1
+  fi
+  if grep -Fq 'NPM_TOKEN is required' "$TEST_ROOT/npm-token.out"; then
+    echo 'public release rejected a present NPM_TOKEN' >&2
+    exit 1
+  fi
+  grep -Fq 'prepare-release scripts/prepare-release.js' "$VERIFY_LOG"
+  grep -Fxq "mac-release codesign-run -- pnpm run build:swift:all caller-path=$expected_caller_path" \
+    "$VERIFY_LOG" || {
+    echo "CLI build codesign-run did not receive caller PATH $expected_caller_path" >&2
+    exit 1
+  }
 done
 
 mkdir -p "$FIXTURE_ROOT/build"

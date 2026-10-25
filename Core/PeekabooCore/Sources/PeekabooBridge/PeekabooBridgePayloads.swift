@@ -160,6 +160,18 @@ public struct PeekabooBridgeForegroundModifierClickRequest: Codable, Sendable {
     }
 }
 
+public struct PeekabooBridgeSelectTextRequest: Codable, Sendable {
+    public let target: String
+    public let request: TextSelectionRequest
+    public let snapshotId: String?
+
+    public init(target: String, request: TextSelectionRequest, snapshotId: String?) {
+        self.target = target
+        self.request = request
+        self.snapshotId = snapshotId
+    }
+}
+
 public struct PeekabooBridgeSetValueRequest: Codable, Sendable {
     public let target: String
     public let value: UIElementValue
@@ -255,19 +267,25 @@ public struct PeekabooBridgeExactWindowHotkeyRequest: Codable, Sendable {
     public let expectedWindowIdentity: WindowMutationIdentity
     public let expectedWindowBounds: CGRect
     public let expectedFocusedElement: FocusedElementIdentity?
+    public let clipboardClaim: GeneralPasteboardWriteClaim?
+    public let backgroundPreparation: BackgroundWindowKeyboardPreparationMode?
 
     public init(
         keys: String,
         holdDuration: Int,
         expectedWindowIdentity: WindowMutationIdentity,
         expectedWindowBounds: CGRect,
-        expectedFocusedElement: FocusedElementIdentity? = nil)
+        expectedFocusedElement: FocusedElementIdentity? = nil,
+        clipboardClaim: GeneralPasteboardWriteClaim? = nil,
+        backgroundPreparation: BackgroundWindowKeyboardPreparationMode? = nil)
     {
         self.keys = keys
         self.holdDuration = holdDuration
         self.expectedWindowIdentity = expectedWindowIdentity
         self.expectedWindowBounds = expectedWindowBounds
         self.expectedFocusedElement = expectedFocusedElement
+        self.clipboardClaim = clipboardClaim
+        self.backgroundPreparation = backgroundPreparation
     }
 }
 

@@ -5,7 +5,7 @@ import Testing
 @testable import PeekabooAgentRuntime
 @testable import PeekabooCore
 
-@Suite(.serialized, .tags(.safe))
+@Suite(.serialized, .tags(.safe), EnvironmentFreeTachikomaConfiguration())
 struct PeekabooAgentResumeModelContinuityTests {
     @Test
     @MainActor
@@ -366,5 +366,22 @@ private final class CountingContinuityProvider: ModelProvider, @unchecked Sendab
         AsyncThrowingStream { continuation in
             continuation.finish()
         }
+    }
+}
+
+/// These tests resolve real local providers through the process default configuration. Synthetic authority suites in
+/// the same serial test process replace that default with a provider-forbidding one, so own it for this suite.
+private struct EnvironmentFreeTachikomaConfiguration: SuiteTrait, TestScoping {
+    typealias TestBody = @concurrent @Sendable () async throws -> Void
+
+    func provideScope(
+        for _: Test,
+        testCase _: Test.Case?,
+        performing function: TestBody) async throws
+    {
+        let previousConfiguration = TachikomaConfiguration.default
+        TachikomaConfiguration.default = TachikomaConfiguration(loadFromEnvironment: false)
+        defer { TachikomaConfiguration.default = previousConfiguration }
+        try await function()
     }
 }

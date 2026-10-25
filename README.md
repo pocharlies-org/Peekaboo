@@ -51,9 +51,9 @@ peekaboo see --app Finder --json
 
 That is the core loop: observe the current screen, choose an element from the result, and act on it.
 
-## What's new in 4.7.0
+## What's new in 4.8.0
 
-Peekaboo 4.7.0 fixes the 4.6.0 CLI startup failure on Macs without the macOS 27 runtime and adds GPT-6 Astra, Sol, and Luna plus GPT-6.1 Sol model selection. Unattended clipboard reads no longer trigger macOS privacy prompts, and paste cleanup preserves newer clipboard contents. MCP clients can request structured element tables with `include_elements`, CLI JSON and observations report focused text selection and visible display bounds, and compatible-provider Agent streams keep fragmented tool arguments intact. CLI clipboard reads that previously prompted now refuse; see the changelog Compatibility notes for `clipboard status` and `--allow-prompt`.
+Peekaboo 4.8.0 adds exact-window background drag, text selection (`select-text`), and coordinate scrolling (`scroll --at`) to the CLI and MCP, and makes background rich paste work in freshly launched windows while fencing it against concurrent clipboard changes. Background scrolling now reaches Safari, `see --fresh` takes uncached Accessibility reads on request, observations report date-valued controls, and capture recovers when slow startup safety checks finish late. These background actions and fresh reads need the matching 4.8.0 Peekaboo app as the Bridge host; see the changelog Compatibility notes.
 
 ## Automate an app
 

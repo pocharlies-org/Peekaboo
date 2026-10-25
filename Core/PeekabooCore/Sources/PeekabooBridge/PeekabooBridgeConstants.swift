@@ -3,6 +3,12 @@ import Foundation
 public enum PeekabooBridgeConstants {
     public static let socketName = "bridge.sock"
     public static let cliBundleIdentifier = "boo.peekaboo.peekaboo"
+    public static let certificationControllerBundleIdentifier = "boo.peekaboo.peekaboo-certification-controller"
+    public static let guiClientBundleIdentifiers: Set<String> = [
+        PeekabooBridgeConstants.cliBundleIdentifier,
+        "boo.peekaboo.mac",
+        PeekabooBridgeConstants.certificationControllerBundleIdentifier,
+    ]
 
     /// Release identities accepted during the OpenClaw Foundation signing migration.
     /// Keep the legacy team while standalone CLIs must interoperate with pre-3.8 GUI hosts.
@@ -71,7 +77,22 @@ public enum PeekabooBridgeConstants {
     }
 
     /// Current protocol version supported by this build.
-    public static let protocolVersion = PeekabooBridgeProtocolVersion(major: 1, minor: 38)
+    public static let protocolVersion = PeekabooBridgeProtocolVersion(major: 1, minor: 43)
+
+    public static let backgroundCoordinateScrollVersion = PeekabooBridgeProtocolVersion(major: 1, minor: 43)
+
+    public static let textSelectionVersion = PeekabooBridgeProtocolVersion(major: 1, minor: 42)
+
+    /// Explicit target-only preparation before a clipboard-guarded exact-window paste.
+    public static let preparedClipboardGuardedExactWindowHotkeyVersion = PeekabooBridgeProtocolVersion(
+        major: 1,
+        minor: 41)
+
+    /// First protocol that fences exact-window paste with the caller's retained clipboard write claim.
+    public static let clipboardGuardedExactWindowHotkeyVersion = PeekabooBridgeProtocolVersion(major: 1, minor: 40)
+
+    /// First protocol with a bounded exact-window drag owned by the held-pointer lifecycle.
+    public static let exactWindowDragVersion = PeekabooBridgeProtocolVersion(major: 1, minor: 39)
 
     /// First protocol with one-shot, receipt-bound foreground-connect handoff to a caller-scoped browser session.
     public static let browserConnectionHandoffVersion =
