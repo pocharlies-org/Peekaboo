@@ -37,10 +37,13 @@ let package = Package(
         .library(
             name: "PeekabooBridge",
             targets: ["PeekabooBridge"]),
-        // Test-only support product. Production targets do not depend on or link this module.
+        // Test-only support products. Production targets do not depend on or link these modules.
         .library(
             name: "PeekabooBridgeTestSupport",
             targets: ["PeekabooBridgeTestSupport"]),
+        .library(
+            name: "PeekabooAgentRuntimeTestSupport",
+            targets: ["PeekabooAgentRuntimeTestSupport"]),
         .library(
             name: "PeekabooCore",
             targets: ["PeekabooCore"]),
@@ -52,10 +55,11 @@ let package = Package(
         .package(path: "../PeekabooExternalDependencies"),
         .package(path: "../PeekabooVisualizer"),
         .package(path: "../../Tachikoma"),
-        // Pin swift-sdk#276's capability decoder until it is included in a tagged SDK.
+        // Pin swift-sdk#276's capability decoder until it is included in a tagged SDK. Its fork rebases the
+        // branch, so re-pin to the PR's current head if this revision ever stops resolving.
         .package(
             url: "https://github.com/modelcontextprotocol/swift-sdk.git",
-            revision: "f7077e0d5cd57e0b2a497862017aa94ee344252f"),
+            revision: "6f02d8e7b5c0795698f5a90366f2081ebc91530d"),
         .package(url: "https://github.com/apple/swift-configuration", from: "1.0.0"),
     ],
     targets: [
@@ -77,6 +81,17 @@ let package = Package(
                 "Services/README.md",
             ],
             swiftSettings: coreTargetSettings),
+        .target(
+            name: "PeekabooAgentRuntimeTestSupport",
+            dependencies: [
+                "PeekabooAgentRuntime",
+                "PeekabooAutomation",
+                "PeekabooCore",
+                .product(name: "PeekabooFoundationTestSupport", package: "PeekabooFoundation"),
+                .product(name: "Tachikoma", package: "Tachikoma"),
+            ],
+            path: "Sources/PeekabooAgentRuntimeTestSupport",
+            swiftSettings: approachableConcurrencySettings),
         .testTarget(
             name: "PeekabooAutomationTests",
             dependencies: [
@@ -101,6 +116,7 @@ let package = Package(
             name: "PeekabooBridgeTests",
             dependencies: [
                 "PeekabooBridge",
+                "PeekabooBridgeTestSupport",
                 .product(name: "PeekabooAutomationKit", package: "PeekabooAutomationKit"),
                 .product(name: "PeekabooFoundation", package: "PeekabooFoundation"),
             ],
@@ -139,6 +155,7 @@ let package = Package(
             name: "PeekabooAgentRuntimeTests",
             dependencies: [
                 "PeekabooAgentRuntime",
+                "PeekabooAgentRuntimeTestSupport",
                 "PeekabooCore",
                 .product(name: "PeekabooFoundation", package: "PeekabooFoundation"),
                 .product(name: "PeekabooFoundationTestSupport", package: "PeekabooFoundation"),
@@ -169,6 +186,7 @@ let package = Package(
             name: "PeekabooTests",
             dependencies: [
                 "PeekabooCore",
+                "PeekabooAgentRuntimeTestSupport",
                 "PeekabooAutomation",
                 "PeekabooAgentRuntime",
                 .product(name: "PeekabooAutomationKit", package: "PeekabooAutomationKit"),

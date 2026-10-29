@@ -113,21 +113,11 @@ extension LegacyScreenCaptureOperator {
             size: CGSize(width: image.width, height: image.height),
             mode: .window,
             applicationInfo: app,
-            windowInfo: ServiceWindowInfo(
-                windowID: Int(windowID),
-                title: windowTitle,
+            windowInfo: Self.captureWindowInfo(
+                from: targetWindow,
+                windowID: windowID,
                 bounds: bounds,
-                isMinimized: false,
-                isMainWindow: true,
-                windowLevel: 0,
-                alpha: 1.0,
                 index: resolvedIndex,
-                isOffScreen: !SystemIdentityResolver.windowIsOnScreen(targetWindow),
-                layer: targetWindow[kCGWindowLayer as String] as? Int ?? 0,
-                isOnScreen: SystemIdentityResolver.windowIsOnScreen(targetWindow),
-                sharingState: (targetWindow[kCGWindowSharingState as String] as? Int).flatMap {
-                    WindowSharingState(rawValue: $0)
-                },
                 mutationIdentity: mutationIdentity),
             displayInfo: DisplayInfo(
                 index: resolvedIndex,
@@ -201,10 +191,12 @@ extension LegacyScreenCaptureOperator {
         }
 
         let applicationInfo: ServiceApplicationInfo? = if let runningApplication = NSRunningApplication(
-            processIdentifier: owningPid)
+            processIdentifier: owningPid),
+            let processIdentifier = RunningApplicationProcessIdentity.resolve(runningApplication),
+            processIdentifier == owningPid
         {
             ServiceApplicationInfo(
-                processIdentifier: runningApplication.processIdentifier,
+                processIdentifier: processIdentifier,
                 processStartIdentity: mutationIdentity?.ownerProcessStartIdentity,
                 bundleIdentifier: runningApplication.bundleIdentifier,
                 name: runningApplication.localizedName ?? runningApplication.bundleIdentifier ?? "Unknown",
@@ -220,21 +212,11 @@ extension LegacyScreenCaptureOperator {
             size: CGSize(width: image.width, height: image.height),
             mode: .window,
             applicationInfo: applicationInfo,
-            windowInfo: ServiceWindowInfo(
-                windowID: Int(windowID),
-                title: windowTitle,
+            windowInfo: Self.captureWindowInfo(
+                from: targetWindow,
+                windowID: windowID,
                 bounds: bounds,
-                isMinimized: false,
-                isMainWindow: true,
-                windowLevel: 0,
-                alpha: 1.0,
                 index: resolvedIndex,
-                isOffScreen: !SystemIdentityResolver.windowIsOnScreen(targetWindow),
-                layer: targetWindow[kCGWindowLayer as String] as? Int ?? 0,
-                isOnScreen: SystemIdentityResolver.windowIsOnScreen(targetWindow),
-                sharingState: (targetWindow[kCGWindowSharingState as String] as? Int).flatMap {
-                    WindowSharingState(rawValue: $0)
-                },
                 mutationIdentity: mutationIdentity),
             displayInfo: DisplayInfo(
                 index: 0,
@@ -248,6 +230,32 @@ extension LegacyScreenCaptureOperator {
         return CaptureResult(
             imageData: imageData,
             metadata: metadata)
+    }
+
+    nonisolated static func captureWindowInfo(
+        from window: [String: Any],
+        windowID: CGWindowID,
+        bounds: CGRect,
+        index: Int,
+        mutationIdentity: WindowMutationIdentity?) -> ServiceWindowInfo
+    {
+        ServiceWindowInfo(
+            windowID: Int(windowID),
+            title: window[kCGWindowName as String] as? String ?? "untitled",
+            bounds: bounds,
+            isMinimized: false,
+            // Capture selection and WindowServer visibility do not establish AX main-window state.
+            isMainWindow: false,
+            windowLevel: 0,
+            alpha: 1.0,
+            index: index,
+            isOffScreen: !SystemIdentityResolver.windowIsOnScreen(window),
+            layer: window[kCGWindowLayer as String] as? Int ?? 0,
+            isOnScreen: SystemIdentityResolver.windowIsOnScreen(window),
+            sharingState: (window[kCGWindowSharingState as String] as? Int).flatMap {
+                WindowSharingState(rawValue: $0)
+            },
+            mutationIdentity: mutationIdentity)
     }
 
     private static func windowMutationSnapshot(

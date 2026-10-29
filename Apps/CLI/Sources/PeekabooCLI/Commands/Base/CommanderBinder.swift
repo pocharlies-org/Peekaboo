@@ -124,8 +124,9 @@ enum CommanderCLIBinder {
             options.requiresProcessGenerationPinnedClicks = true
             options.requiresTargetedClickAccessibilityValueDelivery = true
         }
-        options.requiresTargetedScroll = commandType == ScrollCommand.self &&
-            !commandValues.flag("foreground")
+        options.requiresTargetedScroll = commandType == ScrollCommand.self && usesBackgroundInput
+        options.requiresBackgroundCoordinateScroll = commandType == ScrollCommand.self &&
+            commandValues.singleOption("at") != nil
         options.requiresPostEventPermission = Self.requiresPostEventPermission(
             commandType,
             parsedValues: parsedValues
@@ -162,23 +163,25 @@ enum CommanderCLIBinder {
             options.usesPerToolSnapshotInvalidation
         options.verbose = parsedValues.flags.contains("verbose")
         options.jsonOutput = parsedValues.flags.contains("jsonOutput")
-        let values = CommanderBindableValues(parsedValues: parsedValues)
-        if let level: LogLevel = try values.decodeOption("logLevel", as: LogLevel.self) {
+        if let level: LogLevel = try commandValues.decodeOption("logLevel", as: LogLevel.self) {
             options.logLevel = level
         }
-        try Self.applyCaptureEnginePreference(to: &options, values: values, seeSkipsPixels: seeSkipsPixels)
+        try Self.applyCaptureEnginePreference(to: &options, values: commandValues, seeSkipsPixels: seeSkipsPixels)
         try Self.applyRuntimeTransportOptions(
             &options,
             commandType: commandType,
             parsedValues: parsedValues,
             environment: environment
         )
+        Self.applyRoutePermissionOptions(&options, commandType, values: commandValues)
         if commandType == SetValueCommand.self {
             options.requiredElementActionOperations.insert(.setValue)
+        } else if commandType == SelectTextCommand.self {
+            options.requiredElementActionOperations.insert(.selectText)
         } else if commandType == ActionCommand.self {
             options.requiredElementActionOperations.insert(.performAction)
         }
-        if commandType == SeeCommand.self, values.flag("noScreenshot") {
+        if commandType == SeeCommand.self, commandValues.flag("noScreenshot") {
             options.requiresInspectAccessibilityTree = true
         }
         if commandType == BrowserCommand.self {
@@ -277,6 +280,8 @@ enum CommanderCLIBinder {
         let seeSkipsPixels = commandType == SeeCommand.self && values.flag("noScreenshot")
         options.requiresDesktopObservation = commandType == SeeCommand.self && !seeSkipsPixels
         options.requiresDesktopObservationOCR = commandType == SeeCommand.self && values.flag("ocr")
+        options.requiresDesktopObservationFreshAccessibilityTree = commandType == SeeCommand.self &&
+            values.flag("fresh") && !seeSkipsPixels
         options.requiresExplicitSnapshotPublication = commandType == SeeCommand.self &&
             values.flag("noElements") &&
             values.singleOption("windowId") != nil &&
@@ -425,7 +430,8 @@ enum CommanderCLIBinder {
             return mayRefreshObservation && (values.singleOption("to") != nil ||
                 values.singleOption("on") != nil)
         }
-        if commandType == SetValueCommand.self || commandType == ActionCommand.self {
+        if commandType == SetValueCommand.self || commandType == SelectTextCommand.self || commandType == ActionCommand
+            .self {
             let hasElementReference = values.singleOption("on")?
                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
             let hasExplicitTarget = ["app", "pid", "windowId", "windowTitle", "windowIndex"]
@@ -473,6 +479,7 @@ enum CommanderCLIBinder {
             commandType == ScrollCommand.self ||
             commandType == DragCommand.self ||
             commandType == SetValueCommand.self ||
+            commandType == SelectTextCommand.self ||
             commandType == ActionCommand.self ||
             commandType == CaptureActionCommand.self ||
             commandType == WindowCommand.FocusSubcommand.self ||

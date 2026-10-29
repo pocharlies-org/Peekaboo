@@ -564,6 +564,8 @@ public final class FocusManagementService {
         public let retryCount: Int
         public let switchSpace: Bool
         public let bringToCurrentSpace: Bool
+        /// Foreground close only. Other focus callers keep the raw frontmost PID.
+        let recoverNonPositiveFrontmostProcessIdentifier: Bool
 
         public init(
             timeout: TimeInterval = 5.0,
@@ -571,10 +573,26 @@ public final class FocusManagementService {
             switchSpace: Bool = true,
             bringToCurrentSpace: Bool = false)
         {
+            self.init(
+                timeout: timeout,
+                retryCount: retryCount,
+                switchSpace: switchSpace,
+                bringToCurrentSpace: bringToCurrentSpace,
+                recoverNonPositiveFrontmostProcessIdentifier: false)
+        }
+
+        init(
+            timeout: TimeInterval,
+            retryCount: Int,
+            switchSpace: Bool,
+            bringToCurrentSpace: Bool,
+            recoverNonPositiveFrontmostProcessIdentifier: Bool)
+        {
             self.timeout = timeout
             self.retryCount = retryCount
             self.switchSpace = switchSpace
             self.bringToCurrentSpace = bringToCurrentSpace
+            self.recoverNonPositiveFrontmostProcessIdentifier = recoverNonPositiveFrontmostProcessIdentifier
         }
     }
 
@@ -692,7 +710,8 @@ public final class FocusManagementService {
     func focusDialogWindowWithOwnedLane(
         target: UIAutomationTarget.ExactWindow,
         dialog: Element,
-        options: FocusOptions = FocusOptions()) async throws
+        options: FocusOptions = FocusOptions(),
+        onDispatch: ((FocusDispatchRecord) -> Void)? = nil) async throws
     {
         try await self.focusWindowWithOwnedLane(
             windowID: CGWindowID(target.identity.windowID),
@@ -704,7 +723,83 @@ public final class FocusManagementService {
                     dialog: dialog),
                 expectedIdentity: target.identity,
                 dispatchGuard: nil,
-                onDispatch: nil))
+                onDispatch: onDispatch))
+    }
+
+    func focusFileDialogWindowWithOwnedLane(
+        target: UIAutomationTarget.ExactWindow,
+        window: Element,
+        dialog: Element,
+        options: FocusOptions,
+        onDispatch: @escaping (FocusDispatchRecord) -> Void) async throws
+    {
+        let windowID = CGWindowID(target.identity.windowID)
+        let guardOwnership = FocusDispatchGuard {
+            guard let current = self.windowIdentityService.findWindow(byID: windowID, messagingTimeout: 0.1),
+                  DialogService.sameElement(current.element, window),
+                  DialogService.rawElementPresence(dialog, in: current.element) == .present
+            else { throw FocusError.focusVerificationFailed(windowID) }
+        }
+        try guardOwnership.validate(.unspecified)
+        let attached = DialogService.sameElement(window, dialog) ? nil : AttachedDialogFocusReceipt(
+            parentIdentity: target.identity, parentBounds: target.bounds, dialog: dialog)
+        try await self.focusWindowWithOwnedLane(
+            windowID: windowID,
+            options: options,
+            context: FocusWindowDispatchContext(
+                attachedDialog: attached,
+                expectedIdentity: target.identity,
+                dispatchGuard: guardOwnership,
+                onDispatch: onDispatch))
+    }
+
+    func requireFileDialogWindowFocusWithOwnedLane(
+        target: UIAutomationTarget.ExactWindow,
+        window: Element,
+        dialog: Element,
+        timeout: TimeInterval) async throws
+    {
+        if DialogService.sameElement(window, dialog) {
+            let windowID = CGWindowID(target.identity.windowID)
+            guard let current = self.windowIdentityService.findWindow(byID: windowID, messagingTimeout: 0.1),
+                  DialogService.sameElement(current.element, window)
+            else { throw FocusError.focusVerificationFailed(windowID) }
+            try await self.verifyWindowFocus(
+                current.element,
+                windowID: windowID,
+                timeout: timeout,
+                attachedDialog: nil,
+                expectedIdentity: target.identity)
+        } else {
+            try await self.requireDialogWindowFocusWithOwnedLane(target: target, dialog: dialog, timeout: timeout)
+        }
+    }
+
+    /// File operations already own the parent/panel plan. Recheck it synchronously at each input boundary.
+    func requireFileDialogDispatchFocus(
+        target: UIAutomationTarget.ExactWindow,
+        window: Element,
+        dialog: Element,
+        field: Element?) throws
+    {
+        let windowID = CGWindowID(target.identity.windowID)
+        guard SystemIdentityResolver.validateWindowMutationIdentity(target.identity, expectedBounds: target.bounds),
+              let current = self.windowIdentityService.findWindow(byID: windowID, messagingTimeout: 0.1),
+              DialogService.sameElement(current.element, window),
+              let app = NSRunningApplication(processIdentifier: target.identity.ownerProcessIdentifier),
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+              let focused = self.focusedWindow(for: app, timeout: 0.1),
+              focused.pid() == app.processIdentifier,
+              DialogService.sameElement(focused, dialog),
+              DialogService.rawElementPresence(dialog, in: window) == .present
+        else { throw FocusError.focusVerificationFailed(windowID) }
+        if let field {
+            guard let focusedField = self.focusedElement(for: app, timeout: 0.1),
+                  focusedField.pid() == app.processIdentifier,
+                  DialogService.sameElement(focusedField, field),
+                  DialogService.rawElementPresence(field, in: dialog) == .present
+            else { throw FocusError.focusVerificationFailed(windowID) }
+        }
     }
 
     /// Verify an already-focused exact dialog without activating, raising, or changing Spaces.
@@ -939,7 +1034,9 @@ public final class FocusManagementService {
                     windowID: windowID,
                     timeout: min(options.timeout, 0.15),
                     attachedDialog: attachedDialog,
-                    expectedIdentity: expectedIdentity)
+                    expectedIdentity: expectedIdentity,
+                    recoverNonPositiveFrontmostProcessIdentifier: options
+                        .recoverNonPositiveFrontmostProcessIdentifier)
                 return
             } catch is CancellationError {
                 throw CancellationError()
@@ -1091,7 +1188,9 @@ public final class FocusManagementService {
                             windowID: windowID,
                             timeout: options.timeout,
                             attachedDialog: context.attachedDialog,
-                            expectedIdentity: context.expectedIdentity)
+                            expectedIdentity: context.expectedIdentity,
+                            recoverNonPositiveFrontmostProcessIdentifier: options
+                                .recoverNonPositiveFrontmostProcessIdentifier)
                     },
                     completeRaise: {
                         // Accepted AXRaise is terminal only after the exact focus observation settles.
@@ -1110,10 +1209,14 @@ public final class FocusManagementService {
         windowID: CGWindowID,
         timeout: TimeInterval,
         attachedDialog: AttachedDialogFocusReceipt?,
-        expectedIdentity: WindowMutationIdentity? = nil) async throws
+        expectedIdentity: WindowMutationIdentity? = nil,
+        recoverNonPositiveFrontmostProcessIdentifier: Bool = false) async throws
     {
+        // The window element's PID stays positive after re-exec. The NSRunningApplication
+        // for that same PID can report -1, and an AX query of -1 never sees the focused window.
         guard let ownerPID = Self.processIdentifier(for: windowElement.underlyingElement),
-              let runningApp = NSRunningApplication(processIdentifier: ownerPID)
+              ownerPID > 0,
+              NSRunningApplication(processIdentifier: ownerPID) != nil
         else {
             throw FocusError.focusVerificationFailed(windowID)
         }
@@ -1127,14 +1230,17 @@ public final class FocusManagementService {
             let remainingTimeout = timeout - Date().timeIntervalSince(startTime)
             let isMinimized = windowElement.isMinimized() ?? false
             let focusedWindow = self.focusedWindow(
-                for: runningApp,
+                pid: ownerPID,
                 timeout: min(0.1, remainingTimeout))
             let focusedWindowID = focusedWindow.flatMap {
                 self.windowIdentityService.getWindowID(
                     from: $0,
                     messagingTimeout: Float(min(0.1, remainingTimeout)))
             }
-            let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            // A re-exec app can be frontmost while AppKit reports PID -1. Only foreground close
+            // recovers that PID, and a switch or a new PID still fails the same equality check.
+            let frontmostPID = focusVerificationCurrentFrontmostProcessIdentifier(
+                recoverNonPositiveFrontmostProcessIdentifier: recoverNonPositiveFrontmostProcessIdentifier)
             let preparedGenerationMatches = attachedDialog.map {
                 SystemIdentityResolver.processStartIdentity(ownerPID) == $0.parentIdentity.ownerProcessStartIdentity
             } ?? true
@@ -1232,6 +1338,14 @@ public final class FocusManagementService {
         guard timeout > 0 else { return nil }
         let axApp = AXApp(app)
         return try? axApp.element.withMessagingTimeout(Float(timeout)) { _ in axApp.focusedWindow() }
+    }
+
+    /// Query AX with the window element's PID. `AXApp` uses `NSRunningApplication.processIdentifier`,
+    /// which is -1 after re-exec even when this PID is the live process.
+    private func focusedWindow(pid: pid_t, timeout: TimeInterval) -> Element? {
+        guard timeout > 0, pid > 0 else { return nil }
+        let application = Element(AXUIElementCreateApplication(pid))
+        return try? application.withMessagingTimeout(Float(timeout)) { $0.focusedWindow() }
     }
 
     private func focusedElement(for app: NSRunningApplication, timeout: TimeInterval) -> Element? {

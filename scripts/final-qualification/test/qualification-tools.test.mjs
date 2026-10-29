@@ -44,7 +44,9 @@ import {
   aggregateSHA256,
   canonicalBytes,
   isSupportedQualificationHostProtocol,
+  prepareAtomicPublisher,
   publishPrivateAtomicNoReplace,
+  releaseAtomicPublisher,
   sha256,
   validateCurrentQualificationBridgeHandshake,
 } from '../lib.mjs';
@@ -3751,6 +3753,66 @@ test('retained atomic publisher uses a closed toolchain and revalidates publishe
   }
 });
 
+test('prepared atomic publisher is reused, re-verified before each use, and released', () => {
+  const root = fs.mkdtempSync('/private/tmp/pbq-tools-prepared-atomic-');
+  fs.chmodSync(root, 0o700);
+  let publisher = null;
+  let freshPublisher = null;
+  try {
+    publisher = prepareAtomicPublisher();
+    for (const name of ['first', 'second']) {
+      const output = path.join(root, `${name}.json`);
+      const value = { name, version: 1 };
+      const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
+      const result = publishPrivateAtomicNoReplace(output, value, { publisher });
+      assert.deepEqual(result.bytes, bytes);
+      assert.deepEqual(fs.readFileSync(output), bytes);
+      assert.equal(fs.statSync(output).mode & 0o777, 0o600);
+      assert.equal(fs.existsSync(publisher.directory), true);
+    }
+
+    fs.chmodSync(publisher.path, 0o700);
+    fs.writeFileSync(publisher.path, 'tampered publisher\n');
+    fs.chmodSync(publisher.path, 0o500);
+    const tamperedOutput = path.join(root, 'third.json');
+    assert.throws(
+      () => publishPrivateAtomicNoReplace(tamperedOutput, { version: 1 }, { publisher }),
+      /changed/,
+    );
+    assert.equal(fs.existsSync(tamperedOutput), false);
+    assert.equal(fs.readdirSync(root).some((name) => name.startsWith('.third.json.') && name.endsWith('.tmp')), false);
+
+    freshPublisher = prepareAtomicPublisher();
+    fs.chmodSync(freshPublisher.directory, 0o755);
+    assert.throws(
+      () => publishPrivateAtomicNoReplace(path.join(root, 'loosened.json'), { version: 1 }, {
+        publisher: freshPublisher,
+      }),
+      /changed/,
+    );
+    fs.chmodSync(freshPublisher.directory, 0o700);
+    const forged = { directory: freshPublisher.directory, path: freshPublisher.path, sha256: freshPublisher.sha256 };
+    assert.throws(
+      () => publishPrivateAtomicNoReplace(path.join(root, 'forged.json'), { version: 1 }, { publisher: forged }),
+      /not a live prepared publisher/,
+    );
+    releaseAtomicPublisher(freshPublisher);
+    assert.equal(fs.existsSync(freshPublisher.directory), false);
+    assert.throws(
+      () => publishPrivateAtomicNoReplace(path.join(root, 'released.json'), { version: 1 }, {
+        publisher: freshPublisher,
+      }),
+      /not a live prepared publisher/,
+    );
+    assert.doesNotThrow(() => releaseAtomicPublisher(freshPublisher));
+  } finally {
+    releaseAtomicPublisher(publisher);
+    if (freshPublisher && fs.existsSync(freshPublisher.directory)) fs.chmodSync(freshPublisher.directory, 0o700);
+    releaseAtomicPublisher(freshPublisher);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function managedLaunchSpec(root, kind, planPath, executablePath, arguments_, context, prefix) {
   return {
     version: 1,
@@ -3765,6 +3827,7 @@ function managedLaunchSpec(root, kind, planPath, executablePath, arguments_, con
     exit_receipt_path: path.join(root, `${prefix}-exit.json`),
     stdout_path: path.join(root, `${prefix}.stdout`),
     stderr_path: path.join(root, `${prefix}.stderr`),
+    // Publishers are prepared before spawn, so the SPAWNED-to-ACK window holds no toolchain build.
     start_timeout_seconds: 10,
     run_timeout_seconds: 10,
     context,
@@ -3776,6 +3839,8 @@ test('managed launcher suspends the coordinator until signed-monitor identity an
   fs.chmodSync(root, 0o700);
   const priorCWD = process.cwd();
   const priorNodeOptions = process.env.NODE_OPTIONS;
+  let preparedPublisher = null;
+  let tamperedPublisher = null;
   try {
     process.chdir(root);
     const injectionMarker = path.join(root, 'node-options-injected');
@@ -3849,7 +3914,9 @@ test('managed launcher suspends the coordinator until signed-monitor identity an
     const coordinatorRun = await runManagedLaunch(
       coordinatorSpecPath,
       {
-        afterSuspendedSpawn: () => {
+        afterSuspendedSpawn: ({ atomicPublisher }) => {
+          preparedPublisher = atomicPublisher;
+          assert.equal(fs.existsSync(atomicPublisher.path), true);
           fs.chmodSync(coordinatorSource, 0o600);
           writeFile(coordinatorSource, 'process.stdout.write("replacement-source\\n");\n', 0o400);
           fs.chmodSync(planPath, 0o600);
@@ -3857,8 +3924,16 @@ test('managed launcher suspends the coordinator until signed-monitor identity an
           replacementPlan.fixture_value = 'replacement-plan';
           writeJSON(planPath, replacementPlan);
         },
+        beforeAcknowledgement: ({ atomicPublisher }) => {
+          assert.equal(atomicPublisher, preparedPublisher);
+          assert.equal(atomicPublisher.path, preparedPublisher.path);
+          assert.equal(atomicPublisher.sha256, preparedPublisher.sha256);
+          assert.equal(fs.existsSync(atomicPublisher.path), true);
+          assert.equal(sha256(fs.readFileSync(atomicPublisher.path)), atomicPublisher.sha256);
+        },
       },
     );
+    assert.equal(fs.existsSync(preparedPublisher.directory), false);
     fs.chmodSync(coordinatorSource, 0o600);
     writeFile(coordinatorSource, retainedCoordinatorSource, 0o400);
     fs.chmodSync(planPath, 0o600);
@@ -3875,6 +3950,37 @@ test('managed launcher suspends the coordinator until signed-monitor identity an
     assert.equal(fs.existsSync(injectionMarker), false);
     assert.equal(fs.readFileSync(childMarker, 'utf8'), 'ran\n');
     fs.unlinkSync(childMarker);
+
+    const tamperedPublisherSpec = managedLaunchSpec(
+      root,
+      'coordinator',
+      planPath,
+      process.execPath,
+      [coordinatorSource, '--plan', planPath],
+      { coordinator_source_path: coordinatorSource },
+      'tampered-publisher',
+    );
+    await assert.rejects(
+      runManagedLaunch(
+        writeJSON(path.join(root, 'tampered-publisher-spec.json'), tamperedPublisherSpec),
+        {
+          beforeAcknowledgement: ({ atomicPublisher }) => {
+            tamperedPublisher = atomicPublisher;
+            fs.chmodSync(atomicPublisher.path, 0o700);
+            fs.writeFileSync(atomicPublisher.path, 'tampered publisher\n');
+            fs.chmodSync(atomicPublisher.path, 0o500);
+          },
+        },
+      ),
+      /changed/,
+    );
+    assert.equal(fs.existsSync(tamperedPublisherSpec.invocation_receipt_path), true);
+    assert.equal(fs.existsSync(tamperedPublisherSpec.start_ack_path), false);
+    assert.equal(fs.existsSync(tamperedPublisherSpec.exit_receipt_path), false);
+    const tamperedPublisherPID = JSON.parse(fs.readFileSync(tamperedPublisherSpec.pid_path)).pid;
+    assert.throws(() => process.kill(tamperedPublisherPID, 0), /ESRCH/);
+    assert.equal(fs.existsSync(childMarker), false);
+    assert.equal(fs.existsSync(tamperedPublisher.directory), false);
 
     const rejectedAgentSpec = managedLaunchSpec(
       root,
@@ -3960,6 +4066,40 @@ test('managed launcher suspends the coordinator until signed-monitor identity an
     assert.throws(() => process.kill(orphanPID, 0), /ESRCH/);
     assert.equal(fs.existsSync(orphanSpec.exit_receipt_path), false);
 
+    const expiredSpec = managedLaunchSpec(
+      root,
+      'coordinator',
+      planPath,
+      process.execPath,
+      [coordinatorSource, '--plan', planPath],
+      { coordinator_source_path: coordinatorSource },
+      'expired',
+    );
+    await assert.rejects(
+      runManagedLaunch(
+        writeJSON(path.join(root, 'expired-spec.json'), expiredSpec),
+        {
+          // Fail the guardian's acknowledgement wait, as an expired start window does, and let it exit
+          // before this event loop observes that exit: the ACK write then reaches a closed pipe (EPIPE).
+          beforeAcknowledgement: ({ guardian }) => {
+            guardian.kill('SIGTERM');
+            const guardianState = () => spawnSync('/bin/ps', ['-o', 'stat=', '-p', String(guardian.pid)], {
+              encoding: 'utf8',
+            }).stdout.trim();
+            const hangGuard = Date.now() + 60_000;
+            for (let state = guardianState(); state !== '' && !state.startsWith('Z'); state = guardianState()) {
+              assert.ok(Date.now() < hangGuard, `guardian did not exit after SIGTERM (${state})`);
+            }
+          },
+        },
+      ),
+      /guardian failed \(2\): managed-launch-suspended: identity acknowledgement timed out or launcher exited/,
+    );
+    const expiredPID = JSON.parse(fs.readFileSync(expiredSpec.pid_path)).pid;
+    assert.throws(() => process.kill(expiredPID, 0), /ESRCH/);
+    assert.equal(fs.existsSync(expiredSpec.exit_receipt_path), false);
+    assert.equal(fs.existsSync(childMarker), false);
+
     const noHandshakePlan = writeJSON(path.join(root, 'no-handshake-plan.json'), {
       version: 1,
       peekaboo_executable: '/usr/bin/true',
@@ -3993,6 +4133,8 @@ test('managed launcher suspends the coordinator until signed-monitor identity an
     process.chdir(priorCWD);
     if (priorNodeOptions === undefined) delete process.env.NODE_OPTIONS;
     else process.env.NODE_OPTIONS = priorNodeOptions;
+    releaseAtomicPublisher(preparedPublisher);
+    releaseAtomicPublisher(tamperedPublisher);
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -4452,8 +4594,8 @@ function signedBundleFixture(root, name, operation, targetValue, startedAt, comp
   clientInstanceID = UUID,
   sessionID = SESSION_ID,
   sessionSequence = null,
-  targetAbsent = false,
-  outcome = null,
+  targetGlobal = false,
+  outcome = undefined,
   outcomeAttested = mutating,
   traceArguments = {},
   canonicalRequestValue = null,
@@ -4462,6 +4604,10 @@ function signedBundleFixture(root, name, operation, targetValue, startedAt, comp
   const requestOrdinal = fixtureRequestCounter++;
   const requestID = `00000000-0000-4000-8000-${String(requestOrdinal).padStart(12, '0')}`;
   const resolvedSessionSequence = sessionSequence ?? String(requestOrdinal);
+  const canonicalRequest = canonicalRequestValue === null
+    ? signedOperationRequestFixture(operation, traceArguments)
+    : canonicalBytes(canonicalRequestValue).toString('base64');
+  const canonicalResponse = canonicalBytes(canonicalResponseValue).toString('base64');
   const payload = {
     schemaVersion: 1,
     requestID,
@@ -4477,7 +4623,9 @@ function signedBundleFixture(root, name, operation, targetValue, startedAt, comp
     },
     startedAtUnixMilliseconds: startedAt,
     completedAtUnixMilliseconds: completedAt,
-    target: targetAbsent ? null : {
+    requestSHA256: sha256(Buffer.from(canonicalRequest, 'base64')),
+    responseSHA256: sha256(Buffer.from(canonicalResponse, 'base64')),
+    target: targetGlobal ? { kind: 'global' } : {
       kind: 'window',
       processIdentifier: targetValue.pid,
       processStartIdentity: targetValue.start_identity,
@@ -4485,7 +4633,7 @@ function signedBundleFixture(root, name, operation, targetValue, startedAt, comp
       capturedBounds: [[0, 0], [400, 300]],
       isMinimized: false,
     },
-    outcome: outcome ?? (mutating ? actionOutcome() : {
+    outcome: outcome !== undefined ? outcome : (mutating ? actionOutcome() : {
       state: 'confirmed_no_change', effect: 'confirmed', route: 'bridge',
       evidence: 'verified_no_change', dispatch_state: 'none', retry_safety: 'not_applicable',
       escalation: 'none', mutation_dispatched: false, retry_safe: false,
@@ -4494,10 +4642,8 @@ function signedBundleFixture(root, name, operation, targetValue, startedAt, comp
   };
   const bundle = writeJSON(path.join(directory, `${name}-bundle.json`), {
     receipt: { payload },
-    canonicalRequest: canonicalRequestValue === null
-      ? signedOperationRequestFixture(operation, traceArguments)
-      : canonicalBytes(canonicalRequestValue).toString('base64'),
-    canonicalResponse: canonicalBytes(canonicalResponseValue).toString('base64'),
+    canonicalRequest,
+    canonicalResponse,
   });
   const validator = writeJSON(path.join(root, `${name}-validator.json`), {
     success: true,
@@ -4526,7 +4672,7 @@ function signedBundleFixture(root, name, operation, targetValue, startedAt, comp
       host_protocol_version: '1.32',
       bundle_sha256: sha256(fs.readFileSync(bundle)),
       terminal_receipt_attested: true,
-      target_attested: !targetAbsent,
+      target_attested: true,
       outcome_attested: outcomeAttested,
       retention_basis: 'exported_bundle',
     },
@@ -6211,9 +6357,26 @@ test('qualification manifest closes every required evidence class and detects by
           host: pointerHost,
           clientInstanceID: pointerClientInstanceID,
           sessionSequence: String(entryIndex),
-          targetAbsent: [
-            'createExactWindowHeldPointerOwner', 'disconnectExactWindowHeldPointerOwner',
-          ].includes(operation),
+          targetGlobal: !mutating,
+          canonicalRequestValue: operation === 'listWindows' ? {
+            listWindowMutationInventory: { _0: {
+              target: { kind: 'windowId', windowId: adjunctTarget.window_id },
+            } },
+          } : null,
+          canonicalResponseValue: operation === 'listWindows' ? {
+            windowMutationInventory: { _0: {
+              completeness: 'complete', warnings: [], items: [{
+                window_id: adjunctTarget.window_id,
+                bounds: [[0, 0], [400, 300]], isMinimized: false,
+                mutationIdentity: {
+                  windowID: adjunctTarget.window_id,
+                  ownerProcessIdentifier: adjunctTarget.pid,
+                  ownerProcessStartIdentity: Number(adjunctTarget.start_identity),
+                  capturedBounds: [[0, 0], [400, 300]], isMinimized: false,
+                },
+              }],
+            } },
+          } : {},
           outcomeAttested: mutating || operation === 'disconnectExactWindowHeldPointerOwner',
           outcome: operation === 'beginExactWindowHeldPointer' ? {
             ...actionOutcome(), delivery_mechanism: 'window_targeted_events',
@@ -6225,6 +6388,11 @@ test('qualification manifest closes every required evidence class and detects by
             evidence: 'delivery_accepted', state: 'dispatched_unverified',
             effect: 'unverifiable', retry_safety: 'unsafe', escalation: 'observe_before_retry',
             dispatched_unit_count: 1, requires_fresh_observation: true,
+          } : operation === 'disconnectExactWindowHeldPointerOwner' ? {
+            state: 'confirmed_no_change', effect: 'confirmed', route: 'bridge',
+            evidence: 'verified_no_change', dispatch_state: 'none', retry_safety: 'not_applicable',
+            escalation: 'none', mutation_dispatched: false, retry_safe: false,
+            requires_fresh_observation: false,
           } : null,
         },
       )
@@ -6287,7 +6455,7 @@ test('qualification manifest closes every required evidence class and detects by
         bundle: {
           file: `bundles/${entry.payload.requestID}.json`,
           sha256: sha256(fs.readFileSync(entry.bundle)),
-          request_sha256: '1'.repeat(64), response_sha256: '2'.repeat(64),
+          request_sha256: entry.payload.requestSHA256, response_sha256: entry.payload.responseSHA256,
         },
       })),
     });
@@ -8250,76 +8418,80 @@ test('qualification manifest closes every required evidence class and detects by
       ),
       /is not one exact controlled fixture target/,
     );
-    const foreignPointerListInput = structuredClone(inputValue);
-    const foreignPointerListBundleValue = JSON.parse(fs.readFileSync(pointerPairs[0].bundle));
-    foreignPointerListBundleValue.receipt.payload.target.processIdentifier = 999;
-    foreignPointerListBundleValue.receipt.payload.target.processStartIdentity = '999001';
-    foreignPointerListBundleValue.receipt.payload.target.windowID = 999;
-    const foreignPointerListBundle = writeJSON(
-      path.join(root, 'foreign-pointer-list-bundle.json'),
-      foreignPointerListBundleValue,
-    );
-    const foreignPointerListValidatorValue = JSON.parse(fs.readFileSync(pointerPairs[0].validator));
-    foreignPointerListValidatorValue.data.bundle_sha256 = sha256(fs.readFileSync(foreignPointerListBundle));
-    const foreignPointerListValidator = writeJSON(
-      path.join(root, 'foreign-pointer-list-validator.json'),
-      foreignPointerListValidatorValue,
-    );
-    const foreignPointerListControllerValue = JSON.parse(fs.readFileSync(pointerControllerResult));
-    foreignPointerListControllerValue.operations[0].bundle.sha256
-      = sha256(fs.readFileSync(foreignPointerListBundle));
-    foreignPointerListInput.adjuncts.held_pointer.raw_bundles[0] = foreignPointerListBundle;
-    foreignPointerListInput.adjuncts.held_pointer.live_validator_reports[0]
-      = foreignPointerListValidator;
-    foreignPointerListInput.adjuncts.held_pointer.controller_results = [writeJSON(
-      path.join(root, 'foreign-pointer-list-controller.json'),
-      foreignPointerListControllerValue,
-    )];
-    assert.throws(
-      () => generateManifest(
-        writeJSON(path.join(root, 'foreign-pointer-list-input.json'), foreignPointerListInput),
-        path.join(root, 'foreign-pointer-list-manifest.json'),
-      ),
-      /target-bearing operation differs from the controlled fixture/,
-    );
-    const targetedPointerCreateInput = structuredClone(inputValue);
-    const targetedPointerCreateBundleValue = JSON.parse(fs.readFileSync(pointerPairs[2].bundle));
-    targetedPointerCreateBundleValue.receipt.payload.target = {
-      kind: 'window',
-      processIdentifier: adjunctTarget.pid,
-      processStartIdentity: adjunctTarget.start_identity,
-      windowID: adjunctTarget.window_id,
+    const rejectPointerBundle = (index, name, mutate, expected, resealDigests = true) => {
+      const changedInput = structuredClone(inputValue);
+      const bundleValue = JSON.parse(fs.readFileSync(pointerPairs[index].bundle));
+      mutate(bundleValue);
+      if (resealDigests) {
+        bundleValue.receipt.payload.requestSHA256 = sha256(Buffer.from(bundleValue.canonicalRequest, 'base64'));
+        bundleValue.receipt.payload.responseSHA256 = sha256(Buffer.from(bundleValue.canonicalResponse, 'base64'));
+      }
+      const bundlePath = writeJSON(path.join(root, name + '-bundle.json'), bundleValue);
+      const validatorValue = JSON.parse(fs.readFileSync(pointerPairs[index].validator));
+      validatorValue.data.bundle_sha256 = sha256(fs.readFileSync(bundlePath));
+      validatorValue.data.target_attested = bundleValue.receipt.payload.target != null;
+      const validatorPath = writeJSON(path.join(root, name + '-validator.json'), validatorValue);
+      const controllerValue = JSON.parse(fs.readFileSync(pointerControllerResult));
+      controllerValue.operations[index].bundle.sha256 = validatorValue.data.bundle_sha256;
+      controllerValue.operations[index].bundle.request_sha256 = bundleValue.receipt.payload.requestSHA256;
+      controllerValue.operations[index].bundle.response_sha256 = bundleValue.receipt.payload.responseSHA256;
+      changedInput.adjuncts.held_pointer.raw_bundles[index] = bundlePath;
+      changedInput.adjuncts.held_pointer.live_validator_reports[index] = validatorPath;
+      changedInput.adjuncts.held_pointer.controller_results = [writeJSON(
+        path.join(root, name + '-controller.json'), controllerValue,
+      )];
+      assert.throws(
+        () => generateManifest(
+          writeJSON(path.join(root, name + '-input.json'), changedInput),
+          path.join(root, name + '-manifest.json'),
+        ),
+        expected,
+      );
     };
-    const targetedPointerCreateBundle = writeJSON(
-      path.join(root, 'targeted-pointer-create-bundle.json'),
-      targetedPointerCreateBundleValue,
-    );
-    const targetedPointerCreateValidatorValue = JSON.parse(fs.readFileSync(pointerPairs[2].validator));
-    targetedPointerCreateValidatorValue.data.target_attested = true;
-    targetedPointerCreateValidatorValue.data.bundle_sha256
-      = sha256(fs.readFileSync(targetedPointerCreateBundle));
-    const targetedPointerCreateValidator = writeJSON(
-      path.join(root, 'targeted-pointer-create-validator.json'),
-      targetedPointerCreateValidatorValue,
-    );
-    const targetedPointerCreateControllerValue = JSON.parse(fs.readFileSync(pointerControllerResult));
-    targetedPointerCreateControllerValue.operations[2].bundle.sha256
-      = sha256(fs.readFileSync(targetedPointerCreateBundle));
-    targetedPointerCreateInput.adjuncts.held_pointer.raw_bundles[2]
-      = targetedPointerCreateBundle;
-    targetedPointerCreateInput.adjuncts.held_pointer.live_validator_reports[2]
-      = targetedPointerCreateValidator;
-    targetedPointerCreateInput.adjuncts.held_pointer.controller_results = [writeJSON(
-      path.join(root, 'targeted-pointer-create-controller.json'),
-      targetedPointerCreateControllerValue,
-    )];
-    assert.throws(
-      () => generateManifest(
-        writeJSON(path.join(root, 'targeted-pointer-create-input.json'), targetedPointerCreateInput),
-        path.join(root, 'targeted-pointer-create-manifest.json'),
-      ),
-      /targetless held-pointer operation claimed a target/,
-    );
+    const mutateInventory = (bundle, mutate) => {
+      const response = JSON.parse(Buffer.from(bundle.canonicalResponse, 'base64'));
+      mutate(response.windowMutationInventory._0);
+      bundle.canonicalResponse = canonicalBytes(response).toString('base64');
+    };
+    rejectPointerBundle(0, 'foreign-pointer-list', (bundle) => mutateInventory(bundle, (inventory) => {
+      inventory.items[0].mutationIdentity.ownerProcessIdentifier = 999;
+    }), /held-pointer inventory is incomplete, changed, or off-target/);
+    rejectPointerBundle(0, 'partial-pointer-list', (bundle) => mutateInventory(bundle, (inventory) => {
+      inventory.completeness = 'partial';
+    }), /held-pointer inventory is incomplete, changed, or off-target/);
+    for (const index of [0, 1]) {
+      rejectPointerBundle(index, 'warned-pointer-list-' + index, (bundle) => mutateInventory(bundle, (inventory) => {
+        inventory.warnings = ['inventory evidence unavailable'];
+      }), /held-pointer inventory is incomplete, changed, or off-target/);
+    }
+    rejectPointerBundle(0, 'ambiguous-pointer-list', (bundle) => mutateInventory(bundle, (inventory) => {
+      inventory.items.push(structuredClone(inventory.items[0]));
+    }), /held-pointer inventory is incomplete, changed, or off-target/);
+    rejectPointerBundle(0, 'moved-pointer-list', (bundle) => mutateInventory(bundle, (inventory) => {
+      inventory.items[0].bounds[0][0] += 1;
+    }), /held-pointer inventory is incomplete, changed, or off-target/);
+    rejectPointerBundle(1, 'changed-pointer-list', (bundle) => mutateInventory(bundle, (inventory) => {
+      inventory.items[0].title = 'changed after first inventory';
+    }), /held-pointer inventory is incomplete, changed, or off-target/);
+    rejectPointerBundle(0, 'wrong-pointer-inventory-query', (bundle) => {
+      const request = JSON.parse(Buffer.from(bundle.canonicalRequest, 'base64'));
+      request.listWindowMutationInventory._0.target.windowId += 1;
+      bundle.canonicalRequest = canonicalBytes(request).toString('base64');
+    }, /held-pointer inventory is incomplete, changed, or off-target/);
+    rejectPointerBundle(0, 'unbound-pointer-inventory-response', (bundle) => mutateInventory(bundle, (inventory) => {
+      inventory.items[0].mutationIdentity.ownerProcessIdentifier = 999;
+    }), /inventory bytes differ from their receipt\/controller digests/, false);
+    rejectPointerBundle(2, 'targeted-pointer-create', (bundle) => {
+      bundle.receipt.payload.target = {
+        kind: 'window', processIdentifier: adjunctTarget.pid,
+        processStartIdentity: adjunctTarget.start_identity, windowID: adjunctTarget.window_id,
+      };
+    }, /global held-pointer operation lacks its exact signed scope/);
+    for (const index of [0, 1, 2, 5]) {
+      rejectPointerBundle(index, 'absent-global-pointer-' + index, (bundle) => {
+        bundle.receipt.payload.target = null;
+      }, /global held-pointer operation lacks its exact signed scope/);
+    }
     const restoredLocalDuringTree = JSON.parse(fs.readFileSync(deployment.processTrees[1]));
     synchronizeProcessTreeAuthorization(restoredLocalDuringTree);
     writeJSON(deployment.processTrees[1], restoredLocalDuringTree);

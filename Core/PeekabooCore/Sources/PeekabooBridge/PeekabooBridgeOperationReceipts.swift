@@ -1188,12 +1188,14 @@ extension PeekabooBridgeOperationReceiptAuthority {
         let liveIdentity: PeekabooBridgeLivePeerIdentity
         let bundleIdentifier: String?
         let teamIdentifier: String?
+        let trustMode: PeekabooBridgeTrustMode?
 
         var peer: PeekabooBridgePeer {
             PeekabooBridgePeer(
                 liveIdentity: self.liveIdentity,
                 bundleIdentifier: self.bundleIdentifier,
-                teamIdentifier: self.teamIdentifier)
+                teamIdentifier: self.teamIdentifier,
+                trustMode: self.trustMode)
         }
 
         init(peer: PeekabooBridgePeer) throws {
@@ -1217,6 +1219,7 @@ extension PeekabooBridgeOperationReceiptAuthority {
             self.liveIdentity = liveIdentity
             self.bundleIdentifier = peer.bundleIdentifier
             self.teamIdentifier = peer.teamIdentifier
+            self.trustMode = peer.trustMode
         }
     }
 
@@ -1275,6 +1278,8 @@ extension PeekabooBridgeRequest {
             [DesktopTargetEvidenceAdapter.evidence(
                 windowIdentity: payload.request.windowIdentity,
                 bounds: payload.request.windowBounds)]
+        case let .exactWindowDrag(payload):
+            [.init(target: DesktopTargetIdentity(exactWindow: payload.target))]
         case let .releaseExactWindowHeldPointer(payload),
              let .revokeExactWindowHeldPointer(payload):
             [DesktopTargetEvidenceAdapter.evidence(
@@ -1352,6 +1357,10 @@ extension PeekabooBridgeRequest {
             } ?? []
         case let .exactDialogClickButton(receipt), let .exactDialogDismiss(receipt):
             [.init(target: DesktopTargetIdentity(exactWindow: receipt.target))]
+        case let .dialogHandleFile(payload):
+            payload.execution.map {
+                [.init(processIdentifier: $0.target.processIdentifier, windowID: $0.target.windowID)]
+            } ?? []
         case let .inspectAccessibilityTree(payload):
             payload.windowContext.map(DesktopTargetEvidenceAdapter.evidence(selectorContext:)).map { [$0] } ?? []
         default:
