@@ -15,7 +15,6 @@ public enum DialogError: Error {
     case noDismissButton
     case fileVerificationFailed(expectedPath: String)
     case fileSavedToUnexpectedDirectory(expectedDirectory: String, actualDirectory: String, actualPath: String)
-    case inputSuppressedUnderTests
 }
 
 extension DialogError: LocalizedError {
@@ -41,8 +40,6 @@ extension DialogError: LocalizedError {
             "Dialog reported success, but the saved file did not appear at: \(expectedPath)"
         case let .fileSavedToUnexpectedDirectory(expectedDirectory, actualDirectory, actualPath):
             "Saved file landed in '\(actualDirectory)', expected '\(expectedDirectory)' (actual: \(actualPath))"
-        case .inputSuppressedUnderTests:
-            "Dialog keyboard input is suppressed under tests; inject a typeCharacterHandler to record input."
         }
     }
 }
@@ -52,6 +49,7 @@ extension DialogError: LocalizedError {
 public final class DialogService: DialogServiceProtocol {
     public let supportsSystemAlertDiscovery = true
     public let supportsBackgroundExactDialogInput = true
+    public let supportsExactFileDialogExecution = true
     public let supportsExactProcessIdentifierAppHint = true
 
     let logger = Logger(subsystem: "boo.peekaboo.core", category: "DialogService")

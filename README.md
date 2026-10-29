@@ -51,9 +51,9 @@ peekaboo see --app Finder --json
 
 That is the core loop: observe the current screen, choose an element from the result, and act on it.
 
-## What's new in 4.7.0
+## What's new in 4.9.7
 
-Peekaboo 4.7.0 fixes the 4.6.0 CLI startup failure on Macs without the macOS 27 runtime and adds GPT-6 Astra, Sol, and Luna plus GPT-6.1 Sol model selection. Unattended clipboard reads no longer trigger macOS privacy prompts, and paste cleanup preserves newer clipboard contents. MCP clients can request structured element tables with `include_elements`, CLI JSON and observations report focused text selection and visible display bounds, and compatible-provider Agent streams keep fragmented tool arguments intact. CLI clipboard reads that previously prompted now refuse; see the changelog Compatibility notes for `clipboard status` and `--allow-prompt`.
+Peekaboo 4.9.7 is a fix release. `window close` through the daemon now reports success when an app keeps its closed window alive, `see` works on Chrome windows whose titles carry the app name or are elided, `window close --foreground` handles apps that re-exec themselves, and `dock list` hides separators. In the Mac app, the chat keeps a streaming answer together when you queue a follow-up, failed tools show as failed, the saved Vision model is used even when its provider doesn't advertise vision, and the Inspector highlights the control you are actually pointing at on every display.
 
 ## Automate an app
 

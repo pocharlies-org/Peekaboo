@@ -103,8 +103,12 @@ The initialize handshake accepts arbitrary JSON values in `capabilities.experime
 `PeekabooMCPInitializationTests` sends raw requests through the production server and verifies that a successful
 initialize reaches `tools/list`, without invoking desktop tools.
 
-Peekaboo temporarily pins Swift MCP SDK commit `f7077e0d5cd57e0b2a497862017aa94ee344252f`, the single-commit
-decoder repair in [swift-sdk#276](https://github.com/modelcontextprotocol/swift-sdk/pull/276) on top of 0.12.1.
+Peekaboo temporarily pins Swift MCP SDK commit `6f02d8e7b5c0795698f5a90366f2081ebc91530d`, the single-commit
+decoder repair in [swift-sdk#276](https://github.com/modelcontextprotocol/swift-sdk/pull/276) on top of SDK main
+`72a09adb`. The PR's fork rebases its branch, which orphans the previous head: SwiftPM then cannot find the pinned
+commit and every uncached build fails dependency resolution. If that happens, re-pin the Core and CLI manifests
+to the PR's current head (confirm with `git range-diff` that the commit itself is unchanged) and regenerate the
+lockfiles below.
 Replace the Core and CLI manifest pins with a tagged SDK containing that repair when available, then regenerate
 the Core, Mac, and Xcode workspace lockfiles. The SDK's Swift `Client.Capabilities.experimental` type becomes
 `[String: Value]?`; source integrations passing a typed `[String: String]` dictionary must convert its values
@@ -140,6 +144,19 @@ Provider-backed `agent` and `analyze` calls require configuration at server star
 
 ## Troubleshooting
 
+### npm wrapper shutdown
+
+Importing `PeekabooMCPWrapper` from `peekaboo-mcp.js` does not start a server. Eval, print-eval and stdin consumers remain imports even if an ordinary program argument names the wrapper or a symlink to it. Missing/non-directory entry metadata is treated as non-main; unrelated filesystem errors still propagate. Direct and symlinked script entrypoints retain startup behavior, including on the supported Node 22 baseline.
+
+The npm `peekaboo-mcp` launcher owns its Swift server child and restarts it after crashes. On SIGINT or SIGTERM,
+it cancels pending restart backoff, sends SIGTERM to that child, and allows five seconds for exit before sending
+SIGKILL to the same still-owned child. Repeated shutdown requests do not restart or extend this deadline.
+Fatal wrapper errors and unhandled promise rejections trigger shutdown and exit with status 1; normal SIGINT or SIGTERM shutdown exits with status 0.
+This is process cleanup, not confirmation that an in-flight desktop operation had no effect; observe before retrying.
+
+`pnpm run test:mcp-wrapper` covers wrapper imports, startup and bounded shutdown with disposable child fixtures,
+including the normal entrypoint's five-second deadline. It does not send desktop input or start the installed app.
+
 ### Server Won't Start
 
 - Run `"$PEEKABOO_BIN" mcp` directly and inspect stderr.
@@ -165,3 +182,26 @@ Provider-backed `agent` and `analyze` calls require configuration at server star
 3. Use deterministic Playground fixtures for UI mutations.
 4. Keep provider credentials and captured desktop data out of committed artifacts.
 5. Run the repository's focused unit tests alongside live MCP smoke tests.
+
+## Synthetic authority regression tests
+
+Run the temporary-clipboard authority, session-policy, context, paste, and browser-lifecycle regression suites serially
+with `--no-parallel`, with provider API-key/OAuth variables and `PEEKABOO_AI_PROVIDERS` absent from the test process.
+Do not change `HOME`. The selected suites use the non-recursive `AuthorityTestIsolation()` suite trait from the test-only
+`PeekabooAgentRuntimeTestSupport` module. Each scope creates a fresh private configuration directory with empty config
+and credentials files, points `PEEKABOO_CONFIG_DIR` and Tachikoma's profile directory at it, disables legacy
+configuration migration, and installs `TachikomaConfiguration(loadFromEnvironment: false)` without touching `.current`.
+The empty primary credentials file also closes Tachikoma's legacy-file fallback. A provider factory override admits
+only the explicitly supplied custom fixture providers, not built-in remote/local providers. The two nested Agent
+attenuation cases temporarily replace that already-synthetic default with the existing fixture provider so public MCP
+can resolve a model string for a real continuation; they restore `.default` with `defer` and never read `.current` to
+save it. On success or throw, the trait restores the previous optional `.default`, both configuration environment
+variables, and the profile directory, resets cached configuration/credentials, and removes its temporary storage, so
+later suites in the same process never inherit the synthetic configuration. Nested scopes restore the outer scope.
+
+Base services skip automatic Agent creation and use in-memory snapshots. Every explicit fixture Agent receives a
+private session manager. Browser-lifecycle calls use `.minimal` enhancements so they do not collect frontmost-window,
+cursor, application-list, or General-clipboard context. Paste tests inject their scripted clipboard and native-input
+services. Do not run unrelated configuration-mutating suites concurrently and do not treat `PEEKABOO_CONFIG_DIR` alone
+as credential isolation. This is bounded fixture isolation, not a claim that the entire repository's test suite is
+hermetic.

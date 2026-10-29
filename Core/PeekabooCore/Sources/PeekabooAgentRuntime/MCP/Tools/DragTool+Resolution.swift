@@ -5,12 +5,13 @@ extension DragTool {
     func resolveLocation(
         target: DragLocationInput,
         snapshotId: String?,
-        parameterName: String) async throws -> DragPointDescription
+        parameterName: String,
+        background: Bool = false) async throws -> DragPointDescription
     {
         switch target {
         case let .coordinates(raw):
-            let point = try self.parseCoordinates(raw, parameterName: parameterName)
-            return DragPointDescription(point: point, description: "(\(Int(point.x)), \(Int(point.y)))")
+            let point = try self.parseCoordinates(raw, parameterName: parameterName, background: background)
+            return DragPointDescription(point: point, description: "(\(point.x), \(point.y))")
         case let .element(query):
             guard let snapshot = await self.getSnapshot(id: snapshotId) else {
                 throw CoordinateParseError(
@@ -58,7 +59,7 @@ extension DragTool {
         }
     }
 
-    func parseCoordinates(_ coordString: String, parameterName: String) throws -> CGPoint {
+    func parseCoordinates(_ coordString: String, parameterName: String, background: Bool = false) throws -> CGPoint {
         let parts = coordString.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
 
         guard parts.count == 2 else {
@@ -66,20 +67,15 @@ extension DragTool {
                 message: "Invalid \(parameterName) coordinates format. Use 'x,y' (e.g., '100,200')")
         }
 
-        guard let x = Double(parts[0]), let y = Double(parts[1]) else {
+        guard let x = Double(parts[0]), let y = Double(parts[1]), x.isFinite, y.isFinite else {
             throw CoordinateParseError(
                 message: "Invalid \(parameterName) coordinates. Both x and y must be valid numbers")
         }
 
-        // Coordinates outside the desktop are nearly always malformed tool input.
-        guard x >= 0, y >= 0 else {
+        // Displays left of or above the primary display have negative global coordinates.
+        guard background || ((-20000...20000).contains(x) && (-20000...20000).contains(y)) else {
             throw CoordinateParseError(
-                message: "Invalid \(parameterName) coordinates. Both x and y must be non-negative")
-        }
-
-        guard x <= 20000, y <= 20000 else {
-            throw CoordinateParseError(
-                message: "Invalid \(parameterName) coordinates. Both x and y must be 20000 or less")
+                message: "Invalid \(parameterName) coordinates. Both x and y must be between -20000 and 20000")
         }
 
         return CGPoint(x: x, y: y)

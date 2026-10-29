@@ -1,5 +1,225 @@
 # Changelog
 
+## 4.9.7 - 2026-10-23
+
+**Highlights:** Report `window close` through the daemon as closed when an app keeps the closed window alive; let `see` observe Chrome windows whose titles carry the app name or are elided; close apps that re-exec themselves with `--foreground`; and keep the Mac chat, menu bar and Inspector accurate.
+
+- Report `window close` through the daemon or Bridge as closed when the app keeps the closed `NSWindow` alive, instead of exiting 1 with an indeterminate postcondition: the Bridge readback now applies the same exact-window Accessibility presence check as the in-process path. Thanks @goutamadwant! #1131, fixes #1129.
+- Let `peekaboo see` observe Chrome and other apps whose Accessibility window title appends the application name or whose WindowServer title is middle-elided, instead of failing with "inconsistent response evidence: window-context window title". Thanks @L1uYun! #1130.
+- Close windows of apps that re-exec themselves with `window close --foreground`, whose frontmost PID AppKit reports as -1. Thanks @SebTardif! #1124.
+- Classify Dock separators and the Trash from their Accessibility subroles, so `peekaboo dock list` hides separators unless `--include-all` is passed, reports included separators as `separator` instead of blank `unknown` items, and identifies a localized Trash (such as "Papierkorb") as `trash`. #1120.
+- Use the Mac app's saved Vision model for image analysis even when its provider does not report vision support (OpenRouter, OpenAI-compatible, LM Studio and many Ollama models), surfacing the provider's error instead of silently switching models. Thanks @SebTardif! #1127.
+- Keep the Mac chat's streaming answer together when you queue a follow-up, and keep Retry on the prompt that failed. Thanks @SebTardif! #1126.
+- Show a failed Mac agent tool as failed, not completed, in the menu bar, while cancelled tools stay cancelled. Thanks @SebTardif! #1134.
+- Highlight the Inspector control in the front window under the pointer, including floating panels and popup items past their window, instead of the smallest control anywhere on screen; windows of untracked apps such as the Dock now stop the hover from reaching what they cover. Thanks @SebTardif! #1133.
+- Place Inspector highlight boxes on the correct display when a display does not start at the primary display's origin. Thanks @SebTardif! #1132.
+- Restore source builds after the pinned MCP Swift SDK commit became unreachable upstream when its pull request branch was rebased. #1135.
+- Remove the unused public `DialogError.inputSuppressedUnderTests` case from PeekabooAutomationKit along with the dead test-only dialog typing hook that threw it; release builds could never throw it, so only SwiftPM consumers that switch over every `DialogError` case need to drop that branch. #1123.
+
+## 4.9.6 - 2026-10-20
+
+**Highlights:** Find, inspect and capture apps that re-exec themselves on launch, such as Xcode's Device Hub, whose PID AppKit reports as -1; report `window close` as closed when an app keeps the closed window alive or quits; use the Mac app's saved Vision model for image analysis; and keep the Mac chat's Stop button, follow-ups, transcript, menu bar and recent sessions reliable.
+
+- See, inspect, list and capture apps that re-exec themselves on launch, such as Xcode's Device Hub, whose PID AppKit reports as -1, by recovering one verified live process with matching executable and application metadata. Thanks @lukemyself-hub! #1121, fixes #1119.
+- Report `window close` as closed when the app keeps the closed `NSWindow` alive, such as Calculator's About panel: an off-screen WindowServer row no longer counts as the window remaining once Accessibility no longer exposes it. Thanks @jandubois! #1116, fixes #1106.
+- Report `window close` as closed when the owning process exits during close verification (for example the last window of an app that quits) instead of failing with a changed-identity error; a reused PID still counts as a replacement. #1109, refs #1106.
+- Use the Mac app's saved Vision model for screenshots and image analysis: a custom choice is written to `agent.visionModel` in `config.json` (as `provider/modelId`) and used by `see`/`analyze` when no model is given, while "Same as agent model" removes it. Thanks @SebTardif! #1110.
+- Save the Mac app's Ollama base URL to `config.json` so the CLI uses it, and clear it when reset to `http://localhost:11434` instead of restoring the old URL on the next launch. Thanks @SebTardif! #1104.
+- Keep the Mac chat's Stop button attached to the running task when you send follow-ups: follow-ups now queue behind the active task and run in order, Stop cancels the in-flight provider request and discards queued follow-ups, and a queued prompt stays with the session it was sent from. Thanks @SebTardif! #1095.
+- Stop recording Mac chat prompts twice from the menu bar or queued follow-ups, stop appending a combined copy of the reply after multi-step runs, and title a new chat from its first prompt again. #1117.
+- Open the chat you clicked under Recent Sessions in the Mac menu bar instead of the one already selected; that window can continue or retry its chat without first switching the menu bar's selection. Thanks @SebTardif! #1108.
+- Keep the Mac menu bar's chat in sync with the conversation: new messages, streamed replies, generated titles and summaries now show up there, and deleting that chat no longer leaves it selected. Thanks @SebTardif! #1107.
+- Keep the Mac app's chat history when `sessions.json` cannot be decoded: move the unreadable file aside instead of overwriting it, save atomically, and show a notice while saves are blocked. Thanks @SebTardif! #1102.
+- Keep underscores inside words, such as `WINDOW_NOT_FOUND` or `browser_wait_for`, literal on the documentation site instead of rendering them as emphasis. Thanks @rudycelekli! #1112.
+- Move macOS CI and qualification jobs to Xcode 27 runners (except CodeQL Swift tracing), retain macOS 15 deployment and runtime-symbol checks, and smoke-test Intel artifacts under Rosetta.
+
+## 4.9.5 - 2026-10-16
+
+**Highlights:** Let unsigned source builds such as Homebrew core's `peekaboo` formula run commands in-process immediately instead of waiting on or aborting at daemons they cannot trust, with an explicit same-binary daemon opt-in; stop starting daemons that a granted Peekaboo.app host would outrank; and keep `see` and multi-app `quit` outcomes accurate.
+
+- Fall back to in-process execution immediately when an unsigned source build (such as Homebrew core's `peekaboo` formula) meets a daemon it cannot trust, instead of waiting out daemon startup or aborting, and add an explicit `PEEKABOO_ALLOW_UNSIGNED_DAEMON=1` opt-in that lets such a build trust only its own exact-binary daemon; release-signed builds ignore it. Thanks @fry69! #1089, #1064.
+- Skip auto-starting an on-demand daemon when a granted Peekaboo.app bridge host would be selected anyway, avoiding the daemon's startup wait and an idle permission-less daemon; lifecycle commands, snapshot-owned actions and explicit sockets still start it. #1082, follow-up to #1073.
+- Declare route-specific Accessibility and Event Synthesizing needs for `type`, `paste`, `press`/`hotkey`, `window`, `menu` and `menubar`, so hosts that explicitly lack them are skipped while grant-free routes and unknown host reports keep working. #1088.
+- Stop reporting complete Accessibility observations as incomplete when an app declines an inapplicable child attribute, such as Calculator's Help search field after a menu opens; preserve readable children and genuine read-failure warnings. Thanks @jandubois! #1094.
+- Keep a multi-application `app quit` cancelled after a suspected no-op reported as a no-op instead of a partial change that asks callers to recover a side effect. Thanks @SebTardif! #1098.
+- Stop shipping the CI runner's Swift toolchain directory as an `LC_RPATH` in released CLI binaries, and fail release builds that carry any non-system absolute rpath. #1099.
+- Show macOS 27's renamed "Device Control and Data Access" Settings row in `axorc permissions` guidance by updating AXorcist. openclaw/AXorcist#102.
+- Render indented code fences, nested and wrapped list items, and parentheses inside link URLs correctly on the documentation site. Thanks @rudycelekli! #1084, #1085, #1086.
+- Update Service Lifecycle to 2.13.0; Swift 6.2 builds select the same runtime code. #1097.
+
+## 4.9.4 - 2026-10-15
+
+**Highlights:** Keep Peekaboo.app's granted bridge host selected after a command auto-starts an ungranted on-demand daemon, name macOS 27's renamed "Device Control and Data Access" Settings row in permission guidance, explain unsigned source builds such as Homebrew core's `peekaboo` formula in Bridge and daemon trust failures, and reject non-finite coordinates and regions.
+
+- Keep a granted Peekaboo.app bridge host selected when an on-demand daemon started from an ungranted terminal reports missing Accessibility, Event Synthesizing or Screen Recording, instead of downgrading every caller's permissions until the daemon idles out. Thanks @joshua-koehler! #1073.
+- Show macOS 27's renamed "Device Control and Data Access" Settings row for Accessibility and Event Synthesizing, and consistently name "Screen & System Audio Recording", in `peekaboo permissions`, MCP permission tools, and permission errors. Thanks @fry69! #1071.
+- Explain in Bridge and daemon trust failures when the running `peekaboo` is an unsigned source build (such as Homebrew core's `peekaboo` formula) and point to the notarized `openclaw/tap` or npm install. Thanks @fry69! #1064.
+- Reject `nan` and infinite coordinates and regions in `click`, `move`, `capture live`, `capture action`, `see --region` and the MCP `click` tool instead of dispatching a non-finite point or capture rect, and ignore non-finite agent verification target points. Thanks @rudycelekli! #1074, #1075, #1076.
+- Update SwiftNIO to 2.104.0 and Service Lifecycle to 2.12.1, including its Unix signal dispatch-source leak fix, while preserving the Swift 6.2 and macOS baselines.
+
+## 4.9.3 - 2026-10-14
+
+**Highlights:** Give manual `peekaboo daemon start` the same readiness budget as automatic startup and report the real authentication or probe failure instead of a generic timeout, keep agent tool results readable when they contain backslashes or newlines, and harden the MCP wrapper's fatal-error and restart handling.
+
+- Use the shared 10-second readiness budget for manual daemon startup, preserve authentication and probe failure diagnostics, and honor `PEEKABOO_DAEMON_SOCKET` consistently across daemon commands without relaxing host trust. Thanks @fry69! #1064.
+- Prevent agent tool results from showing "Invalid JSON result" for fallback messages containing backslashes or newlines. #1068.
+- Shut down the owned MCP server and exit with status 1 after fatal wrapper errors or unhandled rejections, while retaining successful signal-driven shutdown. Thanks @rudycelekli! #1039.
+- Keep repeated MCP wrapper starts from spawning duplicate servers and validate timing options before scheduling, preserving explicit zero delays. Thanks @rudycelekli! #1020, #1021.
+- Classify cooperative and URL cancellation as `CANCELLED` while preserving existing standardized errors. Thanks @rudycelekli! #1042.
+- Apply error-only log filtering consistently to historical queries and live streams, including with debug verbosity, in both log helpers. Thanks @rudycelekli! #1033.
+- Preserve ordered-list start numbers, honor code-fence delimiters and lengths, and keep emphasis punctuation literal in link destinations and autolinks on the documentation site. Thanks @rudycelekli! #1029, #1028, #1030.
+- Remove unused public PeekabooFoundation symbols (`TimeInterval.nanoseconds`, `performOperation(_:errorContext:)`, `RecoverableError`, `ErrorRecoveryManager`, `ErrorRecoveryFailure`, and `InteractionTargetSelector.Policy.windowCLI`); SwiftPM consumers referencing them must drop those references, while no shipped Peekaboo or OpenClaw path used them.
+- Remove unused local release helpers, appcast and tracked release-notes tooling; document hosted publication while preserving terminal/fleet archive and notarization checks.
+
+## 4.9.2 - 2026-10-12
+
+**Highlights:** Create CLI child-process pipes close-on-exec with Swift Subprocess 1.0.1 so they no longer leak into other children, build signed and notarized releases on GitHub Actions behind an approval gate, and keep local notarization working on congested uplinks with a parallel Notary API upload fallback.
+
+- Update Swift Subprocess to 1.0.1 for close-on-exec pipe handling and single-owner output-descriptor cleanup in CLI child processes, preserving the Swift 6.2 and macOS baselines.
+- Add an approval-gated GitHub Actions release path for signed and notarized universal app, DMG, CLI, npm, and Homebrew deliverables, with independent artifact verification and an appcast closeout PR.
+- Fall back to parallel Notary REST uploads for terminal-qualification notarization when API-key notarization hits a notarytool transport failure, with explicit transport selection, bounded retries, and unchanged artifact verification.
+
+## 4.9.1 - 2026-10-10
+
+**Highlights:** Stop idle `peekaboo mcp` servers from burning CPU whenever other applications launch or quit, accept renamed or symlinked CLI executables, refuse to overwrite configuration files that cannot be read, and keep capture output intact at the retention limit.
+
+- Stop an idle `peekaboo mcp` (and other window-tracking hosts) from burning CPU whenever unrelated applications launch or quit: AXorcist now indexes workspace applications by identity and stops re-reading resolved PIDs, cutting the cost from ~0.68 s to ~0.02 s of CPU per launch and quit on a Mac with ~600 running applications. Thanks @coygeek for the detailed report! #1005.
+- Accept renamed or symlinked CLI executables when routing commands, normalizing agent tasks, and classifying JSON result envelopes.
+- Refuse configuration mutations (custom provider add/remove, configuration updates) when an existing config file cannot be read, instead of overwriting it with defaults or cached data. Thanks @rudycelekli! #1007.
+- Retain capture-action child stdout/stderr when the 64 KiB retention limit splits a trailing UTF-8 scalar, instead of discarding the whole valid prefix and recording an empty stream receipt. Thanks @rudycelekli! #1006.
+- Accept signed global coordinates for foreground MCP move and drag within existing magnitude bounds, preserving target guards and before-delivery validation. Thanks @rudycelekli! #963.
+- Update AXorcist to 0.2.2 so SwiftPM consumers of Peekaboo's library products get the idle-observer CPU fix, plus `collectAll` request-timeout handling, complete observation subscriptions, and fast observer-removal failure reporting.
+- Update the shared Swift Log lock to 1.16.1 and Swift Configuration to 1.2.2 for corrected multiplexed log metadata and empty configuration values, preserving the supported Swift and macOS baselines.
+- Preserve documentation source text through syntax highlighting, parse CRLF metadata, render unfinished EOF fences, retain link entities/query parameters, and assign unique heading targets. Thanks @rudycelekli! #931, #939, #940, #969, #971.
+- Link the npm version page from the published GitHub release body, keeping scoped package paths literal and requiring the registry package name to match the local package before rendering.
+- Publish the Sparkle minimum macOS version as the item element Sparkle reads, migrating existing feed entries whose enclosure attribute Sparkle ignored.
+
+## 4.9.0 - 2026-10-06
+
+**Highlights:** Add exact app- and PID-scoped menu-bar extra clicks, keep foreground file dialogs bound to their parent window, tailor Agent guidance to the acquired tool catalog, show visualizer overlays from a hidden companion app, restore clipboard slots faithfully across processes, and harden release archive and artifact validation.
+
+- Add exact app/PID-scoped menu-extra clicks with bounded AX owner preparation and revalidation, preserving displayed-CG names and indices without scanning unrelated applications. Thanks @buremba! #953.
+- Keep targeted foreground file-dialog focus, navigation, and result receipts under one parent-window owner; negotiate exact execution with Bridge hosts and scope document reads to that parent without losing file-on-disk verification when Save closes it.
+- Fix application-targeted file sheets losing their parent-window identity; preserve compatible panels and ignore unrelated alerts when selecting a unique file panel. Thanks @buremba! #951.
+- Recognize native file-panel identifiers and reuse fresh classification evidence to avoid redundant button scans; batch strict dialog AX reads without truncating hierarchy discovery.
+- Recognize equivalent saved-file paths such as `/tmp` and `/private/tmp` in dialog diagnostics, preserving reported paths and directory-only enforcement.
+- Tailor Agent and learn guidance to the available tool catalog, removing irrelevant recipes while preserving execution authority, observation requirements and session history.
+- Show eligible visualizer overlays from a hidden companion app without unhiding or activating it, accepting input, or changing background-input suppression.
+- Avoid redundant PNG encoding for unchanged live capture frames, preserving original bytes and metadata while retaining transformed-frame encoding, actual-byte caps, and artifact validation.
+- Restore clipboard slots from the current persisted contents instead of a stale per-process cache, and keep multi-item clipboards' item order and boundaries through save and restore. Thanks @rudycelekli! #990.
+- Update AXorcist to 0.2.1 to unwrap live Accessibility values and clear inherited typing and final hotkey modifier flags. Thanks @jandubois! #797.
+- Prepare the final-qualification launcher's atomic receipt publisher before spawning the suspended coordinator, so loaded release Macs no longer spend the identity-acknowledgement window compiling Swift; each use still re-verifies the exact executable, and the exit receipt keeps a fresh build.
+- Reject negative SDK automation waits before preparation or earlier input, and keep large positive waits safely cancellable without integer overflow. Thanks @rudycelekli! #973.
+- Preserve literal environment values inside configuration JSON strings and omit expanded documents from decode warnings; retain numeric substitutions and credential references. Thanks @rudycelekli! #972.
+- Reject non-ASCII tar size/checksum text and PAX record lengths/keys before decoding can disguise malformed bytes, preserving binary tar numbers and UTF-8 values. Thanks @rudycelekli! #966.
+- Retain failed browser connection attempts across ordinary provider tools and invalidate cached verification after socket loss, preventing implicit reconnects and stale success. Thanks @rudycelekli! #949.
+- Honor cancellation and connection deadlines during browser application-metadata reads; reconcile failures without repeating a blocked lookup, retaining connected or uncertain provider ownership. Thanks @rudycelekli! #950.
+- Preserve literal log-helper search and filter text without shell re-parsing, including quotes, backslashes and trailing newlines; retain output, streaming and private-mode arguments. Thanks @rudycelekli! #934.
+- Reject missing log-helper option values promptly with a targeted usage error instead of looping indefinitely, before any log access; match native log severity for historical error-only queries. Thanks @rudycelekli! #938.
+- Preserve conventional shell exit statuses when a wrapped source-build command is terminated by a signal, while retaining mapping integrity checks and lock cleanup. Thanks @rudycelekli! #932.
+- Reject malformed or overflowing release versions before computing build numbers, preserving stable versions and supported alpha/beta/rc aliases instead of allowing extra identifiers to alias a different build. Thanks @rudycelekli! #936.
+- Require explicit npm error codes when detecting unpublished versions; server/authentication failures and contradictory responses no longer become absence merely because a diagnostic contains E404. Thanks @rudycelekli! #965.
+- Reject symlinked or nonregular controller sources and catalogs when producing source receipts, while preserving regular executable files and frozen-commit receipts. Thanks @rudycelekli! #957.
+- Bound ZIP data descriptors before allocating or reading their untrusted gap, preserving valid descriptor checks while avoiding malformed-archive memory amplification. Thanks @rudycelekli! #967.
+- Resolve composed symlink targets before accepting artifact trees and archives, refusing root escapes and native-unreadable chains beyond 32 traversals while preserving contained framework and dangling links. Thanks @rudycelekli! #954.
+- Reject archive entries nested beneath regular files as well as symlinks, independent of entry order, before extraction. Thanks @rudycelekli! #955.
+- Fix the Playground log wrapper's moved script path and clarify repository-root examples, preserving arguments and exit status. Thanks @rudycelekli! #933.
+- Fix signed Bridge typing receipts after already-empty clears and already-satisfied caret moves, preserving zero-dispatch no-ops and strict key, delivery and dispatch-count validation.
+- Preserve accepted dispatch evidence and retry-unsafe status after unchanged readback instead of reporting a no-dispatch no-op or a safe retry; positively observed changes still confirm the action. Thanks @rudycelekli! #942.
+- Preserve recorded response-loss evidence when action sequences or quit batches are cancelled, retaining indeterminate outcomes and unsafe retry guidance. Thanks @rudycelekli! #943.
+- Share literal-replacement eligibility between native typing and Bridge validation without changing confirmation policy, and clarify that typing counts represent keystrokes and accepted typing units rather than raw event or Accessibility setter calls.
+- Accept equivalent PID aliases consistently in read-only window listing and target resolution, while retaining conflicting-PID errors and strict single-selector mutation gates. Thanks @rudycelekli! #945.
+- Clarify `type --clear` help and generated learning guidance to distinguish eligible native Accessibility clearing from keyboard routes, without changing delivery, targeting, or success rules.
+- Format complete keyboard shortcut names without rewriting substrings, distinguish forward and backward delete aliases in compatibility summaries, and reuse the immutable symbol table. Thanks @rudycelekli! #962.
+- Preserve fractional timeout durations in command and dialog diagnostics instead of truncating them to whole seconds, without changing deadlines or error codes. Thanks @rudycelekli! #946.
+- Preserve pending native-operation evidence when combining action receipts, without downgrading it to accepted delivery or weakening response-loss and retry-safety semantics. Thanks @rudycelekli! #944.
+- Escape update-feed URLs and metadata as XML while preserving decoded values and literal replacement characters, including multi-parameter URLs. Thanks @rudycelekli! #935.
+- Validate Swift compatibility-library loader paths and required library architectures per executable slice, so another architecture cannot hide a missing path. Thanks @rudycelekli! #937.
+- Reject ZIP entries with unconsumed trailing DEFLATE bytes before extraction, even when their inflated size and CRC match. Thanks @rudycelekli! #956.
+- Distinguish missing blank title-bar space from changed retained geometry in background paste preparation diagnostics, without relaxing clearance or input guards.
+- Keep CLI and MCP action summaries explicit about unverified or unreported receiver effects, and report paste clipboard cleanup separately without changing canonical outcomes, JSON, retry rules, or exit status.
+- Strip terminal control scalars from agent/task titles before both VibeTunnel and ANSI output, preserving Unicode joiners and preventing embedded title text from injecting terminal commands. Thanks @rudycelekli! #964.
+- Avoid agent-summary crashes on unrepresentable numeric metadata, preserve each consumer's rounding and lookup rules, and report unusable shell exit codes as unavailable rather than success. Thanks @rudycelekli! #961.
+- Preserve apostrophes and escaped characters in JSON documentation reading hints, retaining the legacy single-quoted fallback and malformed-input diagnostics. Thanks @rudycelekli! #941.
+- Explain evaluated Bridge host requirements when `see --fresh` cannot obtain authenticated producer-bound snapshots, instead of incorrectly claiming fresh AX is unsupported or a binary update is sufficient; preserve host selection, trust, and error codes.
+- Correct the visualizer log helper's receiver subsystem and include info/debug output while preserving explicit predicates, without changing logging settings or rendering behavior.
+- Preserve failed log-query exit statuses through tail-limited terminal and file output instead of reporting success from the downstream pipeline. Thanks @rudycelekli! #959.
+- Preserve complete JSON log output and forward live events without waiting for stream completion; retain line limits for completed text queries. Thanks @rudycelekli! #958.
+- Bound npm MCP wrapper shutdown: cancel pending restarts, allow five seconds for the owned server to exit after SIGTERM, then terminate that same child if necessary. Thanks @rudycelekli! #947.
+- Keep MCP wrapper imports free of server-start side effects for eval, print and stdin consumers, including arguments matching its own path or symlink; preserve real entrypoints and unrelated filesystem errors. Thanks @rudycelekli! #948.
+- Refuse companion-app deployment when source or staged directory permissions prevent moving or cleaning up the bundle, before stopping the running GUI, while preserving read-only files and leaving artifact permissions unchanged.
+- Stop inferring a captured window's main state from selection, list position, or visibility; retain the existing `false`/unavailable convention and preserve already-supplied main-state metadata without extra Accessibility reads.
+- Keep Playground log filters and message text literal, reject missing option values, preserve export failures and complete JSON/live output, and match native error severity. Thanks @rudycelekli! #968.
+- Validate smooth duration and step overrides for the human MCP move profile, which forces smooth movement but previously dispatched out-of-range overrides. Thanks @rudycelekli! #970.
+- Report MCP cursor movement directions in screen coordinates, where eastward movement was previously reported as west. Thanks @rudycelekli! #960.
+- Report dialog classification and truncation from cached snapshots instead of always returning a non-dialog, untruncated result. Thanks @rudycelekli! #989.
+- Publish release CLI archives and the app ZIP atomically so a failed write leaves any previous artifact intact. Thanks @rudycelekli! #979.
+- Drain ZIP entry readers before the archive closes its descriptor, so a rejected payload no longer crashes later with an uncaught EBADF (#985). Thanks @rudycelekli! #986.
+- Reject release package resolution when the pinned Sparkle checkout has tracked, staged, or untracked changes. Thanks @rudycelekli! #978.
+- Install the Swift compatibility libraries that standalone CLI builds need next to the binary, so a standalone install loads after moving; release builds keep the mandatory older-SDK runtime audit. Thanks @rudycelekli! #982.
+- Bound release-preflight CLI probes with a timeout and report spawn or timeout failures instead of hanging or misreading them as contract failures. Thanks @rudycelekli! #984.
+- Clean up Node runtime build downloads and work directories when an early transfer or temporary-directory allocation fails. Thanks @rudycelekli! #980.
+- Render capture-timeout and rate-limit retry durations that cannot be represented as integers without trapping. Thanks @rudycelekli! #981.
+- Preserve managed screenshots when a snapshot reuses its own stored image as input, copying through a staged file before replacing the artifact. Thanks @rudycelekli! #987.
+- Require canonical lowercase ASCII hex selected-leaf candidate digests, rejecting full-width digits and letters that Swift's hex check accepted. Thanks @rudycelekli! #983.
+- Report the qualification guardian's own failure when the managed launcher's identity acknowledgement reaches an exited guardian, instead of crashing on an uncaught EPIPE before cleanup; guardian deadlines and the acknowledgement protocol are unchanged.
+
+### Compatibility
+
+- App/PID-scoped `menubar click` and exact-owner file-dialog execution require a 4.9.0 GUI Bridge host that advertises those capabilities at protocol 1.43. With an older Peekaboo app as the Bridge host, these requests refuse before any input instead of falling back to a global search or unscoped dialog handling; update the app together with the CLI.
+
+## 4.8.0 - 2026-10-03
+
+**Highlights:** Add exact-window background drag, text selection, and coordinate scrolling to the CLI and MCP, make background rich paste work in freshly launched windows and fence it against concurrent clipboard changes, extend background scrolling to Safari, add opt-in fresh Accessibility reads to `see`, and recover capture readiness after slow startup checks.
+
+- Add bounded exact-window background drag to CLI and MCP using one held-pointer owner, generation-bound last-point cleanup, and protocol-1.39 receipts; preserve explicit foreground gestures and report unverified retry-unsafe delivery without claiming the drop succeeded.
+- Report missing background-drag source and destination IDs as explicit retry-safe, zero-dispatch `ELEMENT_NOT_FOUND` refusals without inventing receiver receipts or changing foreground error semantics.
+- Preserve captured focused-element evidence in signed background-drag target attribution, avoiding false receipt failures while retaining unverified delivery and retry-unsafe outcomes.
+- Prepare exact standard background windows for temporary rich/binary paste using observed blank chrome and retained editor state, preserving clipboard ownership, foreground isolation, owed releases, and truthful composite receipts through Bridge protocol 1.41. #877.
+- Fence temporary exact-window background paste with the retained clipboard write generation, refusing unsupported hosts before writing and stopping new key-downs after another copy while preserving owed key releases and newer clipboard contents.
+- Report failed background rich-paste preparation observations as no-input refusals, preserving earlier clipboard/preparation effects and avoiding misleading claims that a focus request was sent.
+- Add explicit `--allow-temporary-clipboard` authority for Agent and public MCP to paste bounded base64 payloads through fresh exact-window snapshots while keeping UI background-only, requiring fresh resume opt-in, preserving ownership-aware cleanup and retry-unsafe receipts, and retaining nested/managed Agent attenuation.
+- Preserve input-delivery and message-only refusal causes across composed background preparation outcomes, including content-free native chrome observation diagnostics, without changing dispatch or retry safety.
+- Preserve the underlying cause of failed background paste preparation reads, without changing input dispatch, deadlines, or retry safety.
+- Add background `select-text` / MCP `select_text` for literal, context-disambiguated selections and caret placement, including unfocused native fields, with UTF-16 source-drift checks, unchanged-text verification, and protocol-1.42 receipts without keyboard or clipboard fallback.
+- Add exact-window background coordinate scrolling via CLI `--at` / `--global` and MCP `coords`, preferring the nearest proven AX scroll owner and allowing pixel-authorized native-WebKit wheel delivery without an exposed owner, preserving the requested point and retry-unsafe receipts, and refusing older hosts through protocol 1.43.
+- Recognize Safari's framework-linked executable and scroll-area containers for eligible exact-window background wheel dispatch, preserving hidden-app exclusions, exact receipt checks, and unverified retry-unsafe outcomes.
+- Add opt-in `see --fresh` and MCP `see` / `inspect_ui` freshness with uncached AX evidence, truthful `used_cache` metadata, and fail-closed host compatibility while preserving default caching and partial-tree limits.
+- Preserve native Accessibility date values as ISO-8601 UTC timestamps in UI observations instead of silently omitting them, including Calendar's date-valued controls.
+- Recover ScreenCaptureKit readiness when a slow startup safety scan later completes, preserving fail-closed capture while pending or failed and the existing per-capture ownership checks.
+- Validate Bridge Agent and live certification-producer executables against the running universal-binary slice, avoiding false identity refusals while preserving exact code, path, process-generation, file, and peer-trust checks.
+- Redact inline base64 payloads from Agent live tool-call previews, including nested and partially streamed values, without changing authorized tool input.
+- Remove proven duplicate `see` / `inspect_ui` element listings from Agent provider requests while preserving observation evidence, raw MCP/CLI output, and saved history.
+- Preserve known clipboard cleanup status through Agent paste errors and public MCP metadata, keeping provider claims isolated and canonical dispatch, target, and retry semantics unchanged.
+- Preserve plain and attributed Accessibility value labels in menu listing, path selection, and menu-extra matching, keeping title precedence and ambiguous-name refusals unchanged.
+- Preserve a native text field's coherently observed post-value selection for the dependent caret update, while refusing later state or focus drift without rebasing or replay and retaining nested typing failure diagnostics.
+- Preserve retry-safe no-dispatch outcomes for background wheel failures before the first event, including stale or out-of-window geometry, without weakening accepted-prefix or uncertain-delivery failures.
+- Preserve unsupported background scrolls as exact-target, retry-safe no-dispatch refusals through Bridge instead of reporting a possible mutation or implying all background scroll is Accessibility-only.
+- Preserve reported receiver receipts in MCP background scroll errors without changing retry safety, snapshot invalidation, or foreground global-input attribution.
+- Preserve reported process-generation and exact-window receipts in CLI and MCP paste errors after unconfirmed targeted input, without changing retry safety or attributing shared clipboard effects to a window.
+- Report conflicting concrete snapshot and target selectors in `set-value` and `action` as retry-safe, non-dispatched `INVALID_INPUT` refusals instead of unknown, unverifiable errors; clarify the targeting alternatives.
+- Preserve Bridge route, reported target receipts, hints, and causes on typed stale-snapshot CLI refusals instead of replacing them with local errors; keep snapshot-consumption and finalization safeguards unchanged.
+- Keep app-launch bundle paths and selector proofs consistent across canonical spellings, fixing background verification under `/private/tmp` while preserving process-generation, ambiguity, and caller-local alias checks.
+- Fix Bridge verification when macOS hides the caller's window title, preserving exact process/window identity, fresh Accessibility reads, and strict signed-receipt validation.
+- Distinguish unreadable exact-window focus evidence from actual window mismatches, retaining the AX observation stage and native error without changing background input guards or retry safety.
+- Reuse normalized Agent tool-result claims when building execution traces, eliminating duplicate canonical validation while preserving failure, dispatch, and redaction semantics.
+- Clarify that `see` pixels and Accessibility metadata are not acquired atomically, and explain how to verify an asynchronous action without replaying it.
+- Explain when listed windows are rejected by coordinate-target eligibility without exposing their titles or changing the filters, and preserve already-completed setup focus plus the later refusal diagnostic in cursor-move errors. #869.
+- Explain that exact-window paste capability refusals can result from custom-socket Bridge trust limits, not only an outdated host, without changing trust or retry behavior.
+- Clarify that deprecated `app launch --no-focus` is a compatibility no-op: default launch only verifies an already-running app, while cold launch still requires explicit foreground consent.
+- Clarify that foreground `paste` does not confirm receiver consumption, explain how to inspect an unconfirmed paste outcome instead of replaying it, and add a charset-safe HTML hyperlink paste example. Thanks @marcoantoniofassa! #885.
+- Clarify backward versus forward Delete key names and supported Command modifiers in `press` help and docs, without changing key mappings.
+- Refresh Playground testing guidance for v4 inventories, signed fixtures, fresh exact-window snapshots, and background outcome verification without input replay.
+- Bind companion-app installation and rollback quits to verified exact-path process generations, refusing ambiguous targets, inspection failures, and uncertain retries without raw PID signals. #874.
+- Bound ScreenCaptureKit process-safety signing inspections to two concurrent workers across censuses, preserving complete blocker collection, identity checks, registration retries, and fail-closed readiness.
+- Sign debug CLI builds with the canonical Peekaboo CLI identifier so they satisfy existing GUI Bridge and deployment healthcheck identity checks.
+- Repair first-party GUI qualification by admitting the signed controller and validating canonical global/window receipt scopes; preserve exact authenticated inventory binding and avoid repeating an acknowledged owner disconnect after an evidence error.
+- Remove idle certification-coordinator exit delays by clearing completed child-wait timers and their listeners, preserving normal output draining and bounded TERM/KILL cleanup.
+
+### Compatibility
+
+- Exact-window background drag requires a GUI Bridge host at protocol 1.39, exact-window background rich/binary paste requires the clipboard-fenced protocol 1.40 path (cold-window preparation uses 1.41), background text selection requires protocol 1.42, and exact-window background coordinate scrolling requires protocol 1.43. Screenshot-backed `see --fresh` through a Bridge host requires its fresh Accessibility tree capability. With an older Peekaboo app as the Bridge host, these fail closed before any clipboard write or input; update the app together with the CLI.
+
 ## 4.7.0 - 2026-09-29
 
 **Highlights:** Fix the 4.6.0 CLI startup failure on Macs without the macOS 27 runtime, add GPT-6 Astra, Sol, and Luna plus GPT-6.1 Sol models, keep unattended clipboard reads from triggering macOS privacy prompts, give MCP and JSON clients structured element tables, focused text selection, and visible display bounds, and make compatible-provider Agent streaming reliable.

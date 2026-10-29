@@ -7,30 +7,39 @@ import PeekabooFoundation
 struct PeekabooBridgeClientHostAuthentication: @unchecked Sendable {
     typealias LiveIdentityProvider = @Sendable (Int32) throws -> PeekabooBridgeLivePeerIdentity
     typealias SigningIdentityProvider = @Sendable (PeekabooBridgePeerAuditIdentity)
-        -> PeekabooBridgeHost.PeerSigningIdentity?
+        throws -> PeekabooBridgeHost.PeerSigningIdentity?
 
     let liveIdentity: LiveIdentityProvider
     let signingIdentity: SigningIdentityProvider
+    let currentProcessIsReleaseSigned: @Sendable () -> Bool
+    let unsignedDaemonPolicy: PeekabooBridgeUnsignedDaemonPolicy
 
     init(
         liveIdentity: @escaping LiveIdentityProvider = {
             try PeekabooBridgeSocketIO.livePeerIdentity(fd: $0)
         },
-        signingIdentity: @escaping SigningIdentityProvider)
+        signingIdentity: @escaping SigningIdentityProvider,
+        currentProcessIsReleaseSigned: @escaping @Sendable () -> Bool =
+            PeekabooBridgeSigningDiagnostics.currentProcessIsReleaseSigned,
+        unsignedDaemonPolicy: PeekabooBridgeUnsignedDaemonPolicy? = nil)
     {
         self.liveIdentity = liveIdentity
         self.signingIdentity = signingIdentity
+        self.currentProcessIsReleaseSigned = currentProcessIsReleaseSigned
+        self.unsignedDaemonPolicy = unsignedDaemonPolicy ?? .init(
+            currentProcessIsReleaseSigned: currentProcessIsReleaseSigned)
     }
 
     static let live = Self(
         signingIdentity: { identity in
-            PeekabooBridgeHost.signingIdentity(auditIdentity: identity)
+            try PeekabooBridgeHost.validatedSigningIdentity(auditIdentity: identity)
         })
 }
 
 struct PeekabooBridgeConnectedHostIdentity: Equatable, Sendable {
     let liveIdentity: PeekabooBridgeLivePeerIdentity
     let signingIdentity: PeekabooBridgeHost.PeerSigningIdentity?
+    var signingIdentityFailure: PeekabooBridgeCodeSignatureIdentity.SigningValidationFailure?
 }
 
 // swiftlint:disable:next type_body_length
@@ -52,25 +61,106 @@ public actor PeekabooBridgeClient {
     var exactDialogInputExecutionEnabled = false
     var exactDialogForceDismissExecutionEnabled = false
     var dialogInputFocusPolicyEnabled = false
+    var exactFileDialogExecutionEnabled = false
     var applicationMutationInventoryTransportEnabled = false
     var windowMutationInventoryTransportEnabled = false
-    var exactWindowHeldPointerLifecycleEnabled = false
-    var exactWindowHeldPointerTerminalCleanupEnabled = false
-    var statelessClickVariantPayloadsEnabled = false
-    var statelessClickVariantsEnabled = false
-    var agentExecutionTraceEnabled = false
-    var processGenerationObservationEnabled = false
-    var certificationProducerAttestationEnabled = false
-    var setValueResultTargetBindingEnabled = false
-    var processGenerationBoundElementMutationsEnabled = false
-    var foregroundModifierClickSnapshotLeaseEnabled = false
-    var nativeBrowserConnectionBindingEnabled = false
-    var browserConnectionHandoffEnabled = false
-    var producerBoundSnapshotReferencesEnabled = false
-    var targetedClickAccessibilityValueDeliveryEnabled = false
-    var requestPinnedExactWindowScrollReceiptEnabled = false
-    var compositeTypeDeliveryEnabled = false
-    var desktopObservationInlinePixelsEnabled = false
+    private var inputCapabilities = PeekabooBridgeClientInputCapabilities()
+    var exactWindowHeldPointerLifecycleEnabled: Bool {
+        self.inputCapabilities.exactWindowHeldPointerLifecycleEnabled
+    }
+
+    var exactWindowDragEnabled: Bool {
+        self.inputCapabilities.exactWindowDragEnabled
+    }
+
+    var exactWindowHeldPointerTerminalCleanupEnabled: Bool {
+        self.inputCapabilities.exactWindowHeldPointerTerminalCleanupEnabled
+    }
+
+    var statelessClickVariantPayloadsEnabled: Bool {
+        self.inputCapabilities.statelessClickVariantPayloadsEnabled
+    }
+
+    var statelessClickVariantsEnabled: Bool {
+        self.inputCapabilities.statelessClickVariantsEnabled
+    }
+
+    var agentExecutionTraceEnabled: Bool {
+        self.inputCapabilities.agentExecutionTraceEnabled
+    }
+
+    var processGenerationObservationEnabled: Bool {
+        self.inputCapabilities.processGenerationObservationEnabled
+    }
+
+    var certificationProducerAttestationEnabled: Bool {
+        self.inputCapabilities.certificationProducerAttestationEnabled
+    }
+
+    var setValueResultTargetBindingEnabled: Bool {
+        self.inputCapabilities.setValueResultTargetBindingEnabled
+    }
+
+    var textSelectionEnabled: Bool {
+        self.inputCapabilities.textSelectionEnabled
+    }
+
+    var processGenerationBoundElementMutationsEnabled: Bool {
+        self.inputCapabilities.processGenerationBoundElementMutationsEnabled
+    }
+
+    var foregroundModifierClickSnapshotLeaseEnabled: Bool {
+        self.inputCapabilities.foregroundModifierClickSnapshotLeaseEnabled
+    }
+
+    var nativeBrowserConnectionBindingEnabled: Bool {
+        self.inputCapabilities.nativeBrowserConnectionBindingEnabled
+    }
+
+    var browserConnectionHandoffEnabled: Bool {
+        self.inputCapabilities.browserConnectionHandoffEnabled
+    }
+
+    var producerBoundSnapshotReferencesEnabled: Bool {
+        self.inputCapabilities.producerBoundSnapshotReferencesEnabled
+    }
+
+    var scopedMenuBarActionsEnabled: Bool {
+        self.inputCapabilities.scopedMenuBarActionsEnabled
+    }
+
+    var targetedClickAccessibilityValueDeliveryEnabled: Bool {
+        self.inputCapabilities.targetedClickAccessibilityValueDeliveryEnabled
+    }
+
+    var requestPinnedExactWindowScrollReceiptEnabled: Bool {
+        self.inputCapabilities.requestPinnedExactWindowScrollReceiptEnabled
+    }
+
+    var backgroundCoordinateScrollEnabled: Bool {
+        self.inputCapabilities.backgroundCoordinateScrollEnabled
+    }
+
+    var compositeTypeDeliveryEnabled: Bool {
+        self.inputCapabilities.compositeTypeDeliveryEnabled
+    }
+
+    var clipboardGuardedExactWindowHotkeysEnabled: Bool {
+        self.inputCapabilities.clipboardGuardedExactWindowHotkeysEnabled
+    }
+
+    var preparedClipboardGuardedExactWindowHotkeysEnabled: Bool {
+        self.inputCapabilities.preparedClipboardGuardedExactWindowHotkeysEnabled
+    }
+
+    var desktopObservationInlinePixelsEnabled: Bool {
+        self.inputCapabilities.desktopObservationInlinePixelsEnabled
+    }
+
+    var desktopObservationFreshAccessibilityTreeEnabled: Bool {
+        self.inputCapabilities.desktopObservationFreshAccessibilityTreeEnabled
+    }
+
     var operationAttestation: PeekabooBridgeListenerAttestation?
     var latestVerifiedOperationReceipt: PeekabooBridgeOperationReceipt?
     var latestVerifiedOperationReceiptBundle: PeekabooBridgeOperationReceiptBundle?
@@ -90,8 +180,8 @@ public actor PeekabooBridgeClient {
     /// Creates a Bridge client.
     ///
     /// Bundled Peekaboo socket paths use the release signing teams automatically. Custom socket
-    /// paths must provide `trustedHostTeamIDs` to negotiate protocol 1.29; without explicit host
-    /// trust they remain source-compatible by negotiating receiptless protocol 1.28.
+    /// paths must provide `trustedHostTeamIDs` or enable the unsigned same-binary daemon policy
+    /// to negotiate protocol 1.29; otherwise they negotiate receiptless protocol 1.28.
     public init(
         socketPath: String = PeekabooBridgeConstants.peekabooSocketPath,
         maxResponseBytes: Int = 64 * 1024 * 1024,
@@ -108,10 +198,11 @@ public actor PeekabooBridgeClient {
         self.encoder = encoder
         self.decoder = decoder
         self.operationClientInstanceID = operationClientInstanceID
+        self.hostAuthentication = .live
         self.trustedHostTeamIDs = Self.resolveTrustedHostTeamIDs(
             explicit: trustedHostTeamIDs,
-            socketPath: socketPath)
-        self.hostAuthentication = .live
+            socketPath: socketPath) ?? (self.hostAuthentication.unsignedDaemonPolicy.enabled
+            ? PeekabooBridgeConstants.trustedReleaseTeamIDs : nil)
         self.enqueueTransport = { _, operation in PeekabooBridgeBlockingIO.enqueue(operation) }
         let environmentDirectory = ProcessInfo.processInfo.environment["PEEKABOO_OPERATION_RECEIPT_DIRECTORY"]
             .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
@@ -169,7 +260,8 @@ public actor PeekabooBridgeClient {
         self.operationClientInstanceID = operationClientInstanceID
         self.trustedHostTeamIDs = Self.resolveTrustedHostTeamIDs(
             explicit: trustedHostTeamIDs,
-            socketPath: socketPath)
+            socketPath: socketPath) ?? (hostAuthentication.unsignedDaemonPolicy.enabled
+            ? PeekabooBridgeConstants.trustedReleaseTeamIDs : nil)
         self.hostAuthentication = hostAuthentication
         self.enqueueTransport = enqueueTransport
         let environmentDirectory = ProcessInfo.processInfo.environment["PEEKABOO_OPERATION_RECEIPT_DIRECTORY"]
@@ -465,23 +557,7 @@ public actor PeekabooBridgeClient {
     }
 
     func clearNegotiatedInputCapabilities() {
-        self.exactWindowHeldPointerLifecycleEnabled = false
-        self.exactWindowHeldPointerTerminalCleanupEnabled = false
-        self.statelessClickVariantPayloadsEnabled = false
-        self.statelessClickVariantsEnabled = false
-        self.agentExecutionTraceEnabled = false
-        self.processGenerationObservationEnabled = false
-        self.certificationProducerAttestationEnabled = false
-        self.setValueResultTargetBindingEnabled = false
-        self.processGenerationBoundElementMutationsEnabled = false
-        self.foregroundModifierClickSnapshotLeaseEnabled = false
-        self.nativeBrowserConnectionBindingEnabled = false
-        self.browserConnectionHandoffEnabled = false
-        self.producerBoundSnapshotReferencesEnabled = false
-        self.targetedClickAccessibilityValueDeliveryEnabled = false
-        self.requestPinnedExactWindowScrollReceiptEnabled = false
-        self.compositeTypeDeliveryEnabled = false
-        self.desktopObservationInlinePixelsEnabled = false
+        self.inputCapabilities = PeekabooBridgeClientInputCapabilities()
     }
 
     /// Creates or joins one successor-session handshake using the most recent successful public inputs.
@@ -736,6 +812,9 @@ public actor PeekabooBridgeClient {
         if protocolVersion >= PeekabooBridgeConstants.browserConnectionHandoffVersion {
             capabilities.append(PeekabooBridgeClientCapability.browserConnectionHandoff)
         }
+        if protocolVersion >= PeekabooBridgeConstants.scopedMenuBarActionsVersion {
+            capabilities.append(PeekabooBridgeClientCapability.scopedMenuBarActions)
+        }
         return capabilities
     }
 
@@ -755,11 +834,17 @@ public actor PeekabooBridgeClient {
                 ? Self.offeredCapabilities(for: protocolVersion)
                 : nil)
         let reply = try await self.sendCarryingActionOutcome(.handshake(payload), timeoutSec: timeoutSec)
-        try self.validateTrustedConnectedHost(reply.connectedHost)
         let response = reply.response
+        let hostKind: PeekabooBridgeHostKind? = if case let .handshake(handshake) = response {
+            handshake.hostKind
+        } else {
+            nil
+        }
+        let trustMode = try self.validateTrustedConnectedHost(reply.connectedHost, hostKind: hostKind)
 
         switch response {
-        case let .handshake(handshake):
+        case var .handshake(handshake):
+            handshake.trustMode = trustMode
             return try self.handshakeCandidate(
                 handshake,
                 replacingOperationSessionID: replacingOperationSessionID,
@@ -774,10 +859,18 @@ public actor PeekabooBridgeClient {
     /// Validates the kernel-connected host before interpreting any trusted-socket handshake response, including
     /// errors that could otherwise trigger protocol fallback. Custom sockets without an explicit trust policy retain
     /// their intentionally unauthenticated protocol-1.28 compatibility behavior.
-    private func validateTrustedConnectedHost(_ connectedHost: PeekabooBridgeConnectedHostIdentity?) throws {
-        guard let trustedHostTeamIDs = self.trustedHostTeamIDs else { return }
-        try PeekabooBridgeConnectedHostTrust.validate(
-            connectedHost, socketPath: self.socketPath, trustedTeamIDs: trustedHostTeamIDs)
+    private func validateTrustedConnectedHost(
+        _ connectedHost: PeekabooBridgeConnectedHostIdentity?,
+        hostKind: PeekabooBridgeHostKind?) throws -> PeekabooBridgeTrustMode?
+    {
+        guard let trustedHostTeamIDs = self.trustedHostTeamIDs else { return nil }
+        return try PeekabooBridgeConnectedHostTrust.validate(
+            connectedHost,
+            socketPath: self.socketPath,
+            trustedTeamIDs: trustedHostTeamIDs,
+            hostKind: hostKind,
+            unsignedDaemonPolicy: self.hostAuthentication.unsignedDaemonPolicy,
+            currentProcessIsReleaseSigned: self.hostAuthentication.currentProcessIsReleaseSigned)
     }
 
     private func handshakeCandidate(
@@ -792,6 +885,7 @@ public actor PeekabooBridgeClient {
         let exactInputAdvertised = handshake.supportedOperations.contains(.exactDialogEnterText)
         let exactForceDismissAdvertised = handshake.supportedOperations.contains(.exactDialogForceDismiss)
         let legacyInputAdvertised = handshake.supportedOperations.contains(.dialogEnterText)
+        let exactFileAdvertised = handshake.supportedOperations.contains(.dialogHandleFile)
         return PeekabooBridgeClientHandshakeCandidate(
             response: handshake,
             actionProjectionEnabled:
@@ -816,6 +910,13 @@ public actor PeekabooBridgeClient {
                 (handshake.enabledOperations?.contains(.dialogEnterText) ?? legacyInputAdvertised) &&
                 handshake.hostCapabilities?.contains(
                     PeekabooBridgeHostCapability.dialogInputFocusPolicy) == true,
+            exactFileDialogExecutionEnabled:
+            handshake.negotiatedVersion >= PeekabooBridgeConstants.exactFileDialogExecutionVersion &&
+                authentication.sessionAttestation != nil &&
+                exactFileAdvertised &&
+                handshake.enabledOperations?.contains(.dialogHandleFile) == true &&
+                handshake.hostCapabilities?.contains(
+                    PeekabooBridgeHostCapability.exactFileDialogExecution) == true,
             applicationMutationInventoryTransportEnabled:
             handshake.negotiatedVersion >= PeekabooBridgeConstants.plannerInventoryTransportVersion &&
                 handshake.hostCapabilities?.contains(
@@ -828,62 +929,75 @@ public actor PeekabooBridgeClient {
                     PeekabooBridgeHostCapability.plannerInventoryTransport) == true &&
                 handshake.supportedOperations.contains(.listWindows) &&
                 (handshake.enabledOperations?.contains(.listWindows) ?? true),
-            exactWindowHeldPointerLifecycleEnabled:
-            handshake.negotiatedVersion >= PeekabooBridgeConstants.exactWindowHeldPointerLifecycleVersion &&
-                handshake.hostCapabilities?.contains(
-                    PeekabooBridgeHostCapability.exactWindowHeldPointerLifecycle) == true &&
-                Set([
-                    PeekabooBridgeOperation.createExactWindowHeldPointerOwner,
-                    .beginExactWindowHeldPointer,
-                    .releaseExactWindowHeldPointer,
-                    .revokeExactWindowHeldPointer,
-                    .disconnectExactWindowHeldPointerOwner,
-                ]).isSubset(of: Set(handshake.supportedOperations)) &&
-                Set([
-                    PeekabooBridgeOperation.createExactWindowHeldPointerOwner,
-                    .beginExactWindowHeldPointer,
-                ]).isSubset(of: Set(handshake.enabledOperations ?? handshake.supportedOperations)),
-            exactWindowHeldPointerTerminalCleanupEnabled:
-            handshake.negotiatedVersion >= PeekabooBridgeConstants.exactWindowHeldPointerLifecycleVersion &&
-                handshake.hostCapabilities?.contains(
-                    PeekabooBridgeHostCapability.exactWindowHeldPointerLifecycle) == true &&
-                Set([
-                    PeekabooBridgeOperation.createExactWindowHeldPointerOwner,
-                    .beginExactWindowHeldPointer,
-                    .releaseExactWindowHeldPointer,
-                    .revokeExactWindowHeldPointer,
-                    .disconnectExactWindowHeldPointerOwner,
-                ]).isSubset(of: Set(handshake.supportedOperations)) &&
-                Set([
-                    PeekabooBridgeOperation.releaseExactWindowHeldPointer,
-                    .revokeExactWindowHeldPointer,
-                    .disconnectExactWindowHeldPointerOwner,
-                ]).isSubset(of: Set(handshake.enabledOperations ?? handshake.supportedOperations)),
-            statelessClickVariantPayloadsEnabled:
-            handshake.negotiatedVersion >= PeekabooBridgeConstants.statelessClickVariantVersion,
-            statelessClickVariantsEnabled: Self.supportsStatelessClickVariants(handshake),
-            agentExecutionTraceEnabled: Self.supportsAgentExecutionTrace(handshake),
-            processGenerationObservationEnabled: Self.supportsProcessGenerationObservation(handshake),
-            certificationProducerAttestationEnabled: Self.supportsCertificationProducerAttestation(handshake),
-            setValueResultTargetBindingEnabled: Self.supportsSetValueResultTargetBinding(handshake),
-            processGenerationBoundElementMutationsEnabled:
-            Self.supportsProcessGenerationBoundElementMutations(handshake),
-            foregroundModifierClickSnapshotLeaseEnabled:
-            Self.supportsForegroundModifierClickSnapshotLease(handshake),
-            nativeBrowserConnectionBindingEnabled:
-            Self.supportsNativeBrowserConnectionBinding(handshake),
-            browserConnectionHandoffEnabled:
-            Self.supportsBrowserConnectionHandoff(handshake),
-            producerBoundSnapshotReferencesEnabled:
-            Self.supportsProducerBoundSnapshotReferences(handshake),
-            targetedClickAccessibilityValueDeliveryEnabled:
-            Self.supportsTargetedClickAccessibilityValueDelivery(handshake),
-            requestPinnedExactWindowScrollReceiptEnabled:
-            Self.supportsRequestPinnedExactWindowScrollReceipt(handshake),
-            compositeTypeDeliveryEnabled: Self.supportsCompositeTypeDelivery(handshake),
-            desktopObservationInlinePixelsEnabled: handshake.supportedOperations.contains(.desktopObservation) &&
-                handshake.hostCapabilities?
-                .contains(PeekabooBridgeHostCapability.desktopObservationInlinePixels) == true,
+            inputCapabilities: .init(
+                exactWindowHeldPointerLifecycleEnabled:
+                handshake.negotiatedVersion >= PeekabooBridgeConstants.exactWindowHeldPointerLifecycleVersion &&
+                    handshake.hostCapabilities?.contains(
+                        PeekabooBridgeHostCapability.exactWindowHeldPointerLifecycle) == true &&
+                    Set([
+                        PeekabooBridgeOperation.createExactWindowHeldPointerOwner,
+                        .beginExactWindowHeldPointer,
+                        .releaseExactWindowHeldPointer,
+                        .revokeExactWindowHeldPointer,
+                        .disconnectExactWindowHeldPointerOwner,
+                    ]).isSubset(of: Set(handshake.supportedOperations)) &&
+                    Set([
+                        PeekabooBridgeOperation.createExactWindowHeldPointerOwner,
+                        .beginExactWindowHeldPointer,
+                    ]).isSubset(of: Set(handshake.enabledOperations ?? handshake.supportedOperations)),
+                exactWindowDragEnabled: handshake.supportsExactWindowDrag,
+                exactWindowHeldPointerTerminalCleanupEnabled:
+                handshake.negotiatedVersion >= PeekabooBridgeConstants.exactWindowHeldPointerLifecycleVersion &&
+                    handshake.hostCapabilities?.contains(
+                        PeekabooBridgeHostCapability.exactWindowHeldPointerLifecycle) == true &&
+                    Set([
+                        PeekabooBridgeOperation.createExactWindowHeldPointerOwner,
+                        .beginExactWindowHeldPointer,
+                        .releaseExactWindowHeldPointer,
+                        .revokeExactWindowHeldPointer,
+                        .disconnectExactWindowHeldPointerOwner,
+                    ]).isSubset(of: Set(handshake.supportedOperations)) &&
+                    Set([
+                        PeekabooBridgeOperation.releaseExactWindowHeldPointer,
+                        .revokeExactWindowHeldPointer,
+                        .disconnectExactWindowHeldPointerOwner,
+                    ]).isSubset(of: Set(handshake.enabledOperations ?? handshake.supportedOperations)),
+                statelessClickVariantPayloadsEnabled:
+                handshake.negotiatedVersion >= PeekabooBridgeConstants.statelessClickVariantVersion,
+                statelessClickVariantsEnabled: Self.supportsStatelessClickVariants(handshake),
+                agentExecutionTraceEnabled: Self.supportsAgentExecutionTrace(handshake),
+                processGenerationObservationEnabled: Self.supportsProcessGenerationObservation(handshake),
+                certificationProducerAttestationEnabled: Self.supportsCertificationProducerAttestation(handshake),
+                setValueResultTargetBindingEnabled: Self.supportsSetValueResultTargetBinding(handshake),
+                textSelectionEnabled: handshake.negotiatedVersion >= PeekabooBridgeConstants.textSelectionVersion &&
+                    handshake.hostCapabilities?.contains(PeekabooBridgeHostCapability.textSelection) == true &&
+                    handshake.supportedOperations.contains(.selectText) &&
+                    (handshake.enabledOperations?.contains(.selectText) ?? true),
+                processGenerationBoundElementMutationsEnabled:
+                Self.supportsProcessGenerationBoundElementMutations(handshake),
+                foregroundModifierClickSnapshotLeaseEnabled:
+                Self.supportsForegroundModifierClickSnapshotLease(handshake),
+                nativeBrowserConnectionBindingEnabled:
+                Self.supportsNativeBrowserConnectionBinding(handshake),
+                browserConnectionHandoffEnabled:
+                Self.supportsBrowserConnectionHandoff(handshake),
+                producerBoundSnapshotReferencesEnabled:
+                Self.supportsProducerBoundSnapshotReferences(handshake),
+                scopedMenuBarActionsEnabled: handshake.supportsScopedMenuBarActions,
+                targetedClickAccessibilityValueDeliveryEnabled:
+                Self.supportsTargetedClickAccessibilityValueDelivery(handshake),
+                requestPinnedExactWindowScrollReceiptEnabled:
+                handshake.supportsRequestPinnedExactWindowScrollReceipt,
+                backgroundCoordinateScrollEnabled: handshake.supportsBackgroundCoordinateScroll,
+                compositeTypeDeliveryEnabled: Self.supportsCompositeTypeDelivery(handshake),
+                clipboardGuardedExactWindowHotkeysEnabled: handshake.supportsClipboardGuardedExactWindowHotkeys,
+                preparedClipboardGuardedExactWindowHotkeysEnabled: handshake
+                    .supportsPreparedClipboardGuardedExactWindowHotkeys,
+                desktopObservationInlinePixelsEnabled: handshake.supportedOperations.contains(.desktopObservation) &&
+                    handshake.hostCapabilities?
+                    .contains(PeekabooBridgeHostCapability.desktopObservationInlinePixels) == true,
+                desktopObservationFreshAccessibilityTreeEnabled:
+                handshake.supportsDesktopObservationFreshAccessibilityTree),
             listenerAttestation: authentication.listenerAttestation,
             listenerLiveIdentity: authentication.listenerLiveIdentity,
             sessionAttestation: authentication.sessionAttestation,
@@ -924,10 +1038,7 @@ public actor PeekabooBridgeClient {
             guard let connectedHost,
                   let liveCodeSignatureHash = connectedHost.liveIdentity.codeSignatureHash,
                   !liveCodeSignatureHash.isEmpty,
-                  let signingIdentity = connectedHost.signingIdentity,
-                  signingIdentity.codeSignatureHash == liveCodeSignatureHash,
-                  let signingTeamIdentifier = signingIdentity.teamIdentifier,
-                  self.trustedHostTeamIDs?.contains(signingTeamIdentifier) == true,
+                  handshake.trustMode != nil,
                   connectedHost.liveIdentity.processIdentifier == advertisedListenerAttestation.host.processIdentifier,
                   connectedHost.liveIdentity.processStartIdentity ==
                   advertisedListenerAttestation.host.processStartIdentity,
@@ -963,10 +1074,14 @@ public actor PeekabooBridgeClient {
             listenerLiveIdentity = connectedHost.liveIdentity
             sessionAttestation = advertisedSessionAttestation
             receiptlessAuthenticatedHost = nil
-            authenticatedHostIdentity = Self.authenticatedHostIdentity(
-                advertised: advertisedHostIdentity,
-                listener: advertisedListenerAttestation,
-                signingIdentity: signingIdentity)
+            if handshake.trustMode == .releaseSignature, let signingIdentity = connectedHost.signingIdentity {
+                authenticatedHostIdentity = Self.authenticatedHostIdentity(
+                    advertised: advertisedHostIdentity,
+                    listener: advertisedListenerAttestation,
+                    signingIdentity: signingIdentity)
+            } else {
+                authenticatedHostIdentity = nil
+            }
         } else {
             listenerAttestation = nil
             listenerLiveIdentity = nil
@@ -1132,17 +1247,6 @@ public actor PeekabooBridgeClient {
             operations.isSubset(of: Set(handshake.enabledOperations ?? handshake.supportedOperations))
     }
 
-    private static func supportsRequestPinnedExactWindowScrollReceipt(
-        _ handshake: PeekabooBridgeHandshakeResponse) -> Bool
-    {
-        handshake.negotiatedVersion >= PeekabooBridgeConstants.requestPinnedExactWindowScrollReceiptVersion &&
-            handshake.hostCapabilities?.contains(PeekabooBridgeHostCapability.attestedOperationReceipts) == true &&
-            handshake.hostCapabilities?.contains(
-                PeekabooBridgeHostCapability.requestPinnedExactWindowScrollReceipt) == true &&
-            handshake.supportedOperations.contains(.targetedScroll) &&
-            (handshake.enabledOperations?.contains(.targetedScroll) ?? true)
-    }
-
     private func installHandshakeCandidate(
         _ candidate: PeekabooBridgeClientHandshakeCandidate,
         inputs: PeekabooBridgeClientHandshakeInputs?,
@@ -1178,30 +1282,11 @@ public actor PeekabooBridgeClient {
         self.exactDialogInputExecutionEnabled = candidate.exactDialogInputExecutionEnabled
         self.exactDialogForceDismissExecutionEnabled = candidate.exactDialogForceDismissExecutionEnabled
         self.dialogInputFocusPolicyEnabled = candidate.dialogInputFocusPolicyEnabled
+        self.exactFileDialogExecutionEnabled = candidate.exactFileDialogExecutionEnabled
         self.applicationMutationInventoryTransportEnabled =
             candidate.applicationMutationInventoryTransportEnabled
         self.windowMutationInventoryTransportEnabled = candidate.windowMutationInventoryTransportEnabled
-        self.exactWindowHeldPointerLifecycleEnabled = candidate.exactWindowHeldPointerLifecycleEnabled
-        self.exactWindowHeldPointerTerminalCleanupEnabled = candidate.exactWindowHeldPointerTerminalCleanupEnabled
-        self.statelessClickVariantPayloadsEnabled = candidate.statelessClickVariantPayloadsEnabled
-        self.statelessClickVariantsEnabled = candidate.statelessClickVariantsEnabled
-        self.agentExecutionTraceEnabled = candidate.agentExecutionTraceEnabled
-        self.processGenerationObservationEnabled = candidate.processGenerationObservationEnabled
-        self.certificationProducerAttestationEnabled = candidate.certificationProducerAttestationEnabled
-        self.setValueResultTargetBindingEnabled = candidate.setValueResultTargetBindingEnabled
-        self.processGenerationBoundElementMutationsEnabled =
-            candidate.processGenerationBoundElementMutationsEnabled
-        self.foregroundModifierClickSnapshotLeaseEnabled =
-            candidate.foregroundModifierClickSnapshotLeaseEnabled
-        self.nativeBrowserConnectionBindingEnabled = candidate.nativeBrowserConnectionBindingEnabled
-        self.browserConnectionHandoffEnabled = candidate.browserConnectionHandoffEnabled
-        self.producerBoundSnapshotReferencesEnabled = candidate.producerBoundSnapshotReferencesEnabled
-        self.targetedClickAccessibilityValueDeliveryEnabled =
-            candidate.targetedClickAccessibilityValueDeliveryEnabled
-        self.requestPinnedExactWindowScrollReceiptEnabled =
-            candidate.requestPinnedExactWindowScrollReceiptEnabled
-        self.compositeTypeDeliveryEnabled = candidate.compositeTypeDeliveryEnabled
-        self.desktopObservationInlinePixelsEnabled = candidate.desktopObservationInlinePixelsEnabled
+        self.inputCapabilities = candidate.inputCapabilities
         self.operationAttestation = candidate.listenerAttestation
         self.installReceiptlessAuthenticatedHost(candidate.receiptlessAuthenticatedHost)
         if let listenerAttestation = candidate.listenerAttestation,
@@ -1483,31 +1568,44 @@ private struct PeekabooBridgeClientHandshakeInputs: Sendable {
     let allowsProtocolFallback: Bool
 }
 
+/// Client eligibility revoked together; server-session authority and retained non-input features stay separate.
+private struct PeekabooBridgeClientInputCapabilities: Sendable {
+    var exactWindowHeldPointerLifecycleEnabled = false
+    var exactWindowDragEnabled = false
+    var exactWindowHeldPointerTerminalCleanupEnabled = false
+    var statelessClickVariantPayloadsEnabled = false
+    var statelessClickVariantsEnabled = false
+    var agentExecutionTraceEnabled = false
+    var processGenerationObservationEnabled = false
+    var certificationProducerAttestationEnabled = false
+    var setValueResultTargetBindingEnabled = false
+    var textSelectionEnabled = false
+    var processGenerationBoundElementMutationsEnabled = false
+    var foregroundModifierClickSnapshotLeaseEnabled = false
+    var nativeBrowserConnectionBindingEnabled = false
+    var browserConnectionHandoffEnabled = false
+    var producerBoundSnapshotReferencesEnabled = false
+    var scopedMenuBarActionsEnabled = false
+    var targetedClickAccessibilityValueDeliveryEnabled = false
+    var requestPinnedExactWindowScrollReceiptEnabled = false
+    var backgroundCoordinateScrollEnabled = false
+    var compositeTypeDeliveryEnabled = false
+    var clipboardGuardedExactWindowHotkeysEnabled = false
+    var preparedClipboardGuardedExactWindowHotkeysEnabled = false
+    var desktopObservationInlinePixelsEnabled = false
+    var desktopObservationFreshAccessibilityTreeEnabled = false
+}
+
 private struct PeekabooBridgeClientHandshakeCandidate: Sendable {
     let response: PeekabooBridgeHandshakeResponse
     let actionProjectionEnabled: Bool
     let exactDialogInputExecutionEnabled: Bool
     let exactDialogForceDismissExecutionEnabled: Bool
     let dialogInputFocusPolicyEnabled: Bool
+    let exactFileDialogExecutionEnabled: Bool
     let applicationMutationInventoryTransportEnabled: Bool
     let windowMutationInventoryTransportEnabled: Bool
-    let exactWindowHeldPointerLifecycleEnabled: Bool
-    let exactWindowHeldPointerTerminalCleanupEnabled: Bool
-    let statelessClickVariantPayloadsEnabled: Bool
-    let statelessClickVariantsEnabled: Bool
-    let agentExecutionTraceEnabled: Bool
-    let processGenerationObservationEnabled: Bool
-    let certificationProducerAttestationEnabled: Bool
-    let setValueResultTargetBindingEnabled: Bool
-    let processGenerationBoundElementMutationsEnabled: Bool
-    let foregroundModifierClickSnapshotLeaseEnabled: Bool
-    let nativeBrowserConnectionBindingEnabled: Bool
-    let browserConnectionHandoffEnabled: Bool
-    let producerBoundSnapshotReferencesEnabled: Bool
-    let targetedClickAccessibilityValueDeliveryEnabled: Bool
-    let requestPinnedExactWindowScrollReceiptEnabled: Bool
-    let compositeTypeDeliveryEnabled: Bool
-    let desktopObservationInlinePixelsEnabled: Bool
+    let inputCapabilities: PeekabooBridgeClientInputCapabilities
     let listenerAttestation: PeekabooBridgeListenerAttestation?
     let listenerLiveIdentity: PeekabooBridgeLivePeerIdentity?
     let sessionAttestation: PeekabooBridgeOperationSessionAttestation?

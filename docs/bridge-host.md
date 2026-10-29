@@ -23,6 +23,34 @@ and host capabilities on the same executable generation. An explicit Bridge sock
 Operations that permit process-local fallback can use it when no compatible host is available. Application inventory
 and launch prefer the GUI host, while relaunch and quit require a reusable daemon that survives the caller.
 
+During implicit routing, an on-demand daemon that reports missing Screen Recording, Accessibility, or Event
+Synthesizing grants held by the running Peekaboo.app host ranks after that app, unless the daemon also holds a grant
+the app reports missing; unreported permissions keep the existing order. Snapshot-owned actions and lifecycle
+commands requiring a surviving daemon retain their existing routing.
+
+Permission admission follows the parsed command route. Background exact-window keyboard input requires
+Accessibility to pin its receiver; raw `press` chords other than AX-capable Cmd+A additionally require Event
+Synthesizing. Background text typing and explicit text paste use Accessibility by default, but do not require
+Event Synthesizing merely because keyboard fallback is possible. Foreground `type` requires Event Synthesizing;
+targeted foreground setup also requires Accessibility. Foreground hotkeys and paste use Event Synthesizing under
+the default synthesis policy; an explicit AX-first policy can instead use menu shortcuts. Input-policy overrides
+retain their existing local routing.
+
+Window mutations and application-menu traversal/actions require Accessibility. Foreground window close can
+finish through AX before its keyboard fallback, so it does not declare Event Synthesizing. Scoped status-item
+clicks require Accessibility; global status-item names/indices use coordinate delivery and require Event
+Synthesizing. Native app hide/focus, window/status-item inventory, and clipboard-only writes declare neither.
+File paste with an unknown payload leaves its delivery requirement undecided until decoding selects text
+or Cmd+V. Current-clipboard paste always uses Cmd+V and requires Event Synthesizing under the default policy;
+`paste` itself always delivers input, whereas `clipboard set` only writes the clipboard.
+
+For these route-derived declarations, an explicitly denied permission skips that remote candidate; omitted
+permission reports (including legacy reports without Event Synthesizing status) remain unknown. Existing
+click/move/drag/scroll permission flags retain their strict grant checks, and operation-derived requirements
+retain their existing admission rules. When all implicit candidates are rejected,
+commands permitting local execution still attempt the same in-process fallback and retain their own local
+permission errors. Snapshot-owner and explicit-socket routing remain strict.
+
 Commands carrying a concrete snapshot reference do not use this preference order. They resolve the unique producer as
 described in [Snapshot authority](#snapshot-authority) before selecting an execution host.
 
@@ -65,6 +93,28 @@ The `--` separates pnpm's script invocation from the installer options. You can 
 `--deployment` directly to `scripts/restart-peekaboo.sh` and omit that separator. Deployment mode requires the trusted signed artifact and current
 signed CLI, then retains the transactional signer/native-only/readiness/rollback gates described
 below.
+
+The source bundle's physical directories must be writable and searchable by the installer so macOS
+can move the staged bundle between parents and clean up its transaction. Read-only regular files are
+supported, and directory symlinks are not followed by this permission check. Explicit `--source-app`
+and `--no-build` inputs are checked before interrupted-transaction recovery; newly built output and
+the exact staged copy are also checked before replacement stops the running GUI. An inaccessible
+directory or an incomplete directory scan fails closed without rewriting permissions. Keep a sealed
+read-only evidence artifact unchanged and prepare a separate installable copy with accessible
+directories; record any directory-mode changes in that copy's full-tree manifest.
+
+Before replacement or rollback stops a process, the installer verifies its exact bundle path with
+the CLI's read-only `app launch` no-op and retains that process-generation receipt for a non-forced
+`app quit`. It refuses ambiguous targets, failed process inspection, and changed generations instead
+of sending a raw PID signal or retrying an uncertain quit. The current signed healthcheck CLI must
+advertise both the read-only launch and generation-bound quit contracts in its help; this is checked
+before interrupted-transaction recovery can invoke application lifecycle commands.
+
+If the companion declines a normal quit, deployment intentionally stops and preserves its recovery
+journal and bundles; there is no automatic force-quit fallback. Finish or cancel ongoing work, quit
+Peekaboo from its menu-bar menu, then rerun the same deployment command with the signed app and
+healthcheck CLI. Leave the recovery journal and transaction directory intact so the installer can
+verify and recover them; do not delete them or signal a PID copied from an earlier attempt.
 
 Deployment may launch the GUI permission broker with the process argument
 `--background-bridge-host`. That unattended mode still initializes the menu-bar status item,
@@ -194,6 +244,29 @@ host, then dispatches type or hotkey input while the Bridge mutation gate remain
 every character or key boundary. Exact clicks likewise retain the capture-time receipt through final native dispatch
 and completion validation. New clients reject older hosts for these exact-input operations.
 
+Protocol `1.40` adds `clipboardGuardedExactWindowHotkeys`. A claim-bearing exact-window Cmd+V request requires
+this negotiated capability, authenticated operation receipts, an enabled exact-window hotkey operation, and retained
+focused-element evidence. Typing support is not a prerequisite. The optional claim is the General pasteboard generation
+retained by the caller's temporary-write transaction, not a count sampled after writing or authority to read clipboard
+contents. The host checks it before each new key-down; losing the claim does not suppress releases already owed to the
+original process generation. Clipboard access and ownership-aware cleanup remain caller-local. Unsupported sessions
+refuse without dropping the claim or falling back to ordinary hotkeys. Claimless keyboard contracts are unchanged.
+Completed guarded delivery reports four window-targeted event units and remains unverified and retry-unsafe; checks
+themselves add no units, and neither the claim nor accepted delivery proves that the application consumed the paste.
+
+Protocol `1.41` adds `preparedClipboardGuardedExactWindowHotkeys`, refining the guarded capability above. The explicit
+`backgroundPreparation: "blankWindowChrome"` mode requires the new negotiated capability even in malformed requests
+that omit a claim; it is never silently dropped by compatibility fallback. CLI and MCP temporary exact-window rich/binary
+paste require this capability before clipboard preparation. Omitted mode preserves the original four-unit contract.
+The native host keeps target-only activation, observed blank-chrome pointer delivery, and Cmd+V under the existing
+process lane. It retains the exact editor, UTF-16 text, and selection across preparation and then applies normal exact
+key-window validation before keys. Complete preparation and delivery report eight composite/background units; native-only
+and mixed failure prefixes remain separately accounted, unverified, and retry-unsafe. It does not invoke foreground
+activation, restore prior focus/selection, retry uncertain input, or create a second pointer owner.
+Some macOS titlebar widgets use auxiliary native surfaces. Their complete descendants may contribute exclusion geometry
+only while every frame stays inside the originating canonical close/minimize/zoom control; they gain no input authority.
+Root and control ownership remain exact, and aliases reached outside that restricted subtree are validated independently.
+
 Protocol `1.36` adds `compositeTypeDelivery` for background type requests that may use AXValue delivery: non-empty text,
 clear, and editable focused-text keys. Each direct AX mutation counts as one dispatch and zero key presses; event fallback
 counts its posted key events, and mixed requests report composite delivery. Event-only special keys retain their earlier
@@ -248,6 +321,11 @@ service contracts and allowed observation operation. Caller-supplied capability 
 proof. The older `screenCaptureKitProcessOwnership` capability remains conservative and is removed if registration or
 preparation fails, preserving old-client wire safety.
 
+The Bridge retains its nine-second startup publication budget without cancelling the shared safety scan. A timeout keeps
+SCK unavailable while that scan is pending. If it later succeeds, subsequent handshakes publish fresh ready status
+and restore the ownership capability; a late concrete failure remains unavailable. Registration failures are not
+retried, and every actual SCK leaf still validates ownership before dispatch. This does not shorten or skip the scan.
+
 Optional `screenCaptureKitReadiness` records the preparation observation and typed failure, including all original
 blocker identities that were available. A ready observation is permission to attempt SCK, not actual ownership.
 Unknown or missing readiness supplies no new SCK authority. A current blocked host can still accept explicit classic
@@ -296,6 +374,22 @@ and cleanup outcomes through signed operation receipts, and refuse zero-dispatch
 The host retains the exact-window write lane until terminal cleanup; a short watchdog handles expiry, window drift,
 client-generation exit, and target-generation exit without ever posting mouse-up to a recycled PID.
 
+Protocol `1.39` adds the separately capability-gated `exactWindowDrag` operation. One request carries a fresh snapshot,
+its immutable exact-window receipt, two finite in-window global logical points, a 1–10000 ms duration, and 1–96 linear
+drag samples. The existing held-pointer owner retains the window lane through primer, down, movement, and one terminal
+up; no outer Bridge lane is acquired. Each successful sample advances the owner's retained cleanup point and count.
+Cancellation and drift await that same owner's terminal cleanup, while PID recycling suppresses cleanup entirely.
+Success is window-targeted background `dispatchedUnverified` with exactly `steps + 3` accepted units. Failure retains
+the bounded accepted prefix and target with indeterminate completion evidence; an up event never certifies a drop. Older or receiptless hosts are rejected
+before dispatch, and the protocol-1.30 fixed-point begin/release counts and payloads are unchanged.
+
+The drag client's total request deadline is at least the requested duration plus three seconds, or the configured
+timeout when longer. This budget includes client queueing, host lane admission, the gesture, cleanup, and receipt;
+it does not restart when the lane opens. The existing held-owner watchdog starts before window-lane acquisition and
+expires after the requested duration plus two seconds. A long lane wait can therefore refuse before down or interrupt
+a later gesture. Cancellation waits for the same owner's cleanup; transport timeout, disconnect, or a lost signed
+response remains retry-unsafe when dispatch may have begun, never a reason to repeat the drag automatically.
+
 Protocol `1.31` adds the capability-gated `agentExecutionTrace` operation for one long-running, signed background Agent
 execution. It is a single Bridge request from launch through terminal reap, not a prepare/start or other two-call
 lifecycle. The host derives the executable from the exact authenticated Peekaboo CLI peer and accepts only the task and
@@ -306,6 +400,14 @@ retains half of macOS's 1 MiB `ARG_MAX` as headroom instead of exposing a late `
 accepts canonical `X_AI_API_KEY` as well as the `XAI_API_KEY` and `GROK_API_KEY` aliases. The child invocation is fixed
 to background-only `agent run --no-cache --bridge-socket
 <serving-host> --json`; there is no foreground-authority flag, session resume, or cache write.
+
+Executable validation uses the signed architecture selected for the live process, which can differ from a universal
+binary's default path-based architecture. Peer lookups retain their socket audit token; newly spawned, unreaped children
+use the parent's retained PID generation. The selected static signature must be valid and match the live kernel CDHash,
+canonical executable path, and process generation before and after validation. Whole-file SHA-256 and safe file-metadata
+checks remain required, and the child must still match the authenticated peer's exact executable identity. Live
+certification producer authentication uses the same audit-bound slice check, including its post-challenge identity
+revalidation.
 
 The host creates bounded anonymous stdout and stderr pipes plus separate anonymous lockdown-readiness and release
 pipes. It spawns the exact CLI with `START_SUSPENDED | SETSID`, then sends `SIGCONT` only to enter the CLI's trusted
@@ -353,10 +455,12 @@ deliberately omitted from public help and shell completions.
 
 The client does not treat the response-carried, self-signed listener as provenance by itself. It captures the connected
 socket peer's audit token and requires exact PID/PID-version, process-start, live kernel CDHash, Apple-anchored signing
-identity, trusted team membership, and listener-host agreement before installing a 1.29 session. Bundled Peekaboo
-socket paths use the release-team migration allowlist. Custom socket clients must pass `trustedHostTeamIDs`; omitting
-that policy caps the handshake at receiptless protocol 1.28 so an arbitrary same-user Developer ID process cannot
-replace the socket and mint a trusted-looking receipt chain.
+identity, trusted team membership, and listener-host agreement before installing a 1.29 session. The unsigned daemon
+developer opt-in described under [Security](#security) replaces only the signing/team requirement with same-effective-UID
+and own-live-CDHash checks; listener, session, and per-request generation binding still apply. Bundled Peekaboo socket
+paths use the release-team migration allowlist. Custom socket clients must pass `trustedHostTeamIDs` or enable that
+unsigned developer policy; otherwise the handshake is capped at receiptless protocol 1.28 so an arbitrary same-user
+Developer ID process cannot replace the socket and mint a trusted-looking receipt chain.
 
 Each protocol 1.29 request reserves one decimal-string sequence in its logical session and carries a deterministic
 RFC 9562 version-8 request UUID derived from the full `(session ID, sequence)` tuple. Replay protection retains the
@@ -422,6 +526,20 @@ retry-unsafe failures retain that same target in the signed receipt. Current cli
 older hosts, and current hosts negotiating protocol 1.34 or earlier return an explicit runtime-incompatible no-dispatch
 refusal instead of silently accepting the older receipt-less request shape.
 
+Protocol `1.43` adds service-derived `backgroundCoordinateScroll` support to the existing `targetedScroll` operation.
+An optional global display point is mutually exclusive with the element selector. Coordinate requests still pin the
+capture-owned exact window and producer lease; a nil element with a point never becomes global input. Both client and
+host require the negotiated capability before dispatch, while older element-scroll and explicit foreground contracts
+remain unchanged. Coordinates cannot request foreground, smooth, or delayed input.
+
+Protocol `1.43` also supports the additive, service-derived `exactFileDialogExecution` capability on
+`dialogHandleFile`. A typed execution payload carries the original app/PID/window selector and foreground focus
+policy to the dialog owner. That owner plans the parent and file sheet before focus and retains the parent in the
+canonical result and signed receipt. The client and host require the capability, operation enablement, and an attested
+session; the version number alone is insufficient. Missing support refuses before operation transport or provider
+execution, with no legacy fallback. Existing attested legacy file payloads remain refused. This capability does not
+grant foreground authority or make keyboard file navigation available to background-only sessions.
+
 Browser execution is bound atomically to the connection receipt observed before dispatch. Protocol 1.29 carries the
 complete normalized browser URL, WebSocket debugger URL, DevTools browser ID, browser version, protocol version, and
 channel. Protocol 1.34 plus `nativeBrowserConnectionBinding` is required for native channel resolution, which carries
@@ -469,6 +587,22 @@ Peekaboo BridgeHost validates callers before processing any request:
 - Reads the peer PID via `getsockopt(..., LOCAL_PEERPID, ...)`.
 - Validates the peer’s **code signature TeamID** via Security.framework (`SecCodeCopyGuestWithAttributes`).
 - Rejects any process not signed by an allowlisted TeamID (default: `FWJYW4S8P8`, plus `Y5PE65HELJ` for transition-era CLI compatibility).
+- Peekaboo.app additionally admits only the exact signing identifiers of its CLI, GUI, and source-bound certification controller (`boo.peekaboo.peekaboo-certification-controller`). The controller retains its own matched-build checks; this admission does not grant CLI-only certification, browser-handoff, or Agent operations to other clients.
+
+Unsigned source builds, including Homebrew core's `peekaboo` formula, normally cannot use trusted Bridge or daemon
+hosts; prefer the [notarized tap or npm CLI installs](install.md#homebrew-recommended).
+
+`PEEKABOO_ALLOW_UNSIGNED_DAEMON=1` is an explicit developer exception only for processes that are not release-signed.
+An opted-in unsigned client can authenticate an on-demand daemon only when its live socket peer has the same
+effective UID and exact same live kernel CDHash as itself. An opted-in unsigned daemon applies the same rule to
+clients. Existing audit-token, liveness, process-generation, and receipt bindings remain in force. GUI hosts and
+different binaries still require release signing; release-signed binaries ignore the variable. Every relaxed
+connection is marked `unsigned same-binary developer opt-in` by Bridge/daemon status (JSON `trustMode` is
+`unsignedSameBinaryDeveloperOptIn`), and host admission is logged. This does not claim release-authenticated source
+provenance. See [daemon development](daemon.md#unsigned-developer-builds).
+
+Ad-hoc source builds lack the hardened runtime, so injected code can run under the same binary and share its CDHash.
+Enable only on machines you control; prefer the notarized install.
 
 Debug-only escape hatch:
 
@@ -508,6 +642,7 @@ response bytes. Protocol 1.5 desktop observation provides the raster metadata, w
   screen-capture observation, AX-tree inspection, browser, and snapshot-state work first prefers—and may auto-start—the
   current CLI build's build-scoped daemon so an older compatible host does not become the owner of build-sensitive
   in-memory state.
+- Implicit auto-start skips a daemon predicted by the caller's non-interactive permission preflights to be weaker than a capable Peekaboo.app host; concrete snapshot ownership and commands requiring a surviving lifecycle host keep their existing routing.
 - Use `--no-remote` to force local execution.
 - Use `--bridge-socket <path>` or `PEEKABOO_BRIDGE_SOCKET` to override host discovery.
 - Use `PEEKABOO_DAEMON_SOCKET` only to change the auto-start daemon socket without treating it as an explicit Bridge override.

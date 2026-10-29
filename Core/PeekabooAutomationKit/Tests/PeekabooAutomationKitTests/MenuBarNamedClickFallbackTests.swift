@@ -117,20 +117,4 @@ struct MenuBarNamedClickFallbackTests {
 
         #expect(fallbackDispatches == 0)
     }
-
-    @Test
-    @MainActor
-    func `Named fallback revalidates the second inventory before dispatch`() throws {
-        let service = MenuService(partialMatchEnabled: false)
-        try service.validateNamedFallbackTitle("Clock", requestedName: "Clock")
-
-        do {
-            try service.validateNamedFallbackTitle("Wi-Fi", requestedName: "Clock")
-            Issue.record("Expected a reordered fallback item to be refused")
-        } catch let failure as DesktopActionFailure {
-            #expect(failure.outcome.state == .refused)
-            #expect(failure.outcome.refusalReason == .targetUnavailable)
-            #expect(failure.outcome.dispatchState == .none)
-        }
-    }
 }

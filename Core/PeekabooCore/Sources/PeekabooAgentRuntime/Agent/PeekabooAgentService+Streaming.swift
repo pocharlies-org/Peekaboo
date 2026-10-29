@@ -53,7 +53,7 @@ extension PeekabooAgentService {
         let eventHandler: EventHandler?
         let textHandler: TextStreamHandler?
         let enhancementOptions: AgentEnhancementOptions?
-        let executionPolicy: MCPToolExecutionPolicy
+        let executionAuthority: MCPToolExecutionAuthority
 
         init(
             model: LanguageModel,
@@ -63,7 +63,7 @@ extension PeekabooAgentService {
             eventHandler: EventHandler?,
             textHandler: TextStreamHandler? = nil,
             enhancementOptions: AgentEnhancementOptions?,
-            executionPolicy: MCPToolExecutionPolicy = .backgroundOnly)
+            executionAuthority: MCPToolExecutionAuthority = .backgroundOnly)
         {
             self.model = model
             self.provider = provider
@@ -72,7 +72,7 @@ extension PeekabooAgentService {
             self.eventHandler = eventHandler
             self.textHandler = textHandler
             self.enhancementOptions = enhancementOptions
-            self.executionPolicy = executionPolicy
+            self.executionAuthority = executionAuthority
         }
     }
 
@@ -86,7 +86,7 @@ extension PeekabooAgentService {
         let imageContextID: String
         let turnBoundary: AgentTurnBoundary
         let enhancementOptions: AgentEnhancementOptions?
-        let executionPolicy: MCPToolExecutionPolicy
+        let executionAuthority: MCPToolExecutionAuthority
 
         init(
             model: LanguageModel,
@@ -97,7 +97,7 @@ extension PeekabooAgentService {
             imageContextID: String = UUID().uuidString,
             initialMessages: [ModelMessage] = [],
             enhancementOptions: AgentEnhancementOptions? = nil,
-            executionPolicy: MCPToolExecutionPolicy = .backgroundOnly)
+            executionAuthority: MCPToolExecutionAuthority = .backgroundOnly)
         {
             self.model = model
             self.supportsVision = model.supportsVision && (providerSupportsVision ?? true)
@@ -107,7 +107,7 @@ extension PeekabooAgentService {
             self.imageContextID = imageContextID
             self.turnBoundary = PeekabooAgentService.restoredTurnBoundary(from: initialMessages)
             self.enhancementOptions = enhancementOptions
-            self.executionPolicy = executionPolicy
+            self.executionAuthority = executionAuthority
         }
 
         func tool(named name: String) -> AgentTool? {
@@ -181,7 +181,7 @@ extension PeekabooAgentService {
             imageContextID: imageContextID,
             initialMessages: initialMessages,
             enhancementOptions: configuration.enhancementOptions,
-            executionPolicy: configuration.executionPolicy)
+            executionAuthority: configuration.executionAuthority)
         return try await self.withAgentToolImageLifecycle(
             executionID: imageContextID,
             imageStore: imageStore)
@@ -244,7 +244,7 @@ extension PeekabooAgentService {
                     let streamResult = try await streamText(
                         model: configuration.model,
                         provider: configuration.provider,
-                        messages: state.messages,
+                        messages: AgentToolMCPBridge.providerContextMessages(state.messages),
                         tools: configuration.tools.isEmpty ? nil : configuration.tools,
                         settings: self.generationSettings(for: configuration.model))
                     return try await self.collectStreamOutput(
@@ -1340,13 +1340,23 @@ extension PeekabooAgentService {
                 wrapped["summary_text"] = summaryText
             }
 
+            // Invalid numbers can raise an Objective-C exception instead of a Swift error.
+            guard JSONSerialization.isValidJSONObject(wrapped) else {
+                throw EncodingError.invalidValue(
+                    result,
+                    .init(codingPath: [], debugDescription: "Invalid tool result JSON"))
+            }
             let data = try JSONSerialization.data(withJSONObject: wrapped, options: [])
             return String(data: data, encoding: .utf8) ?? "{}"
         } catch {
             let fallback = result.stringValue ?? String(describing: result)
-            let escapedFallback = fallback.replacingOccurrences(of: "\"", with: "\\\"")
-            return "{\"result\": \"\(escapedFallback)\"}"
+            return Self.toolCompletionTextPayload(["result": fallback])
         }
+    }
+
+    static func toolCompletionTextPayload(_ payload: [String: String]) -> String {
+        guard let data = try? JSONEncoder().encode(payload) else { return "{}" }
+        return String(data: data, encoding: .utf8) ?? "{}"
     }
 
     private func summaryText(from payload: [String: Any], toolName: String) -> String? {
@@ -1361,13 +1371,7 @@ extension PeekabooAgentService {
     }
 
     private func toolErrorPayload(from error: any Error) -> String {
-        let errorDict = ["error": error.localizedDescription]
-        guard let data = try? JSONSerialization.data(withJSONObject: errorDict, options: []),
-              let json = String(data: data, encoding: .utf8)
-        else {
-            return "{\"error\": \"Unknown error\"}"
-        }
-        return json
+        Self.toolCompletionTextPayload(["error": error.localizedDescription])
     }
 }
 

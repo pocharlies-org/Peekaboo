@@ -58,6 +58,11 @@ extension ActionInputError: LocalizedError {
     }
 }
 
+enum ScrollBarSearchScope: Sendable, Equatable {
+    case targetDescendants
+    case explicitOwner
+}
+
 @MainActor
 protocol ActionInputDriving: Sendable {
     func tryClick(element: AutomationElement, beforeMutation: @MainActor () throws -> Void) async throws
@@ -74,7 +79,8 @@ protocol ActionInputDriving: Sendable {
     func tryScroll(
         element: AutomationElement,
         direction: PeekabooFoundation.ScrollDirection,
-        pages: Int) throws -> UIInputExecutionResult.Action
+        pages: Int,
+        scrollBarScope: ScrollBarSearchScope) throws -> UIInputExecutionResult.Action
     func trySetText(
         element: AutomationElement,
         text: String,
@@ -87,9 +93,23 @@ protocol ActionInputDriving: Sendable {
         value: UIElementValue,
         beforeMutation: @MainActor () throws -> Void) async throws -> UIInputExecutionResult.Action
     func tryPerformAction(element: AutomationElement, actionName: String) throws -> UIInputExecutionResult.Action
+    func trySelectText(
+        element: AutomationElement,
+        request: TextSelectionRequest,
+        beforeMutation: @MainActor () throws -> Void) async throws
+        -> (UIInputExecutionResult.Action, TextSelectionResult)
 }
 
 extension ActionInputDriving {
+    func trySelectText(
+        element: AutomationElement,
+        request: TextSelectionRequest,
+        beforeMutation: @MainActor () throws -> Void) async throws
+        -> (UIInputExecutionResult.Action, TextSelectionResult)
+    {
+        throw ActionInputError.unsupported(.attributeUnsupported)
+    }
+
     func tryClick(
         element: AutomationElement,
         allowAccessibilityValueFallback: Bool,
@@ -222,9 +242,11 @@ struct ActionInputDriver: ActionInputDriving {
     func tryScroll(
         element: AutomationElement,
         direction: PeekabooFoundation.ScrollDirection,
-        pages: Int) throws -> UIInputExecutionResult.Action
+        pages: Int,
+        scrollBarScope: ScrollBarSearchScope) throws -> UIInputExecutionResult.Action
     {
-        try self.performScrollActions(element: element, direction: direction, pages: pages)
+        try self.performScrollActions(
+            element: element, direction: direction, pages: pages, scrollBarScope: scrollBarScope)
     }
 
     func trySetText(
@@ -264,6 +286,120 @@ struct ActionInputDriver: ActionInputDriving {
 
     func tryPerformAction(element: AutomationElement, actionName: String) throws -> UIInputExecutionResult.Action {
         try self.performAction(actionName, on: element)
+    }
+
+    func trySelectText(
+        element: AutomationElement,
+        request: TextSelectionRequest,
+        beforeMutation: @MainActor () throws -> Void) async throws
+        -> (UIInputExecutionResult.Action, TextSelectionResult)
+    {
+        try await self.selectText(element: element, request: request, beforeMutation: beforeMutation)
+    }
+
+    func selectText(
+        element: any AutomationElementRepresenting,
+        request: TextSelectionRequest,
+        beforeMutation: @MainActor () throws -> Void = {}) async throws
+        -> (UIInputExecutionResult.Action, TextSelectionResult)
+    {
+        let unavailable = DesktopActionFailure.preDispatchRefusal(
+            reason: .targetUnavailable,
+            message: "The target text or selection is unreadable or changed; observe it again.")
+        let target = try await self.observationTarget(element)
+        guard element.role != "AXSecureTextField", element.subrole != "AXSecureTextField",
+              element.isTextSelectionSettable
+        else {
+            throw DesktopActionFailure.preDispatchRefusal(
+                reason: .operationUnsupported,
+                message: "The nonsecure target must expose a settable AXSelectedTextRange.")
+        }
+        let readState = { () async throws -> TextSelectionState? in
+            if let native = element.underlyingAXElement {
+                guard let target else { return nil }
+                let sample: AXMutationObservationSnapshot?
+                do {
+                    sample = try await self.nativeReader(
+                        RetainedFocusElement(element: native),
+                        AXMutationObservationTarget(
+                            processIdentifier: target.element.processIdentifier,
+                            processStartIdentity: target.processGeneration,
+                            expectedIdentity: target.element),
+                        .textSelection,
+                        .milliseconds(50))
+                } catch let cancellation as CancellationError {
+                    throw cancellation
+                } catch let failure as DesktopActionFailure {
+                    throw failure
+                } catch {
+                    throw unavailable
+                }
+                guard case let .string(text)? = sample?.value, let range = sample?.selectedTextRange else { return nil }
+                return TextSelectionState(text: text, range: range)
+            }
+            guard let text = element.stringValue, let range = element.textSelectionRange,
+                  range.location + range.length <= text.utf16.count
+            else { return nil }
+            return TextSelectionState(text: text, range: range)
+        }
+        try Self.validateBeforeMutation(beforeMutation)
+        guard let source = try await readState() else { throw unavailable }
+        let selection: TextSelectionResult
+        do {
+            selection = try request.resolve(in: source.text)
+        } catch {
+            throw DesktopActionFailure.preDispatchRefusal(reason: .invalidRequest, message: error.localizedDescription)
+        }
+        let desired = TextSelectionState(text: source.text, range: selection.selectedRange)
+        let dispatch = try await self.performObservedMutation(
+            on: element,
+            attribute: .textSelection,
+            mutation: {
+                try Self.validateBeforeMutation(beforeMutation)
+                guard let current = try await readState(), current == source || current == desired else {
+                    throw unavailable
+                }
+                try Self.validateBeforeMutation(beforeMutation)
+                if current == desired {
+                    return .noChange
+                }
+                do {
+                    return try element
+                        .setAutomationTextSelection(selection.selectedRange) ? .accessibilityValue : .unsupported
+                } catch let failure as DesktopActionFailure {
+                    throw failure
+                } catch {
+                    throw DesktopActionFailure.indeterminate(
+                        delivery: Self.accessibilityValueDelivery,
+                        evidence: .completionUnknown,
+                        unitCount: .one,
+                        message: "The selection write returned without acceptance evidence.",
+                        hint: "Observe the exact field before deciding whether to retry.",
+                        causeDescription: error.localizedDescription)
+                }
+            },
+            matches: { sample in
+                if let sample {
+                    guard case let .string(text)? = sample.value else { return false }
+                    return text.utf16.elementsEqual(source.text.utf16) &&
+                        sample.selectedTextRange == selection.selectedRange
+                }
+                guard let text = element.stringValue, let range = element.textSelectionRange else { return false }
+                return TextSelectionState(text: text, range: range) == desired
+            })
+        guard dispatch != .unsupported else {
+            throw DesktopActionFailure.preDispatchRefusal(
+                reason: .operationUnsupported,
+                message: "The target does not support native text selection.")
+        }
+        return (
+            UIInputExecutionResult.Action(
+                outcome: dispatch == .noChange ? .confirmedNoChange() : .confirmedChange(
+                    delivery: Self.accessibilityValueDelivery, unitCount: .one),
+                actionName: kAXSelectedTextRangeAttribute,
+                anchorPoint: nil,
+                elementRole: element.role),
+            selection)
     }
 
     nonisolated static func classify(_ error: any Error) -> ActionInputError {
@@ -609,12 +745,12 @@ struct ActionInputDriver: ActionInputDriving {
         on element: any AutomationElementRepresenting,
         attribute: AXMutationObservationAttribute,
         beforeMutation: @MainActor () throws -> Void = {},
-        mutation: () throws -> FocusedTextKeyDispatch,
+        mutation: @MainActor () async throws -> FocusedTextKeyDispatch,
         matches: (AXMutationObservationSnapshot?) -> Bool) async throws -> FocusedTextKeyDispatch
     {
         let target = try await self.observationTarget(element)
         try Self.validateBeforeMutation(beforeMutation)
-        let dispatch = try mutation()
+        let dispatch = try await mutation()
         guard dispatch == .accessibilityValue else { return dispatch }
         guard await self.observeMutation(on: element, target: target, attribute: attribute, matches: matches) else {
             throw Self.unverifiedValueMutationFailure(attribute: String(describing: attribute))
@@ -821,9 +957,15 @@ extension ActionInputDriver {
     private func performScrollActions(
         element: any AutomationElementRepresenting,
         direction: PeekabooFoundation.ScrollDirection,
-        pages: Int) throws -> UIInputExecutionResult.Action
+        pages: Int,
+        scrollBarScope: ScrollBarSearchScope) throws -> UIInputExecutionResult.Action
     {
-        let scrollBar = self.findScrollBar(in: element, direction: direction)
+        if scrollBarScope == .explicitOwner, !element.isEnabled {
+            throw DesktopActionFailure.preDispatchRefusal(
+                reason: .operationUnsupported,
+                message: "The selected scroll owner is disabled.")
+        }
+        let scrollBar = self.findScrollBar(in: element, direction: direction, scope: scrollBarScope)
         if let scrollBar,
            let change = Self.scrollBarValueChange(scrollBar, direction: direction, pages: pages)
         {
@@ -1062,8 +1204,17 @@ extension ActionInputDriver {
 
     private func findScrollBar(
         in element: any AutomationElementRepresenting,
-        direction: PeekabooFoundation.ScrollDirection) -> (any AutomationElementRepresenting)?
+        direction: PeekabooFoundation.ScrollDirection,
+        scope: ScrollBarSearchScope) -> (any AutomationElementRepresenting)?
     {
+        if scope == .explicitOwner {
+            // A coordinate has already selected its receiver; an arbitrary descendant bar may belong to another one.
+            let candidates = element.role == AXRoleNames.kAXScrollBarRole
+                ? [element] : element.automationOwnedScrollBars
+            return candidates.first {
+                $0.role == AXRoleNames.kAXScrollBarRole && Self.scrollBar($0, matches: direction)
+            }
+        }
         let budget = 200
         var queue: [any AutomationElementRepresenting] = [element]
         var nextIndex = 0
@@ -1357,9 +1508,11 @@ extension ActionInputDriver {
     func tryScrollForTesting(
         element: any AutomationElementRepresenting,
         direction: PeekabooFoundation.ScrollDirection,
-        pages: Int) throws -> UIInputExecutionResult.Action
+        pages: Int,
+        scrollBarScope: ScrollBarSearchScope = .targetDescendants) throws -> UIInputExecutionResult.Action
     {
-        try self.performScrollActions(element: element, direction: direction, pages: pages)
+        try self.performScrollActions(
+            element: element, direction: direction, pages: pages, scrollBarScope: scrollBarScope)
     }
 
     func tryPerformActionForTesting(

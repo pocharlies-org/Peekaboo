@@ -114,6 +114,22 @@ extension DialogService {
         }
     }
 
+    func setFileDialogValue(_ value: String, field: Element) throws -> DesktopActionOutcome? {
+        guard field.isAttributeSettable(named: AXAttributeNames.kAXValueAttribute) else { return nil }
+        guard field.setValue(value, forAttribute: AXAttributeNames.kAXValueAttribute) else {
+            throw DesktopActionFailure.indeterminate(
+                delivery: .init(mechanism: .accessibilityValue, mode: .background),
+                evidence: .completionUnknown,
+                unitCount: .one,
+                message: "File-dialog value assignment returned without acceptance evidence.",
+                hint: "Observe the field before retrying; keyboard fallback was not attempted.")
+        }
+        return .dispatchedUnverified(
+            delivery: .init(mechanism: .accessibilityValue, mode: .background),
+            evidence: .deliveryAccepted,
+            unitCount: .one)
+    }
+
     func collectButtons(from element: Element) -> [Element] {
         DialogTraversal.collectUniqueDepthFirst(
             from: element,
@@ -287,40 +303,4 @@ extension DialogService {
                 causeDescription: error.localizedDescription)
         }
     }
-
-    func typeCharacter(_ char: Character) throws {
-        try DialogService.typeCharacterHandler(String(char))
-    }
 }
-
-#if DEBUG
-extension DialogService {
-    private static var isRunningUnderTests: Bool {
-        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
-            ProcessInfo.processInfo.arguments.contains("--test-mode") ||
-            NSClassFromString("XCTest") != nil
-    }
-
-    private static let defaultTypeCharacterHandler: (String) throws -> Void = { text in
-        guard !DialogService.isRunningUnderTests else {
-            throw DialogError.inputSuppressedUnderTests
-        }
-        try InputDriver.type(text, delayPerCharacter: 0)
-    }
-
-    /// Test hook to override character typing without sending real events.
-    static var typeCharacterHandler: (String) throws -> Void = DialogService.defaultTypeCharacterHandler
-
-    static func resetTypeCharacterHandlerForTesting() {
-        self.typeCharacterHandler = self.defaultTypeCharacterHandler
-    }
-}
-#else
-extension DialogService {
-    fileprivate static var typeCharacterHandler: (String) throws -> Void {
-        { text in try InputDriver.type(
-            text,
-            delayPerCharacter: 0) }
-    }
-}
-#endif

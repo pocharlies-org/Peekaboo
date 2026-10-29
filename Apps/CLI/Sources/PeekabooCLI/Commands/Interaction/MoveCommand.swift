@@ -65,8 +65,8 @@ struct MoveCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormatt
         if let coordString = self.at {
             let parts = coordString.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
             guard parts.count == 2,
-                  Double(parts[0]) != nil,
-                  Double(parts[1]) != nil
+                  let x = Double(parts[0]), x.isFinite,
+                  let y = Double(parts[1]), y.isFinite
             else {
                 throw ValidationError("Invalid coordinates format. Use: x,y")
             }
@@ -185,12 +185,18 @@ struct MoveCommand: ActionOutputFormattable, ErrorHandlingCommand, OutputFormatt
             let x = Double(parts[0])!
             let y = Double(parts[1])!
             let inputPoint = CGPoint(x: x, y: y)
-            let resolution = try await InteractionCoordinateResolver.resolveClickCoordinates(
-                inputPoint,
-                target: self.target,
-                services: self.services,
-                forceGlobal: self.global
-            )
+            let resolution = try await withPreservedActionResultOnFailure(
+                focusResult,
+                targetIdentity: focusResult.targetIdentity,
+                operation: "Cursor move setup focus"
+            ) {
+                try await InteractionCoordinateResolver.resolveClickCoordinates(
+                    inputPoint,
+                    target: self.target,
+                    services: self.services,
+                    forceGlobal: self.global
+                )
+            }
             let location = resolution.screenPoint
             return MoveExecutionTargetResolution(
                 target: MoveTargetResolution(
