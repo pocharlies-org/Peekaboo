@@ -12,7 +12,10 @@ public enum DialogError: Error {
     case fieldNotFound
     case invalidFieldIndex
     case noTextFields
+    case noFilenameField
     case noDismissButton
+    case fileSelectionNotVerified(path: String)
+    case fileSelectionTargetMissing(path: String)
     case fileVerificationFailed(expectedPath: String)
     case fileSavedToUnexpectedDirectory(expectedDirectory: String, actualDirectory: String, actualPath: String)
 }
@@ -34,8 +37,16 @@ extension DialogError: LocalizedError {
             "Invalid field index."
         case .noTextFields:
             "No text fields found in dialog."
+        case .noFilenameField:
+            "No safe filename field found. On an Open panel, use the file's full path " +
+                "or --path <dir> --name <file>. " +
+                "Otherwise, complete the selection manually."
         case .noDismissButton:
             "No dismiss button found in dialog."
+        case let .fileSelectionTargetMissing(path):
+            "No file exists at '\(path)', so the panel cannot select it."
+        case let .fileSelectionNotVerified(path):
+            "The panel did not select '\(path)'. Check that the panel allows that file type."
         case let .fileVerificationFailed(expectedPath):
             "Dialog reported success, but the saved file did not appear at: \(expectedPath)"
         case let .fileSavedToUnexpectedDirectory(expectedDirectory, actualDirectory, actualPath):
