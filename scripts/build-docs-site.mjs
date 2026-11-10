@@ -277,6 +277,12 @@ function markdownToHtml(markdown, currentRel, nested = false) {
     html.push(`<p>${inline(paragraph.join(" "), currentRel)}</p>`);
     paragraph = [];
   };
+  const openListItem = (itemText) => {
+    const task = itemText.match(/^\[([ xX])\]\s+([\s\S]*)$/);
+    if (!task) return `<li>${inline(itemText, currentRel)}`;
+    const checked = task[1].toLowerCase() === "x" ? " checked" : "";
+    return `<li class="task"><input type="checkbox" disabled${checked}> ${inline(task[2], currentRel)}`;
+  };
   // an item with no nested content closes on its own line: <li>text</li>
   const closeItem = (list) => {
     if (html.length - 1 === list.itemAt) html[list.itemAt] += "</li>";
@@ -455,7 +461,7 @@ function markdownToHtml(markdown, currentRel, nested = false) {
         lists.push({ tag, indent, itemOpen: false, itemAt: -1, itemText: "" });
       }
       const itemText = bullet ? bullet[1] : numbered[2];
-      html.push(`<li>${inline(itemText, currentRel)}`);
+      html.push(openListItem(itemText));
       Object.assign(lists.at(-1), { itemOpen: true, itemAt: html.length - 1, itemText });
       continue;
     }
@@ -469,7 +475,7 @@ function markdownToHtml(markdown, currentRel, nested = false) {
     if (owner?.itemOpen && !paragraph.length && html.length - 1 === owner.itemAt) {
       // the next line of an item's own text, not a new paragraph
       owner.itemText += ` ${line.trim()}`;
-      html[owner.itemAt] = `<li>${inline(owner.itemText, currentRel)}`;
+      html[owner.itemAt] = openListItem(owner.itemText);
       continue;
     }
     paragraph.push(line.trim());
@@ -514,6 +520,17 @@ function inline(text, currentRel, inheritedStash = []) {
     stash.push({ html: `<code>${escapeHtml(code)}</code>`, raw });
     return `\u0000${stash.length - 1}\u0000`;
   });
+  out = out.replace(/!\[([^\]]*)\]\(((?:[^()]|\([^()]*\))+)\)/g, (raw, alt, href) => {
+    const altText = alt.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)].raw);
+    const destination = imageSource(href
+      .replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)].raw)
+      .replace(/\\\|/g, "|"));
+    stash.push({
+      html: `<img src="${escapeAttr(destination)}" alt="${escapeAttr(altText)}">`,
+      raw,
+    });
+    return `\u0000${stash.length - 1}\u0000`;
+  });
   out = out.replace(/\[([^\]]+)\]\(((?:[^()]|\([^()]*\))+)\)/g, (raw, label, href) => {
     const destination = href
       .replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)].raw)
@@ -536,6 +553,12 @@ function inline(text, currentRel, inheritedStash = []) {
   out = out.replace(/\\\|/g, "|");
   out = out.replace(/&lt;br&gt;/g, "<br>");
   return out.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)].html);
+}
+
+function imageSource(href) {
+  const trimmed = href.trim();
+  const titled = trimmed.match(/^(\S+)\s+(?:"[^"]*"|'[^']*')$/);
+  return titled ? titled[1] : trimmed;
 }
 
 function rewriteHref(href, currentRel) {
@@ -868,32 +891,30 @@ function highlightJson(code) {
   ]);
 }
 
+function highlightClassified(code, pattern) {
+  // Earliest token wins, so a URL inside a string is not painted as a line comment
+  // and a comment that contains quotes stays one comment.
+  return renderFragments(highlightFragments([code], pattern, (match) => {
+    let cls = "hl-k";
+    if (match.startsWith("/*") || match.startsWith("//")) cls = "hl-c";
+    else if (match.startsWith("`") || match.startsWith('"') || match.startsWith("'")) cls = "hl-s";
+    else if (/^\d/.test(match)) cls = "hl-n";
+    return `<span class="${cls}">${escapeHtml(match)}</span>`;
+  }));
+}
+
 function highlightJs(code) {
-  return highlightWithPatterns(code, [
-    [/\/\/[^\n]*/g, "hl-c"],
-    [/\/\*[\s\S]*?\*\//g, "hl-c"],
-    [/`(?:\\.|[^`\\])*`/g, "hl-s"],
-    [/"(?:\\.|[^"\\])*"/g, "hl-s"],
-    [/'(?:\\.|[^'\\])*'/g, "hl-s"],
-    [
-      /\b(const|let|var|function|return|if|else|for|while|switch|case|break|continue|class|extends|new|import|from|export|default|async|await|try|catch|finally|throw|typeof|instanceof|interface|type|enum|as|of|in|null|undefined|true|false|this)\b/g,
-      "hl-k",
-    ],
-    [/\b(\d+(?:\.\d+)?)\b/g, "hl-n"],
-  ]);
+  return highlightClassified(
+    code,
+    /\/\*[\s\S]*?\*\/|(?<!:)\/\/[^\n]*|`(?:\\.|[^`\\])*`|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?:const|let|var|function|return|if|else|for|while|switch|case|break|continue|class|extends|new|import|from|export|default|async|await|try|catch|finally|throw|typeof|instanceof|interface|type|enum|as|of|in|null|undefined|true|false|this)\b|\b\d+(?:\.\d+)?\b/g,
+  );
 }
 
 function highlightSwift(code) {
-  return highlightWithPatterns(code, [
-    [/\/\/[^\n]*/g, "hl-c"],
-    [/\/\*[\s\S]*?\*\//g, "hl-c"],
-    [/"(?:\\.|[^"\\])*"/g, "hl-s"],
-    [
-      /\b(let|var|func|class|struct|enum|protocol|extension|actor|import|return|if|else|for|while|switch|case|break|continue|try|throw|throws|async|await|guard|defer|do|public|private|internal|fileprivate|open|static|final|init|deinit|nil|true|false|self|Self|some|any)\b/g,
-      "hl-k",
-    ],
-    [/\b(\d+(?:\.\d+)?)\b/g, "hl-n"],
-  ]);
+  return highlightClassified(
+    code,
+    /\/\*[\s\S]*?\*\/|(?<!:)\/\/[^\n]*|"(?:\\.|[^"\\])*"|\b(?:let|var|func|class|struct|enum|protocol|extension|actor|import|return|if|else|for|while|switch|case|break|continue|try|throw|throws|async|await|guard|defer|do|public|private|internal|fileprivate|open|static|final|init|deinit|nil|true|false|self|Self|some|any)\b|\b\d+(?:\.\d+)?\b/g,
+  );
 }
 
 function highlightYaml(code) {
