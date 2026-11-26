@@ -134,7 +134,7 @@ def main():
                 report("see", res is not None and not res.get("isError") and has_image,
                        text_of(res)[:200])
         else:
-            # Any non-quiet Peekaboo call must light the notice, even one that fails.
+            # The proxy shows the notice before forwarding a non-quiet Peekaboo call.
             res = s.call("app", {"action": "list"})
             report("app", res is not None, text_of(res)[:120])
 

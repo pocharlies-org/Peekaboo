@@ -65,10 +65,6 @@ class FakeDaemon(object):
         with self.lock:
             return [a for n, a in self.calls if n == name]
 
-    def reset(self):
-        with self.lock:
-            self.calls = []
-
     def close(self):
         self.server.shutdown()
         self.server.server_close()
@@ -185,7 +181,6 @@ class ProxyWithDaemon(unittest.TestCase):
                          [{"session": "S1", "purpose": "P1"}] * 2)
 
     def test_quiet_tools_do_not_light_the_notice(self):
-        self.daemon.reset()
         self.c.call("permissions")
         self.c.call("sleep", {"duration": 1})
         self.assertEqual(self.daemon.named("overlay"), [])

@@ -11,7 +11,7 @@ without touching Peekaboo:
                               └──TCP 127.0.0.1:$DESKTOP_MCP_PORT──> desktop-mcp daemon
                                    (applescript, set_control_context, overlay)
 
-- tools/list returns Peekaboo's tools plus the daemon's `applescript`,
+- tools/list returns Peekaboo's tools plus the daemon's definitions for `applescript`,
   `set_control_context` and `overlay`.
 - Every Peekaboo tool call that looks at or touches the desktop lights the notice first,
   and keeps it lit while the call is still running.
