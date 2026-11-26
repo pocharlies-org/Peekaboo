@@ -28,7 +28,7 @@ unavailable") while the plain CLI works — revisit when that is fixed upstream.
 
 | File | What for |
 |---|---|
-| `peekaboo_proxy.py` | MCP proxy in front of `peekaboo mcp`: adds `applescript`, `set_control_context` and `overlay` from the [desktop-mcp](https://github.com/pocharlies-org/desktop-mcp) daemon and lights the on-screen notice ("this Mac is being driven by session X for Y") on every Peekaboo call that looks at or touches the desktop |
+| `peekaboo_proxy.py` | MCP proxy in front of `peekaboo mcp`: enforces `set_control_context` per connection, adds `applescript` and `overlay` from the [desktop-mcp](https://github.com/pocharlies-org/desktop-mcp) daemon, and shows who is using the Mac and why |
 | `tests/` | proxy tests against a fake `peekaboo mcp` and a fake daemon (CI) |
 | `check_contract.py` | what the proxy assumes of upstream, read from the Swift sources: tool names, `--allow-foreground`, `--no-remote`, stdio (CI) |
 | `exec_host.py` | the MCP endpoint on the Mac (127.0.0.1:8812): one proxy + `peekaboo mcp --no-remote` per connection |
@@ -51,3 +51,7 @@ up by comparing the Mac's `DEPLOYED` stamp with `pocharlies`.
 A stdio server whose command is `ssh mac /usr/bin/nc 127.0.0.1 8812`. The grants that
 matter are the desktop-mcp daemon's (System Settings → Privacy & Security → Screen
 Recording and Accessibility, for its app); Peekaboo.app is not needed.
+
+Before accessing the desktop, call `set_control_context(session, purpose)` with your actual
+session ID or name and a short, specific objective. Repeat on each connection and when the
+task changes. Desktop calls are refused without valid context or if the notice cannot be shown.
