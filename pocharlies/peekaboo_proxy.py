@@ -15,8 +15,8 @@ without touching Peekaboo:
   `set_control_context` and `overlay`.
 - Every Peekaboo tool call that looks at or touches the desktop lights the notice first,
   and keeps it lit while the call is still running.
-- The notice names this client's session: the one declared with set_control_context,
-  or the client's name from `initialize` until it declares one.
+- Desktop calls require a session and purpose declared with `set_control_context`
+  on this connection. The proxy does not infer either field.
 
 Run it on the Mac, where both Peekaboo and the daemon live. Everything after `--` goes
 to `peekaboo mcp`. Remote clients reach it through exec_host.py (127.0.0.1:8812), which
@@ -25,8 +25,7 @@ Recording and Accessibility grants:
 
   peekaboo_proxy.py -- --allow-foreground --no-remote
 
-If the daemon is down, Peekaboo keeps working and the proxy logs that the notice could
-not be shown. Stdlib only, Python 3.9+.
+If the notice cannot be shown, the proxy refuses new desktop calls. Stdlib only, Python 3.9+.
 """
 import json
 import os
@@ -45,11 +44,13 @@ NOTICE_MAX_CALL = float(os.environ.get("DESKTOP_MCP_NOTICE_MAX_CALL", "900"))
 DAEMON_TOOLS = ("applescript", "set_control_context", "overlay")
 # Peekaboo tools that neither look at nor touch the desktop.
 QUIET_TOOLS = ("permissions", "sleep", "analyze")
-INSTRUCTIONS = (
-    "This server also offers `applescript` (AppleScript or JXA, the most reliable way to "
-    "ask an app for something through its object model) and `set_control_context`. Call "
-    "set_control_context(session, purpose) before anything else: it is the text of the "
-    "notice shown on the Mac while you drive it.")
+CONTEXT_REQUIRED = (
+    "Call set_control_context with your actual session ID or name and a short, specific "
+    "purpose before accessing the desktop. Do this on every new connection and whenever "
+    "the task changes. Both fields are shown on the Mac: do not use placeholders or secrets.")
+INSTRUCTIONS = CONTEXT_REQUIRED + " This also applies to AppleScript and showing the overlay."
+PLACEHOLDERS = {"sin identificar", "sin identificar (peekaboo)", "unidentified",
+                "objetivo sin declarar", "undeclared purpose"}
 
 
 def log(msg):
@@ -134,8 +135,7 @@ class Proxy(object):
         self.pending_list = set()
         self.pending_init = set()
         self.inflight = {}           # request id -> time it was sent
-        self.context = None          # (session, purpose) declared by this client
-        self.client_name = None
+        self.context = None          # session and purpose declared by this client
         self.daemon_tools = None
         cmd = [find_peekaboo(), "mcp"] + peekaboo_args
         log("starting: %s" % " ".join(cmd))
@@ -156,18 +156,23 @@ class Proxy(object):
             pass
 
     # -- notice -------------------------------------------------------------
-    def notice(self):
-        """Light the notice with this session's name. Never blocks Peekaboo on failure."""
+    def require_context(self):
         with self.state_lock:
-            ctx = self.context or ((self.client_name or "SIN IDENTIFICAR") + " (peekaboo)",
-                                   "objetivo sin declarar")
-        try:
-            # The daemon keeps one global context; set ours again in case another
-            # session changed it since.
-            self.daemon.call("set_control_context", {"session": ctx[0], "purpose": ctx[1]})
-            self.daemon.call("overlay", {"action": "show", "seconds": NOTICE_SECONDS})
-        except Exception as e:
-            log("could not show the on-screen notice: %s" % e)
+            if self.context is None:
+                raise ValueError(CONTEXT_REQUIRED)
+            return self.context
+
+    def notice(self, args=None):
+        ctx = self.require_context()
+        # The daemon keeps one global context; restore ours before showing the notice.
+        result = self.daemon.call("set_control_context", ctx)
+        if result.get("isError"):
+            raise RuntimeError(result["content"][0]["text"])
+        result = self.daemon.call("overlay", args or {"action": "show", "seconds": NOTICE_SECONDS})
+        text = result["content"][0]["text"]
+        if result.get("isError") or not json.loads(text).get("visible"):
+            raise RuntimeError("Could not show the on-screen notice: " + text)
+        return result
 
     def heartbeat(self):
         while True:
@@ -176,7 +181,10 @@ class Proxy(object):
             with self.state_lock:
                 busy = any(now - t < NOTICE_MAX_CALL for t in self.inflight.values())
             if busy:
-                self.notice()
+                try:
+                    self.notice()
+                except Exception as e:
+                    log("could not renew the on-screen notice: %s" % e)
 
     # -- daemon tools -------------------------------------------------------
     def load_daemon_tools(self):
@@ -191,17 +199,37 @@ class Proxy(object):
 
     def call_daemon_tool(self, rid, name, args):
         try:
-            if name == "set_control_context":
-                session = (args.get("session") or "").strip()
-                purpose = (args.get("purpose") or "").strip()
-                if session and purpose:
-                    with self.state_lock:
-                        self.context = (session[:80], purpose[:120])
             timeout = float(args.get("timeout") or 60) + 10 if name == "applescript" else 30
             result = self.tool_daemon.call(name, args, timeout)
         except Exception as e:
             result = {"isError": True, "content": [{"type": "text", "text": str(e)}]}
+        finally:
+            with self.state_lock:
+                self.inflight.pop(rid, None)
         self.send({"jsonrpc": "2.0", "id": rid, "result": result})
+
+    def prepare_tool_call(self, rid, name, args):
+        if name == "set_control_context":
+            context = {}
+            for key, limit in (("session", 80), ("purpose", 120)):
+                value = args.get(key)
+                value = value.strip()[:limit].rstrip() if isinstance(value, str) else ""
+                if not value or value.casefold() in PLACEHOLDERS:
+                    raise ValueError(CONTEXT_REQUIRED)
+                context[key] = value
+            with self.state_lock:
+                self.context = context
+            return {"content": [{"type": "text", "text": "Control context set for this connection."}]}
+        if name == "overlay":
+            action = (args.get("action") or "status").lower()
+            if action == "show":
+                return self.notice(args)
+            if action == "hide":
+                self.require_context()
+        elif name not in QUIET_TOOLS:
+            self.notice()
+            with self.state_lock:
+                self.inflight[rid] = time.time()
 
     # -- pumps --------------------------------------------------------------
     def from_client(self):
@@ -216,23 +244,23 @@ class Proxy(object):
                 continue
             method, rid = msg.get("method"), msg.get("id")
             params = msg.get("params") or {}
-            if method == "tools/call" and params.get("name") in DAEMON_TOOLS:
-                if params["name"] == "applescript":
-                    self.notice()
-                threading.Thread(target=self.call_daemon_tool, daemon=True,
-                                 args=(rid, params["name"], params.get("arguments") or {})
-                                 ).start()
-                continue
-            if method == "initialize":
-                self.client_name = (params.get("clientInfo") or {}).get("name")
+            if method == "tools/call":
+                name, args = params.get("name"), params.get("arguments") or {}
+                try:
+                    result = self.prepare_tool_call(rid, name, args)
+                except Exception as e:
+                    result = {"isError": True, "content": [{"type": "text", "text": str(e)}]}
+                if result is not None:
+                    self.send({"jsonrpc": "2.0", "id": rid, "result": result})
+                    continue
+                if name in DAEMON_TOOLS:
+                    threading.Thread(target=self.call_daemon_tool, daemon=True,
+                                     args=(rid, name, args)).start()
+                    continue
+            elif method == "initialize":
                 self.pending_init.add(rid)
             elif method == "tools/list":
                 self.pending_list.add(rid)
-            elif method == "tools/call":
-                if params.get("name") not in QUIET_TOOLS:
-                    self.notice()
-                    with self.state_lock:
-                        self.inflight[rid] = time.time()
             self.to_child(raw)
         try:
             self.child.stdin.close()
@@ -256,8 +284,15 @@ class Proxy(object):
                     self.inflight.pop(rid, None)
                 if rid in self.pending_list:
                     self.pending_list.discard(rid)
-                    if isinstance(result, dict) and not result.get("nextCursor"):
-                        result["tools"] = result.get("tools", []) + self.load_daemon_tools()
+                    if isinstance(result, dict):
+                        tools = result.get("tools", [])
+                        if not result.get("nextCursor"):
+                            tools = tools + self.load_daemon_tools()
+                        result["tools"] = [
+                            dict(tool, description=(tool.get("description") or "") + "\n\n" + CONTEXT_REQUIRED)
+                            if tool["name"] not in QUIET_TOOLS else tool
+                            for tool in tools
+                        ]
                 elif rid in self.pending_init:
                     self.pending_init.discard(rid)
                     if isinstance(result, dict):

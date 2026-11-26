@@ -41,7 +41,12 @@ class FakeDaemon(object):
                     elif m == "tools/call":
                         with daemon.lock:
                             daemon.calls.append((p["name"], p.get("arguments") or {}))
-                        text = "AS:" + p["arguments"]["script"] if p["name"] == "applescript" else "ok"
+                        if p["name"] == "applescript":
+                            text = "AS:" + p["arguments"]["script"]
+                        elif p["name"] == "overlay":
+                            text = json.dumps({"visible": p["arguments"].get("action") == "show"})
+                        else:
+                            text = "ok"
                         res = {"content": [{"type": "text", "text": text}]}
                     else:
                         res = {}
@@ -137,29 +142,47 @@ class ProxyWithDaemon(unittest.TestCase):
         self.assertIn("set_control_context", instr)
 
     def test_tools_are_peekaboo_plus_daemon_extras_only(self):
-        names = {t["name"] for t in self.c.request("tools/list")["result"]["tools"]}
-        self.assertTrue({"see", "click", "permissions"} <= names)
-        self.assertTrue(DAEMON_TOOLS <= names)
-        self.assertNotIn("screenshot", names)
+        tools = {t["name"]: t for t in self.c.request("tools/list")["result"]["tools"]}
+        self.assertTrue({"see", "click", "permissions"} | DAEMON_TOOLS <= tools.keys())
+        self.assertNotIn("screenshot", tools)
+        for name in ("see", "click", "applescript", "overlay"):
+            self.assertIn("set_control_context", tools[name]["description"])
 
-    def test_applescript_goes_to_the_daemon(self):
-        res = self.c.call("applescript", {"script": "return 1"})
-        self.assertEqual(res["content"][0]["text"], "AS:return 1")
-        self.assertEqual(self.daemon.named("applescript"), [{"script": "return 1"}])
+    def test_desktop_calls_without_context_are_blocked(self):
+        for name, args in (("see", {}), ("click", {"on": "x"}),
+                           ("applescript", {"script": "return 1"}),
+                           ("overlay", {"action": "show"})):
+            with self.subTest(tool=name):
+                res = self.c.call(name, args)
+                self.assertTrue(res["isError"])
+                self.assertIn("set_control_context", res["content"][0]["text"])
+        self.assertEqual(self.daemon.calls, [])
 
-    def test_desktop_call_lights_notice_named_after_client(self):
+    def test_blank_missing_and_placeholder_context_is_rejected(self):
+        for args in ({"session": "S1"}, {"purpose": "P1"},
+                     {"session": " ", "purpose": "P1"}, {"session": "S1", "purpose": "\t"},
+                     {"session": 42, "purpose": "P1"},
+                     {"session": " SIN IDENTIFICAR (Peekaboo) ", "purpose": "P1"},
+                     {"session": "S1", "purpose": "objetivo sin declarar"}):
+            with self.subTest(args=args):
+                self.assertTrue(self.c.call("set_control_context", args)["isError"])
+                self.assertTrue(self.c.call("see")["isError"])
+        self.assertEqual(self.daemon.calls, [])
+
+    def test_declared_context_is_the_banner_and_stays_on_its_connection(self):
+        res = self.c.call("set_control_context", {"session": " S1 ", "purpose": " P1 "})
+        self.assertFalse(res.get("isError"))
+        other = Client(self.daemon.port)
+        self.addCleanup(other.close)
+        other.initialize()
+        self.assertTrue(other.call("see")["isError"])
         res = self.c.call("see", {"app_target": "frontmost"})
         self.assertEqual(json.loads(res["content"][0]["text"])["tool"], "see")
+        res = self.c.call("applescript", {"script": "return 1"})
+        self.assertEqual(res["content"][0]["text"], "AS:return 1")
         self.assertTrue(self.daemon.named("overlay"))
-        ctx = self.daemon.named("set_control_context")[-1]
-        self.assertEqual(ctx["session"], "test-client (peekaboo)")
-
-    def test_declared_context_is_the_banner(self):
-        self.c.call("set_control_context", {"session": "S1", "purpose": "P1"})
-        self.daemon.reset()
-        self.c.call("click", {"on": "x"})
-        self.assertEqual(self.daemon.named("set_control_context")[-1],
-                         {"session": "S1", "purpose": "P1"})
+        self.assertEqual(self.daemon.named("set_control_context"),
+                         [{"session": "S1", "purpose": "P1"}] * 2)
 
     def test_quiet_tools_do_not_light_the_notice(self):
         self.daemon.reset()
@@ -168,7 +191,7 @@ class ProxyWithDaemon(unittest.TestCase):
         self.assertEqual(self.daemon.named("overlay"), [])
 
     def test_notice_kept_lit_while_a_call_is_in_flight(self):
-        self.daemon.reset()
+        self.c.call("set_control_context", {"session": "S1", "purpose": "P1"})
         self.c.call("see", {"delay": 2.5}, timeout=15)
         self.assertGreaterEqual(len(self.daemon.named("overlay")), 2)
 
@@ -186,10 +209,10 @@ class NoticeGivesUpOnAHungCall(unittest.TestCase):
         c = Client(daemon.port, max_call="1.5")
         try:
             c.initialize()
-            daemon.reset()
-            c.call("see", {"delay": 4.5}, timeout=15)
-            # the lighting before the call + at most one heartbeat inside the limit
-            self.assertLessEqual(len(daemon.named("overlay")), 2)
+            c.call("set_control_context", {"session": "S1", "purpose": "P1"})
+            self.assertFalse(c.call("see", {"delay": 4.5}, timeout=15).get("isError"))
+            # The lighting before the call + at most one heartbeat inside the limit.
+            self.assertIn(len(daemon.named("overlay")), (1, 2))
         finally:
             c.close()
             daemon.close()
@@ -207,16 +230,15 @@ class ProxyWithoutDaemon(unittest.TestCase):
     def tearDown(self):
         self.c.close()
 
-    def test_peekaboo_keeps_working(self):
-        res = self.c.call("see")
-        self.assertEqual(json.loads(res["content"][0]["text"])["tool"], "see")
+    def test_only_quiet_tools_work_while_the_notice_daemon_is_down(self):
         names = {t["name"] for t in self.c.request("tools/list")["result"]["tools"]}
         self.assertIn("see", names)
-
-    def test_applescript_reports_the_daemon_is_down(self):
-        res = self.c.call("applescript", {"script": "return 1"})
-        self.assertTrue(res.get("isError"))
-        self.assertIn("desktop-mcp daemon", res["content"][0]["text"])
+        self.assertFalse(self.c.call("permissions").get("isError"))
+        self.assertFalse(self.c.call("set_control_context", {"session": "S1", "purpose": "P1"}).get("isError"))
+        for name in ("see", "applescript"):
+            res = self.c.call(name)
+            self.assertTrue(res["isError"])
+            self.assertIn("desktop-mcp daemon", res["content"][0]["text"])
 
 
 if __name__ == "__main__":

@@ -108,11 +108,16 @@ def main():
                info or "".join(s.stderr[-3:]))
         if failed:
             return 1
-        s.request("notifications/initialized")
+        s.p.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+        s.p.stdin.flush()
         tools = {t["name"] for t in (s.request("tools/list") or {}).get("result", {}).get("tools", [])}
         report("tools", REQUIRED <= tools, "missing: %s" % sorted(REQUIRED - tools))
-        s.call("set_control_context", {"session": "peekaboo-fork " + a.label,
-                                       "purpose": "validar Peekaboo (%s)" % a.mode})
+        res = s.call("overlay", {"action": "show"})
+        report("context-required", (res or {}).get("isError") and "set_control_context" in text_of(res),
+               text_of(res))
+        session, purpose = "peekaboo-fork " + a.label, "validar Peekaboo (%s)" % a.mode
+        res = s.call("set_control_context", {"session": session, "purpose": purpose})
+        report("context-set", bool(res) and not res.get("isError"), text_of(res))
         res = s.call("applescript", {"script": 'return "smoke-ok"'})
         report("applescript", "smoke-ok" in text_of(res), text_of(res))
 
@@ -135,10 +140,12 @@ def main():
 
         st = s.call("overlay", {"action": "status"})
         try:
-            visible = json.loads(text_of(st)).get("visible")
+            notice = json.loads(text_of(st))
         except ValueError:
-            visible = None
-        report("notice", visible is True, text_of(st)[:200])
+            notice = {}
+        banner = notice.get("rotulo") or notice.get("banner", "")
+        report("notice", notice.get("visible") is True and session in banner and purpose in banner,
+               text_of(st)[:200])
     finally:
         s.close()
     return 1 if failed else 0
